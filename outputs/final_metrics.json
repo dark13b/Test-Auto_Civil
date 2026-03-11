@@ -1,0 +1,1284 @@
+{
+  "baseline_metrics": {
+    "model_name": "RandomForestRegressor",
+    "hyperparameters": {
+      "n_estimators": 300,
+      "max_depth": null,
+      "min_samples_split": 2,
+      "min_samples_leaf": 1,
+      "max_features": "sqrt",
+      "n_jobs": -1
+    },
+    "rmse": 3.2121051361363913,
+    "mae": 2.1480542165381395,
+    "r2": 0.9632054274864595,
+    "composite_score": 0.93215897997783,
+    "cv_metrics": {
+      "rmse": 3.2121051361363913,
+      "mae": 2.1480542165381395,
+      "r2": 0.9632054274864595,
+      "composite_score": 0.93215897997783
+    },
+    "test_metrics": {
+      "rmse": 2.6215540252785394,
+      "mae": 1.6831668616492592,
+      "r2": 0.9733533439652999,
+      "composite_score": 0.9460370713280187
+    },
+    "validation_verdict": "WARN",
+    "validation_report": {
+      "pass_rate": 0.8009708737864077,
+      "failed_samples": [],
+      "suspicious_samples": [
+        {
+          "index": 228,
+          "prediction_mpa": 35.30941533360001,
+          "actual_mpa": 39.23,
+          "water_cement_ratio": 0.725,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 2017,
+          "prediction_mpa": 33.669773850867074,
+          "actual_mpa": 33.762260768,
+          "water_cement_ratio": 1.1037037037037039,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 282,
+          "prediction_mpa": 38.01963375269326,
+          "actual_mpa": 36.64,
+          "water_cement_ratio": 0.7498011137629276,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 13,
+          "prediction_mpa": 45.04192306785116,
+          "actual_mpa": 42.33,
+          "water_cement_ratio": 1.2,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 35,
+          "prediction_mpa": 38.180975259954266,
+          "actual_mpa": 38.41,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 232,
+          "prediction_mpa": 50.76278049472879,
+          "actual_mpa": 50.77,
+          "water_cement_ratio": 0.8502573701450632,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 462,
+          "prediction_mpa": 37.28777967306677,
+          "actual_mpa": 37.68,
+          "water_cement_ratio": 0.9095127610208817,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1892,
+          "prediction_mpa": 34.70680029009539,
+          "actual_mpa": 35.22532884,
+          "water_cement_ratio": 1.6928571428571428,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1465,
+          "prediction_mpa": 39.917617943697785,
+          "actual_mpa": 41.20308576,
+          "water_cement_ratio": 1.0484613086345982,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1062,
+          "prediction_mpa": 41.11065545966654,
+          "actual_mpa": 41.719503284,
+          "water_cement_ratio": 0.9667673716012085,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1376,
+          "prediction_mpa": 40.34202973706664,
+          "actual_mpa": 40.14818748,
+          "water_cement_ratio": 0.7241976232806212,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 58,
+          "prediction_mpa": 50.58903826013038,
+          "actual_mpa": 50.95,
+          "water_cement_ratio": 0.75,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 925,
+          "prediction_mpa": 32.580366644620945,
+          "actual_mpa": 27.23,
+          "water_cement_ratio": 1.201219512195122,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 63,
+          "prediction_mpa": 50.01876955472719,
+          "actual_mpa": 50.66,
+          "water_cement_ratio": 1.2,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 66,
+          "prediction_mpa": 43.4365550059232,
+          "actual_mpa": 44.7,
+          "water_cement_ratio": 1.3753581661891119,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 42,
+          "prediction_mpa": 39.32818536755515,
+          "actual_mpa": 39.0,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 465,
+          "prediction_mpa": 48.40773151813343,
+          "actual_mpa": 50.94,
+          "water_cement_ratio": 0.9913693901035673,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1268,
+          "prediction_mpa": 48.29129114832673,
+          "actual_mpa": 49.97322048,
+          "water_cement_ratio": 0.8502058383233534,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1970,
+          "prediction_mpa": 31.463847186777834,
+          "actual_mpa": 31.420110796,
+          "water_cement_ratio": 0.7479729729729729,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 463,
+          "prediction_mpa": 52.86246265586689,
+          "actual_mpa": 56.06,
+          "water_cement_ratio": 0.94985590778098,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 253,
+          "prediction_mpa": 40.65894033119995,
+          "actual_mpa": 42.35,
+          "water_cement_ratio": 0.7496,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 197,
+          "prediction_mpa": 35.95128120186669,
+          "actual_mpa": 33.96,
+          "water_cement_ratio": 0.8505392912172574,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 16,
+          "prediction_mpa": 39.23859488391277,
+          "actual_mpa": 39.36,
+          "water_cement_ratio": 1.3753581661891119,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1469,
+          "prediction_mpa": 36.48593862544222,
+          "actual_mpa": 37.81086384,
+          "water_cement_ratio": 0.9915424889246879,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 836,
+          "prediction_mpa": 34.84742800614444,
+          "actual_mpa": 33.42,
+          "water_cement_ratio": 0.7039473684210527,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1238,
+          "prediction_mpa": 36.84749207040003,
+          "actual_mpa": 39.6103962,
+          "water_cement_ratio": 0.8502381289196964,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 963,
+          "prediction_mpa": 37.378846141657206,
+          "actual_mpa": 37.43,
+          "water_cement_ratio": 1.1586666666666667,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 2037,
+          "prediction_mpa": 36.933662680386696,
+          "actual_mpa": 37.363393916,
+          "water_cement_ratio": 1.1587403598971724,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 347,
+          "prediction_mpa": 47.383680308133385,
+          "actual_mpa": 46.64,
+          "water_cement_ratio": 0.724379971923257,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1223,
+          "prediction_mpa": 30.865841434022215,
+          "actual_mpa": 34.55653712,
+          "water_cement_ratio": 0.8463709849878106,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1328,
+          "prediction_mpa": 41.68556247551109,
+          "actual_mpa": 48.15300384,
+          "water_cement_ratio": 0.9375296068214117,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 273,
+          "prediction_mpa": 43.55439290546666,
+          "actual_mpa": 45.84,
+          "water_cement_ratio": 0.7506471095772217,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 444,
+          "prediction_mpa": 31.387064055362135,
+          "actual_mpa": 33.27,
+          "water_cement_ratio": 0.7673031026252983,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1248,
+          "prediction_mpa": 38.56812317853328,
+          "actual_mpa": 40.38950408,
+          "water_cement_ratio": 0.8503204791425869,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1094,
+          "prediction_mpa": 48.867679708759354,
+          "actual_mpa": 48.695621452,
+          "water_cement_ratio": 0.8571428571428571,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 469,
+          "prediction_mpa": 42.76154664133347,
+          "actual_mpa": 44.28,
+          "water_cement_ratio": 0.8741653826399589,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 990,
+          "prediction_mpa": 35.94578402700652,
+          "actual_mpa": 36.35,
+          "water_cement_ratio": 1.103425559947299,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1306,
+          "prediction_mpa": 31.46707199870445,
+          "actual_mpa": 29.65436276,
+          "water_cement_ratio": 0.7496916895413135,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1242,
+          "prediction_mpa": 30.408386782513396,
+          "actual_mpa": 31.53663224,
+          "water_cement_ratio": 0.849980432230291,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 926,
+          "prediction_mpa": 32.33149333541381,
+          "actual_mpa": 30.65,
+          "water_cement_ratio": 1.2469135802469136,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1733,
+          "prediction_mpa": 30.163988750044414,
+          "actual_mpa": 30.439675924,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1034,
+          "prediction_mpa": 43.02515911834206,
+          "actual_mpa": 44.296075096,
+          "water_cement_ratio": 0.9667673716012085,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 237,
+          "prediction_mpa": 48.845850444551125,
+          "actual_mpa": 47.13,
+          "water_cement_ratio": 0.8498596819457436,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1586,
+          "prediction_mpa": 33.01096161451329,
+          "actual_mpa": 32.626693796,
+          "water_cement_ratio": 0.9596899224806201,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1323,
+          "prediction_mpa": 44.675414954000125,
+          "actual_mpa": 48.67011084,
+          "water_cement_ratio": 0.9350142825752583,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 452,
+          "prediction_mpa": 47.47601376839995,
+          "actual_mpa": 48.99,
+          "water_cement_ratio": 0.9913693901035673,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1096,
+          "prediction_mpa": 43.4365550059232,
+          "actual_mpa": 44.698039604,
+          "water_cement_ratio": 1.3753581661891119,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 368,
+          "prediction_mpa": 54.54668699031093,
+          "actual_mpa": 56.63,
+          "water_cement_ratio": 0.7240577012563982,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1976,
+          "prediction_mpa": 33.09693379133325,
+          "actual_mpa": 32.96384756,
+          "water_cement_ratio": 1.1759197324414716,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1043,
+          "prediction_mpa": 45.04192306785116,
+          "actual_mpa": 42.32693164,
+          "water_cement_ratio": 1.2,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 39,
+          "prediction_mpa": 36.00628521784325,
+          "actual_mpa": 36.25,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1278,
+          "prediction_mpa": 41.39686626821322,
+          "actual_mpa": 44.298833,
+          "water_cement_ratio": 0.7841209829867675,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1975,
+          "prediction_mpa": 35.81896735366887,
+          "actual_mpa": 36.443632932,
+          "water_cement_ratio": 1.4317369549678343,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1277,
+          "prediction_mpa": 37.972000239026684,
+          "actual_mpa": 39.58971192,
+          "water_cement_ratio": 0.7841209829867675,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 675,
+          "prediction_mpa": 33.248311544345576,
+          "actual_mpa": 32.53,
+          "water_cement_ratio": 1.10657966286025,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1317,
+          "prediction_mpa": 41.145845264682585,
+          "actual_mpa": 35.57006684,
+          "water_cement_ratio": 0.9349983460138935,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1243,
+          "prediction_mpa": 33.78221121718007,
+          "actual_mpa": 35.34253976,
+          "water_cement_ratio": 0.849980432230291,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1396,
+          "prediction_mpa": 48.4529029732667,
+          "actual_mpa": 52.20022796,
+          "water_cement_ratio": 0.7241973010702653,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 236,
+          "prediction_mpa": 39.886943015596984,
+          "actual_mpa": 40.23,
+          "water_cement_ratio": 0.8498596819457436,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1494,
+          "prediction_mpa": 53.39999018626654,
+          "actual_mpa": 56.8128224,
+          "water_cement_ratio": 0.9822155688622755,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 457,
+          "prediction_mpa": 37.83532851700433,
+          "actual_mpa": 39.27,
+          "water_cement_ratio": 0.7673031026252983,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 843,
+          "prediction_mpa": 43.85577767261489,
+          "actual_mpa": 44.61,
+          "water_cement_ratio": 1.2253521126760563,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 291,
+          "prediction_mpa": 33.50498413496667,
+          "actual_mpa": 31.27,
+          "water_cement_ratio": 0.9351648351648351,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 287,
+          "prediction_mpa": 41.794440501215924,
+          "actual_mpa": 35.57,
+          "water_cement_ratio": 0.9349503858875413,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 372,
+          "prediction_mpa": 38.18909505342225,
+          "actual_mpa": 37.27,
+          "water_cement_ratio": 0.7240749200548195,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 679,
+          "prediction_mpa": 32.483230289517635,
+          "actual_mpa": 33.0,
+          "water_cement_ratio": 0.9599056603773585,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 30,
+          "prediction_mpa": 54.39687889243657,
+          "actual_mpa": 55.26,
+          "water_cement_ratio": 0.75,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 939,
+          "prediction_mpa": 32.40737483495423,
+          "actual_mpa": 32.72,
+          "water_cement_ratio": 1.3879369431117203,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 878,
+          "prediction_mpa": 30.117625130108937,
+          "actual_mpa": 31.03,
+          "water_cement_ratio": 1.4736842105263157,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1072,
+          "prediction_mpa": 39.32818536755515,
+          "actual_mpa": 38.995383608,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 217,
+          "prediction_mpa": 36.931366353733274,
+          "actual_mpa": 38.56,
+          "water_cement_ratio": 0.8507619548081976,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 425,
+          "prediction_mpa": 30.899194497600014,
+          "actual_mpa": 32.9,
+          "water_cement_ratio": 0.9820359281437125,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 256,
+          "prediction_mpa": 32.30958313655992,
+          "actual_mpa": 31.64,
+          "water_cement_ratio": 0.7496470588235294,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 373,
+          "prediction_mpa": 43.38711138795548,
+          "actual_mpa": 46.23,
+          "water_cement_ratio": 0.7240749200548195,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1483,
+          "prediction_mpa": 33.689940272799994,
+          "actual_mpa": 31.715896,
+          "water_cement_ratio": 0.8753283597772408,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1021,
+          "prediction_mpa": 32.307094172367094,
+          "actual_mpa": 31.88,
+          "water_cement_ratio": 0.7032193158953722,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1090,
+          "prediction_mpa": 53.4724729698376,
+          "actual_mpa": 54.378282644,
+          "water_cement_ratio": 0.75,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 5,
+          "prediction_mpa": 47.39006574189113,
+          "actual_mpa": 47.03,
+          "water_cement_ratio": 0.8571428571428571,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1676,
+          "prediction_mpa": 45.706251697904925,
+          "actual_mpa": 47.714497104,
+          "water_cement_ratio": 0.8133493205435652,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1217,
+          "prediction_mpa": 34.220811775559966,
+          "actual_mpa": 29.44751996,
+          "water_cement_ratio": 0.8512772081309588,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1955,
+          "prediction_mpa": 32.580366644620945,
+          "actual_mpa": 27.234302,
+          "water_cement_ratio": 1.201219512195122,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1301,
+          "prediction_mpa": 34.136044658666584,
+          "actual_mpa": 33.72916592,
+          "water_cement_ratio": 0.7506364617044229,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        }
+      ],
+      "failed_count": 0,
+      "suspicious_count": 82,
+      "verdict": "WARN"
+    }
+  },
+  "best_search_metrics": {
+    "model_name": "LGBMRegressor",
+    "hyperparameters": {
+      "n_estimators": 350,
+      "learning_rate": 0.14274725845230551,
+      "num_leaves": 46,
+      "min_child_samples": 11,
+      "subsample": 0.6934780666757696,
+      "colsample_bytree": 0.8244115207733527
+    },
+    "rmse": 2.4428248234237504,
+    "mae": 1.1882199903160477,
+    "r2": 0.9778270608215142,
+    "composite_score": 0.9526349691154945,
+    "cv_metrics": {
+      "rmse": 2.4428248234237504,
+      "mae": 1.1882199903160477,
+      "r2": 0.9778270608215142,
+      "composite_score": 0.9526349691154945
+    },
+    "test_metrics": {
+      "rmse": 2.063842515838086,
+      "mae": 0.9081250647021155,
+      "r2": 0.9834850143259396,
+      "composite_score": 0.9611830093511762
+    },
+    "validation_verdict": "WARN",
+    "validation_report": {
+      "pass_rate": 0.7888349514563107,
+      "failed_samples": [],
+      "suspicious_samples": [
+        {
+          "index": 1454,
+          "prediction_mpa": 30.465219205861583,
+          "actual_mpa": 33.00521612,
+          "water_cement_ratio": 0.9494641004955631,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 228,
+          "prediction_mpa": 38.97178060756408,
+          "actual_mpa": 39.23,
+          "water_cement_ratio": 0.725,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 2017,
+          "prediction_mpa": 33.69621771551009,
+          "actual_mpa": 33.762260768,
+          "water_cement_ratio": 1.1037037037037039,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 282,
+          "prediction_mpa": 38.00944342855311,
+          "actual_mpa": 36.64,
+          "water_cement_ratio": 0.7498011137629276,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 13,
+          "prediction_mpa": 46.46076662435089,
+          "actual_mpa": 42.33,
+          "water_cement_ratio": 1.2,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 35,
+          "prediction_mpa": 38.00610359535948,
+          "actual_mpa": 38.41,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 232,
+          "prediction_mpa": 53.12539942182387,
+          "actual_mpa": 50.77,
+          "water_cement_ratio": 0.8502573701450632,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 462,
+          "prediction_mpa": 38.57102260662909,
+          "actual_mpa": 37.68,
+          "water_cement_ratio": 0.9095127610208817,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1892,
+          "prediction_mpa": 34.890049987546746,
+          "actual_mpa": 35.22532884,
+          "water_cement_ratio": 1.6928571428571428,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1465,
+          "prediction_mpa": 42.0669057985577,
+          "actual_mpa": 41.20308576,
+          "water_cement_ratio": 1.0484613086345982,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1062,
+          "prediction_mpa": 41.745056023102116,
+          "actual_mpa": 41.719503284,
+          "water_cement_ratio": 0.9667673716012085,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1376,
+          "prediction_mpa": 41.315142022567834,
+          "actual_mpa": 40.14818748,
+          "water_cement_ratio": 0.7241976232806212,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1455,
+          "prediction_mpa": 32.56759939806266,
+          "actual_mpa": 32.90179472,
+          "water_cement_ratio": 0.9822155688622755,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 58,
+          "prediction_mpa": 51.09394552053896,
+          "actual_mpa": 50.95,
+          "water_cement_ratio": 0.75,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 925,
+          "prediction_mpa": 32.28049579025228,
+          "actual_mpa": 27.23,
+          "water_cement_ratio": 1.201219512195122,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 63,
+          "prediction_mpa": 51.184608371251564,
+          "actual_mpa": 50.66,
+          "water_cement_ratio": 1.2,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 66,
+          "prediction_mpa": 45.565705574837935,
+          "actual_mpa": 44.7,
+          "water_cement_ratio": 1.3753581661891119,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 42,
+          "prediction_mpa": 39.45152524656417,
+          "actual_mpa": 39.0,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 465,
+          "prediction_mpa": 50.74776276077579,
+          "actual_mpa": 50.94,
+          "water_cement_ratio": 0.9913693901035673,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1268,
+          "prediction_mpa": 49.723165829012096,
+          "actual_mpa": 49.97322048,
+          "water_cement_ratio": 0.8502058383233534,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1970,
+          "prediction_mpa": 31.357036487258746,
+          "actual_mpa": 31.420110796,
+          "water_cement_ratio": 0.7479729729729729,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 463,
+          "prediction_mpa": 55.699172560790934,
+          "actual_mpa": 56.06,
+          "water_cement_ratio": 0.94985590778098,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 253,
+          "prediction_mpa": 42.61143993837572,
+          "actual_mpa": 42.35,
+          "water_cement_ratio": 0.7496,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 197,
+          "prediction_mpa": 34.189108384418624,
+          "actual_mpa": 33.96,
+          "water_cement_ratio": 0.8505392912172574,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 16,
+          "prediction_mpa": 39.607604258919544,
+          "actual_mpa": 39.36,
+          "water_cement_ratio": 1.3753581661891119,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1469,
+          "prediction_mpa": 38.2384129041766,
+          "actual_mpa": 37.81086384,
+          "water_cement_ratio": 0.9915424889246879,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 836,
+          "prediction_mpa": 33.37316110684924,
+          "actual_mpa": 33.42,
+          "water_cement_ratio": 0.7039473684210527,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1238,
+          "prediction_mpa": 39.81814788613712,
+          "actual_mpa": 39.6103962,
+          "water_cement_ratio": 0.8502381289196964,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 963,
+          "prediction_mpa": 37.56188956354857,
+          "actual_mpa": 37.43,
+          "water_cement_ratio": 1.1586666666666667,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 2037,
+          "prediction_mpa": 37.35670109914182,
+          "actual_mpa": 37.363393916,
+          "water_cement_ratio": 1.1587403598971724,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 347,
+          "prediction_mpa": 45.980065843860565,
+          "actual_mpa": 46.64,
+          "water_cement_ratio": 0.724379971923257,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1223,
+          "prediction_mpa": 33.41472582668478,
+          "actual_mpa": 34.55653712,
+          "water_cement_ratio": 0.8463709849878106,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1328,
+          "prediction_mpa": 46.73828208909976,
+          "actual_mpa": 48.15300384,
+          "water_cement_ratio": 0.9375296068214117,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 273,
+          "prediction_mpa": 46.742395201311055,
+          "actual_mpa": 45.84,
+          "water_cement_ratio": 0.7506471095772217,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 444,
+          "prediction_mpa": 31.440541944064076,
+          "actual_mpa": 33.27,
+          "water_cement_ratio": 0.7673031026252983,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1248,
+          "prediction_mpa": 40.980954830998144,
+          "actual_mpa": 40.38950408,
+          "water_cement_ratio": 0.8503204791425869,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1094,
+          "prediction_mpa": 48.20848525437398,
+          "actual_mpa": 48.695621452,
+          "water_cement_ratio": 0.8571428571428571,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 469,
+          "prediction_mpa": 44.09781642245877,
+          "actual_mpa": 44.28,
+          "water_cement_ratio": 0.8741653826399589,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 990,
+          "prediction_mpa": 36.49199766072445,
+          "actual_mpa": 36.35,
+          "water_cement_ratio": 1.103425559947299,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1306,
+          "prediction_mpa": 32.905450925608534,
+          "actual_mpa": 29.65436276,
+          "water_cement_ratio": 0.7496916895413135,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1242,
+          "prediction_mpa": 30.603890725471537,
+          "actual_mpa": 31.53663224,
+          "water_cement_ratio": 0.849980432230291,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 926,
+          "prediction_mpa": 31.007964687606535,
+          "actual_mpa": 30.65,
+          "water_cement_ratio": 1.2469135802469136,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1733,
+          "prediction_mpa": 30.93525289220779,
+          "actual_mpa": 30.439675924,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1034,
+          "prediction_mpa": 44.49252962309677,
+          "actual_mpa": 44.296075096,
+          "water_cement_ratio": 0.9667673716012085,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 237,
+          "prediction_mpa": 48.64673256859355,
+          "actual_mpa": 47.13,
+          "water_cement_ratio": 0.8498596819457436,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1586,
+          "prediction_mpa": 33.09827685684468,
+          "actual_mpa": 32.626693796,
+          "water_cement_ratio": 0.9596899224806201,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1323,
+          "prediction_mpa": 48.38402632259939,
+          "actual_mpa": 48.67011084,
+          "water_cement_ratio": 0.9350142825752583,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 452,
+          "prediction_mpa": 48.699352409200934,
+          "actual_mpa": 48.99,
+          "water_cement_ratio": 0.9913693901035673,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1096,
+          "prediction_mpa": 45.565705574837935,
+          "actual_mpa": 44.698039604,
+          "water_cement_ratio": 1.3753581661891119,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 368,
+          "prediction_mpa": 56.84287953834294,
+          "actual_mpa": 56.63,
+          "water_cement_ratio": 0.7240577012563982,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1976,
+          "prediction_mpa": 32.94878864726053,
+          "actual_mpa": 32.96384756,
+          "water_cement_ratio": 1.1759197324414716,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1043,
+          "prediction_mpa": 46.46076662435089,
+          "actual_mpa": 42.32693164,
+          "water_cement_ratio": 1.2,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 39,
+          "prediction_mpa": 36.47265665758763,
+          "actual_mpa": 36.25,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1278,
+          "prediction_mpa": 44.43938959744128,
+          "actual_mpa": 44.298833,
+          "water_cement_ratio": 0.7841209829867675,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1975,
+          "prediction_mpa": 36.465848531795864,
+          "actual_mpa": 36.443632932,
+          "water_cement_ratio": 1.4317369549678343,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1277,
+          "prediction_mpa": 39.19364293765195,
+          "actual_mpa": 39.58971192,
+          "water_cement_ratio": 0.7841209829867675,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 675,
+          "prediction_mpa": 32.57783899861958,
+          "actual_mpa": 32.53,
+          "water_cement_ratio": 1.10657966286025,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 424,
+          "prediction_mpa": 30.170614889703216,
+          "actual_mpa": 33.01,
+          "water_cement_ratio": 0.94985590778098,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1317,
+          "prediction_mpa": 39.19787959610005,
+          "actual_mpa": 35.57006684,
+          "water_cement_ratio": 0.9349983460138935,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1243,
+          "prediction_mpa": 35.48718085340391,
+          "actual_mpa": 35.34253976,
+          "water_cement_ratio": 0.849980432230291,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1396,
+          "prediction_mpa": 52.586351566834296,
+          "actual_mpa": 52.20022796,
+          "water_cement_ratio": 0.7241973010702653,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 236,
+          "prediction_mpa": 40.48063021151934,
+          "actual_mpa": 40.23,
+          "water_cement_ratio": 0.8498596819457436,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1494,
+          "prediction_mpa": 56.4026516345577,
+          "actual_mpa": 56.8128224,
+          "water_cement_ratio": 0.9822155688622755,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 457,
+          "prediction_mpa": 38.1591749870959,
+          "actual_mpa": 39.27,
+          "water_cement_ratio": 0.7673031026252983,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 843,
+          "prediction_mpa": 44.62001912514337,
+          "actual_mpa": 44.61,
+          "water_cement_ratio": 1.2253521126760563,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 291,
+          "prediction_mpa": 31.14228634279545,
+          "actual_mpa": 31.27,
+          "water_cement_ratio": 0.9351648351648351,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 287,
+          "prediction_mpa": 39.07678835836739,
+          "actual_mpa": 35.57,
+          "water_cement_ratio": 0.9349503858875413,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 372,
+          "prediction_mpa": 39.528968434972334,
+          "actual_mpa": 37.27,
+          "water_cement_ratio": 0.7240749200548195,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 679,
+          "prediction_mpa": 32.29860831833496,
+          "actual_mpa": 33.0,
+          "water_cement_ratio": 0.9599056603773585,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 30,
+          "prediction_mpa": 55.21949893603818,
+          "actual_mpa": 55.26,
+          "water_cement_ratio": 0.75,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 939,
+          "prediction_mpa": 32.76779200984123,
+          "actual_mpa": 32.72,
+          "water_cement_ratio": 1.3879369431117203,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 878,
+          "prediction_mpa": 30.68383125583761,
+          "actual_mpa": 31.03,
+          "water_cement_ratio": 1.4736842105263157,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1072,
+          "prediction_mpa": 39.45152524656417,
+          "actual_mpa": 38.995383608,
+          "water_cement_ratio": 0.96,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 426,
+          "prediction_mpa": 31.02040365572978,
+          "actual_mpa": 29.55,
+          "water_cement_ratio": 0.9913693901035673,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1456,
+          "prediction_mpa": 31.070205224659844,
+          "actual_mpa": 29.55094136,
+          "water_cement_ratio": 0.9915424889246879,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 217,
+          "prediction_mpa": 37.25537887887703,
+          "actual_mpa": 38.56,
+          "water_cement_ratio": 0.8507619548081976,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 425,
+          "prediction_mpa": 33.07983950391639,
+          "actual_mpa": 32.9,
+          "water_cement_ratio": 0.9820359281437125,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 256,
+          "prediction_mpa": 33.48231725963072,
+          "actual_mpa": 31.64,
+          "water_cement_ratio": 0.7496470588235294,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 373,
+          "prediction_mpa": 46.83441490991275,
+          "actual_mpa": 46.23,
+          "water_cement_ratio": 0.7240749200548195,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1483,
+          "prediction_mpa": 31.06368123290616,
+          "actual_mpa": 31.715896,
+          "water_cement_ratio": 0.8753283597772408,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1021,
+          "prediction_mpa": 31.634282007921215,
+          "actual_mpa": 31.88,
+          "water_cement_ratio": 0.7032193158953722,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1090,
+          "prediction_mpa": 54.16421700752055,
+          "actual_mpa": 54.378282644,
+          "water_cement_ratio": 0.75,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 5,
+          "prediction_mpa": 47.16564280839363,
+          "actual_mpa": 47.03,
+          "water_cement_ratio": 0.8571428571428571,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1676,
+          "prediction_mpa": 47.53534497351116,
+          "actual_mpa": 47.714497104,
+          "water_cement_ratio": 0.8133493205435652,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1217,
+          "prediction_mpa": 30.862008463601327,
+          "actual_mpa": 29.44751996,
+          "water_cement_ratio": 0.8512772081309588,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1955,
+          "prediction_mpa": 32.28049579025228,
+          "actual_mpa": 27.234302,
+          "water_cement_ratio": 1.201219512195122,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        },
+        {
+          "index": 1301,
+          "prediction_mpa": 33.92024496375493,
+          "actual_mpa": 33.72916592,
+          "water_cement_ratio": 0.7506364617044229,
+          "reason": "high_water_cement_ratio_with_high_strength"
+        }
+      ],
+      "failed_count": 0,
+      "suspicious_count": 87,
+      "verdict": "WARN"
+    },
+    "source": "search",
+    "beats_baseline": true,
+    "trial_number": 23
+  },
+  "improvement_percentage": 2.196619844626874,
+  "validation_verdict": "WARN",
+  "best_model_name": "LGBMRegressor",
+  "best_model_hyperparameters": {
+    "n_estimators": 350,
+    "learning_rate": 0.14274725845230551,
+    "num_leaves": 46,
+    "min_child_samples": 11,
+    "subsample": 0.6934780666757696,
+    "colsample_bytree": 0.8244115207733527
+  },
+  "holdout_metrics": {
+    "rmse": 2.063842515838086,
+    "mae": 0.9081250647021155,
+    "r2": 0.9834850143259396,
+    "composite_score": 0.9611830093511762
+  },
+  "rmse_by_range": {
+    "low": 1.0150029730916514,
+    "mid": 2.317696524516504,
+    "high": 2.0474495479834705
+  }
+}
