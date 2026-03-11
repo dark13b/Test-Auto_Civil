@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import pickle
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,8 +14,10 @@ from sklearn.inspection import permutation_importance
 
 from train import (
     compute_regression_metrics,
+    EngineeringValidator,
     get_input_columns,
     get_outputs_dir,
+    load_pickle_artifact,
     load_config,
     load_dataset,
     log_status,
@@ -33,14 +34,6 @@ def load_json_artifact(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"Required artifact not found: {path}")
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
-
-
-def load_pickle_artifact(path: Path) -> Any:
-    """Load a pickle artifact from disk."""
-    if not path.exists():
-        raise FileNotFoundError(f"Required artifact not found: {path}")
-    with path.open("rb") as handle:
-        return pickle.load(handle)
 
 
 def save_figure(path: Path) -> None:
@@ -212,9 +205,9 @@ def create_performance_by_range_plot(
 def create_uncertainty_plot(interval_frame: pd.DataFrame, outputs_dir: Path) -> dict[str, Any]:
     """Create the interval-width plot across the predicted strength range."""
     color_map = {
-        "TIGHT": "#2a9d8f",
+        "HIGH": "#2a9d8f",
         "MODERATE": "#e9c46a",
-        "WIDE": "#e76f51",
+        "LOW": "#e76f51",
     }
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.figure(figsize=(8, 5))
@@ -244,6 +237,15 @@ def calculate_improvement_percentage(baseline_score: float, best_score: float) -
     return ((best_score - baseline_score) / denominator) * 100.0
 
 
+def confidence_labels_from_coverage(bin_coverages: np.ndarray) -> np.ndarray:
+    """Map observed bin coverage rates to human-readable confidence labels."""
+    return np.where(
+        bin_coverages > 0.92,
+        "HIGH",
+        np.where(bin_coverages >= 0.85, "MODERATE", "LOW"),
+    )
+
+
 def main() -> int:
     """Generate the final plots and consolidated metrics report."""
     try:
@@ -259,9 +261,14 @@ def main() -> int:
 
         data = load_dataset(config)
         x_train, x_test, y_train, y_test = split_dataset(data, config)
+        validator = EngineeringValidator.from_config(config)
         baseline_pred = np.asarray(baseline_model.predict(x_test), dtype=float)
         y_pred = np.asarray(best_model.predict(x_test), dtype=float)
         holdout_metrics = compute_regression_metrics(y_test, y_pred, config, float(y_train.mean()))
+        validation_report = validator.validate_model(best_model, x_test, y_test)
+        validation_result = dict(best_search_result)
+        validation_result["validation_verdict"] = validation_report["verdict"]
+        validation_result["validation_report"] = validation_report
         baseline_rmse_by_range = compute_rmse_by_range(y_test, baseline_pred)
 
         create_search_progress_plot(optuna_results, float(baseline_metrics["composite_score"]), outputs_dir)
@@ -271,33 +278,75 @@ def main() -> int:
         create_feature_importance_plot(feature_importance, outputs_dir)
         rmse_by_range = create_performance_by_range_plot(y_test, y_pred, outputs_dir)
         uncertainty_estimator = UncertaintyEstimator(method=str(config["engineering"]["uncertainty_method"]))
+        uncertainty_audit = uncertainty_estimator.calibration_report()
         interval_frame = uncertainty_estimator.predict_with_interval(x_test)
+        audit_coverages = {
+            int(row["bin_id"]): float(row["observed_coverage"])
+            for row in uncertainty_audit.get("reliability_plot_data", [])
+        }
+        if audit_coverages:
+            interval_frame["bin_coverage"] = interval_frame["strength_bin"].map(audit_coverages).astype(float)
+            interval_frame["confidence_label"] = confidence_labels_from_coverage(
+                interval_frame["bin_coverage"].to_numpy(dtype=float)
+            )
         uncertainty_summary = create_uncertainty_plot(interval_frame, outputs_dir)
+        uncertainty_summary["coverage"] = float(uncertainty_audit["coverage"])
+        uncertainty_summary["coverage_target"] = float(uncertainty_audit["coverage_target"])
+        uncertainty_summary["coverage_audit"] = uncertainty_audit.get("coverage_audit", {})
 
         improvement_percentage = calculate_improvement_percentage(
             float(baseline_metrics["composite_score"]),
             float(best_search_result["composite_score"]),
         )
+        validation_summary = {
+            "context_type": validation_report.get("context_type", "general"),
+            "pass_rate": float(validation_report["pass_rate"]),
+            "hard_failed_count": int(validation_report.get("hard_failed_count", validation_report["failed_count"])),
+            "warning_count": int(validation_report["warning_count"]),
+            "statistical_errors": int(
+                validation_report.get(
+                    "statistical_errors",
+                    validation_report.get("statistical_error_count", validation_report["suspicious_count"]),
+                )
+            ),
+            "durability_warnings": int(
+                validation_report.get(
+                    "durability_warnings",
+                    validation_report.get(
+                        "durability_warning_count",
+                        validation_report.get("durability_caution_count", 0),
+                    ),
+                )
+            ),
+            "dataset_anomalies": int(
+                validation_report.get("dataset_anomalies", validation_report.get("dataset_anomaly_count", 0))
+            ),
+        }
         final_metrics = {
             "baseline_metrics": baseline_metrics,
-            "best_search_metrics": best_search_result,
+            "best_search_metrics": validation_result,
             "improvement_percentage": improvement_percentage,
             "composite_improvement_pct": improvement_percentage,
-            "validation_verdict": best_search_result["validation_verdict"],
-            "best_model_name": best_search_result["model_name"],
-            "best_model_hyperparameters": best_search_result["hyperparameters"],
+            "validation_verdict": validation_result["validation_verdict"],
+            "best_model_name": validation_result["model_name"],
+            "best_model_hyperparameters": validation_result["hyperparameters"],
+            "validation_summary": validation_summary,
             "holdout_metrics": holdout_metrics,
             "rmse_by_range": rmse_by_range,
             "baseline_rmse_by_range": baseline_rmse_by_range,
             "uncertainty_summary": uncertainty_summary,
+            "uncertainty_audit": uncertainty_audit.get("coverage_audit", {}),
         }
         save_json_artifact(outputs_dir / "final_metrics.json", final_metrics)
 
         log_status(
-            f"Final report ready. Best model={best_search_result['model_name']} | "
-            f"Composite={best_search_result['composite_score']:.4f} | "
+            f"Final report ready. Best model={validation_result['model_name']} | "
+            f"Composite={validation_result['composite_score']:.4f} | "
             f"Improvement={improvement_percentage:.2f}% | "
-            f"Validation={best_search_result['validation_verdict']}"
+            f"Validation={validation_result['validation_verdict']} | "
+            f"StatisticalErrors={validation_summary['statistical_errors']} | "
+            f"DurabilityWarnings={validation_summary['durability_warnings']} | "
+            f"DatasetAnomalies={validation_summary['dataset_anomalies']}"
         )
         return 0
     except Exception as exc:

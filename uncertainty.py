@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pickle
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,7 @@ from train import (
     build_stratification_bins,
     get_base_input_columns,
     get_input_columns,
+    load_pickle_artifact,
     get_outputs_dir,
     get_project_root,
     load_config,
@@ -51,14 +51,17 @@ class UncertaintyEstimator:
             method or self.config.get("engineering", {}).get("uncertainty_method", "conformal")
         ).strip().lower()
         self.seed = int(self.config["experiment"]["random_seed"])
-        self.coverage_level = float(self.config["uncertainty"]["coverage_level"])
+        self.coverage_level = max(0.92, float(self.config["uncertainty"]["coverage_level"]))
         self.feature_columns = get_input_columns(self.config)
         self.base_columns = get_base_input_columns(self.config)
         self.tight_threshold = float(self.config["uncertainty"]["tight_threshold_mpa"])
         self.wide_threshold = float(self.config["uncertainty"]["wide_threshold_mpa"])
         self.quantile_models: dict[str, Any] = {}
         self.conformal_model: Any | None = None
-        self.conformal_quantile: float | None = None
+        self.conformal_global_quantile: float | None = None
+        self.conformal_bin_edges: np.ndarray | None = None
+        self.conformal_bin_quantiles: dict[int, float] = {}
+        self.conformal_bin_calibration_coverage: dict[int, float] = {}
 
         if self.method not in {"conformal", "quantile", "both"}:
             raise ValueError(
@@ -70,7 +73,7 @@ class UncertaintyEstimator:
             )
 
         set_global_seed(self.seed)
-        self.loaded_model = self._load_pickle(self.model_path)
+        self.loaded_model = load_pickle_artifact(self.model_path)
         dataset = load_dataset(self.config)
         x_train_full, x_test, y_train_full, y_test = split_dataset(dataset, self.config)
         calibration_fraction = float(self.config["uncertainty"]["calibration_fraction"])
@@ -120,12 +123,6 @@ class UncertaintyEstimator:
             resolved_path = self.project_root / resolved_path
         return resolved_path
 
-    @staticmethod
-    def _load_pickle(path: Path) -> Any:
-        """Load a pickle artifact from disk."""
-        with path.open("rb") as handle:
-            return pickle.load(handle)
-
     def _fit_estimators(self) -> None:
         """Fit the interval estimators required by the selected method."""
         if self.method in {"conformal", "both"}:
@@ -141,7 +138,22 @@ class UncertaintyEstimator:
                 1.0,
                 np.ceil((len(nonconformity_scores) + 1) * (1.0 - alpha)) / len(nonconformity_scores),
             )
-            self.conformal_quantile = self._quantile(nonconformity_scores, quantile_level)
+            self.conformal_global_quantile = self._quantile(nonconformity_scores, quantile_level)
+            calibration_bins, bin_edges = self._build_strength_bins(calibration_predictions)
+            self.conformal_bin_edges = bin_edges
+            unique_bins = sorted(np.unique(calibration_bins).tolist())
+            for bin_id in unique_bins:
+                bin_mask = calibration_bins == bin_id
+                bin_scores = nonconformity_scores[bin_mask]
+                if len(bin_scores) == 0:
+                    self.conformal_bin_quantiles[int(bin_id)] = float(self.conformal_global_quantile)
+                    self.conformal_bin_calibration_coverage[int(bin_id)] = float(self.coverage_level)
+                    continue
+                bin_quantile = self._quantile(bin_scores, quantile_level)
+                self.conformal_bin_quantiles[int(bin_id)] = float(bin_quantile)
+                self.conformal_bin_calibration_coverage[int(bin_id)] = float(
+                    np.mean(bin_scores <= bin_quantile)
+                )
 
         if self.method in {"quantile", "both"}:
             if LGBMRegressor is None:
@@ -176,6 +188,38 @@ class UncertaintyEstimator:
         except TypeError:
             return float(np.quantile(values, quantile_level, interpolation="higher"))
 
+    def _build_strength_bins(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Construct quantile-based strength bins and reusable cut edges."""
+        array = np.asarray(values, dtype=float)
+        if array.size == 0:
+            return np.asarray([], dtype=int), np.asarray([0.0, 1.0], dtype=float)
+
+        requested_bins = max(1, min(int(self.config["uncertainty"]["reliability_bins"]), int(array.size)))
+        try:
+            bin_codes, bin_edges = pd.qcut(
+                pd.Series(array),
+                q=requested_bins,
+                labels=False,
+                retbins=True,
+                duplicates="drop",
+            )
+        except ValueError:
+            bin_codes = pd.Series(np.zeros(len(array), dtype=int))
+            center = float(array[0])
+            bin_edges = np.asarray([center - 1e-6, center + 1e-6], dtype=float)
+        clean_edges = np.asarray(bin_edges, dtype=float)
+        if clean_edges.size < 2:
+            center = float(array[0])
+            clean_edges = np.asarray([center - 1e-6, center + 1e-6], dtype=float)
+        return np.asarray(pd.Series(bin_codes).fillna(0), dtype=int), clean_edges
+
+    def _assign_strength_bins(self, values: np.ndarray) -> np.ndarray:
+        """Assign predicted strengths to the fitted calibration bins."""
+        array = np.asarray(values, dtype=float)
+        if self.conformal_bin_edges is None or self.conformal_bin_edges.size < 2:
+            return np.zeros(len(array), dtype=int)
+        return np.digitize(array, self.conformal_bin_edges[1:-1], right=True).astype(int)
+
     def _prepare_input_frame(self, x: pd.DataFrame | np.ndarray) -> pd.DataFrame:
         """Normalize inference input into the trained feature schema."""
         if isinstance(x, pd.DataFrame):
@@ -203,26 +247,36 @@ class UncertaintyEstimator:
                 )
         return frame[self.feature_columns].copy()
 
-    def _confidence_labels(self, interval_widths: np.ndarray) -> np.ndarray:
-        """Map interval widths to human-readable confidence labels."""
+    def _confidence_labels(self, bin_coverages: np.ndarray) -> np.ndarray:
+        """Map per-bin coverage rates to human-readable confidence labels."""
         return np.where(
-            interval_widths < self.tight_threshold,
-            "TIGHT",
-            np.where(interval_widths <= self.wide_threshold, "MODERATE", "WIDE"),
+            bin_coverages > 0.92,
+            "HIGH",
+            np.where(bin_coverages >= 0.85, "MODERATE", "LOW"),
         )
 
     def _predict_conformal(self, x: pd.DataFrame) -> pd.DataFrame:
         """Predict conformal intervals."""
-        if self.conformal_model is None or self.conformal_quantile is None:
+        if self.conformal_model is None or self.conformal_global_quantile is None:
             raise RuntimeError("Conformal estimator is not initialized.")
         predicted = np.asarray(self.conformal_model.predict(x), dtype=float)
-        lower = predicted - self.conformal_quantile
-        upper = predicted + self.conformal_quantile
+        strength_bins = self._assign_strength_bins(predicted)
+        quantiles = np.asarray(
+            [
+                self.conformal_bin_quantiles.get(int(bin_id), float(self.conformal_global_quantile))
+                for bin_id in strength_bins
+            ],
+            dtype=float,
+        )
+        lower = predicted - quantiles
+        upper = predicted + quantiles
         return pd.DataFrame(
             {
                 "predicted": predicted,
                 "lower_90": lower,
                 "upper_90": upper,
+                "strength_bin": strength_bins,
+                "bin_quantile": quantiles,
             },
             index=x.index,
         )
@@ -251,6 +305,8 @@ class UncertaintyEstimator:
             result = self._predict_conformal(feature_frame)
         elif self.method == "quantile":
             result = self._predict_quantile(feature_frame)
+            result["strength_bin"] = self._assign_strength_bins(result["predicted"].to_numpy(dtype=float))
+            result["bin_quantile"] = np.nan
         else:
             conformal_result = self._predict_conformal(feature_frame)
             quantile_result = self._predict_quantile(feature_frame)
@@ -265,13 +321,23 @@ class UncertaintyEstimator:
                         conformal_result["upper_90"].to_numpy(dtype=float),
                         quantile_result["upper_90"].to_numpy(dtype=float),
                     ),
+                    "strength_bin": conformal_result["strength_bin"].to_numpy(dtype=int),
+                    "bin_quantile": conformal_result["bin_quantile"].to_numpy(dtype=float),
                 },
                 index=feature_frame.index,
             )
 
         interval_width = result["upper_90"].to_numpy(dtype=float) - result["lower_90"].to_numpy(dtype=float)
         result["interval_width"] = interval_width
-        result["confidence_label"] = self._confidence_labels(interval_width)
+        default_coverages = np.asarray(
+            [
+                self.conformal_bin_calibration_coverage.get(int(bin_id), float(self.coverage_level))
+                for bin_id in result["strength_bin"].to_numpy(dtype=int)
+            ],
+            dtype=float,
+        )
+        result["bin_coverage"] = default_coverages
+        result["confidence_label"] = self._confidence_labels(default_coverages)
         return result
 
     def calibration_report(self) -> dict[str, Any]:
@@ -283,19 +349,12 @@ class UncertaintyEstimator:
         )
         coverage = float(np.mean(covered))
         mean_interval_width = float(interval_frame["interval_width"].mean())
-        reliability_bins = min(int(self.config["uncertainty"]["reliability_bins"]), len(interval_frame))
-        prediction_bins = pd.qcut(
-            interval_frame["predicted"].rank(method="first"),
-            q=max(1, reliability_bins),
-            labels=False,
-            duplicates="drop",
-        )
         reliability_frame = pd.DataFrame(
             {
                 "predicted": interval_frame["predicted"],
                 "interval_width": interval_frame["interval_width"],
                 "covered": covered.astype(float),
-                "bin_id": prediction_bins,
+                "bin_id": interval_frame["strength_bin"].to_numpy(dtype=int),
             }
         )
         grouped = (
@@ -307,8 +366,22 @@ class UncertaintyEstimator:
                 mean_interval_width=("interval_width", "mean"),
                 sample_count=("covered", "size"),
             )
-            .reset_index(drop=True)
+            .reset_index()
         )
+        grouped["coverage_flag"] = np.where(grouped["observed_coverage"] < 0.80, "LOW_COVERAGE", "OK")
+        grouped["confidence_label"] = self._confidence_labels(
+            grouped["observed_coverage"].to_numpy(dtype=float)
+        )
+        bin_coverages = {
+            int(bin_id): float(observed_coverage)
+            for bin_id, observed_coverage in zip(grouped["bin_id"], grouped["observed_coverage"])
+        }
+        interval_frame["covered"] = covered.astype(bool)
+        interval_frame["bin_coverage"] = interval_frame["strength_bin"].map(bin_coverages).astype(float)
+        interval_frame["confidence_label"] = self._confidence_labels(
+            interval_frame["bin_coverage"].to_numpy(dtype=float)
+        )
+        audit_status = "FAIL" if coverage < 0.88 else "PASS"
         report = {
             "method": self.method,
             "coverage_target": self.coverage_level,
@@ -318,14 +391,45 @@ class UncertaintyEstimator:
             "calibration_sample_count": int(len(self.y_calibration)),
             "test_sample_count": int(len(self.y_test)),
             "reliability_plot_data": grouped.to_dict(orient="records"),
+            "coverage_audit": {
+                "global_status": audit_status,
+                "global_coverage_pass_threshold": 0.88,
+                "bin_coverage_pass_threshold": 0.80,
+                "bins_below_threshold": grouped.loc[
+                    grouped["observed_coverage"] < 0.80,
+                    ["predicted_min", "predicted_max", "observed_coverage", "sample_count"],
+                ].to_dict(orient="records"),
+                "bin_details": grouped.to_dict(orient="records"),
+            },
         }
         report_path = self.outputs_dir / "uncertainty_calibration.json"
         save_json_artifact(report_path, report)
+        for row in grouped.to_dict(orient="records"):
+            flag = row["coverage_flag"]
+            log_status(
+                "Coverage audit bin "
+                f"{int(row['bin_id'])}: {row['predicted_min']:.2f}-{row['predicted_max']:.2f} MPa | "
+                f"coverage={row['observed_coverage']:.3f} | n={int(row['sample_count'])} | {flag}"
+            )
+        if audit_status == "FAIL":
+            log_status(
+                f"FAIL uncertainty coverage audit | coverage={coverage:.3f} | required_min=0.880"
+            )
         log_status(
             f"Saved uncertainty calibration report to {report_path} | "
             f"Coverage={coverage:.3f} | Mean interval width={mean_interval_width:.3f}"
         )
         return report
+
+
+def recalibrate_uncertainty_artifacts(
+    model_path: str | Path | None = None,
+    config_path: str | Path | None = None,
+    method: str | None = None,
+) -> dict[str, Any]:
+    """Recompute and save uncertainty calibration artifacts for the current best model."""
+    estimator = UncertaintyEstimator(model_path=model_path, config_path=config_path, method=method)
+    return estimator.calibration_report()
 
 
 def main() -> int:

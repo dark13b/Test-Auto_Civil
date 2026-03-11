@@ -10,6 +10,12 @@ import pandas as pd
 
 from feature_engineering import build_engineering_features
 
+CONTEXT_DURABILITY_WATER_CEMENT_LIMITS = {
+    "exposed": 0.45,
+    "structural": 0.50,
+    "general": 0.60,
+}
+
 
 @dataclass
 class EngineeringValidator:
@@ -30,6 +36,7 @@ class EngineeringValidator:
     high_water_cement_strength_hard_fail_max_age_days: float
     high_water_cement_strength_low_scm_threshold: float
     high_water_cement_strength_unfavorable_water_binder_ratio: float
+    context_type: str = "general"
     water_column: str = "water"
     cement_column: str = "cement"
 
@@ -44,6 +51,7 @@ class EngineeringValidator:
             suspicious_water_cement_ratio=float(rules["suspicious_water_cement_ratio"]),
             suspicious_strength_mpa=float(rules["suspicious_strength_mpa"]),
             durability_water_cement_warn=float(rules["durability_water_cement_warn"]),
+            context_type=str(rules.get("context_type", "general")).strip().lower(),
             low_water_binder_warn=float(rules["low_water_binder_warn"]),
             total_binder_low_warn=float(rules["total_binder_low_warn"]),
             total_binder_high_warn=float(rules["total_binder_high_warn"]),
@@ -60,6 +68,21 @@ class EngineeringValidator:
             high_water_cement_strength_unfavorable_water_binder_ratio=float(
                 rules.get("high_water_cement_strength_unfavorable_water_binder_ratio", 0.50)
             ),
+        )
+
+    def __post_init__(self) -> None:
+        """Validate validator configuration after dataclass initialization."""
+        if self.context_type not in CONTEXT_DURABILITY_WATER_CEMENT_LIMITS:
+            valid_contexts = ", ".join(sorted(CONTEXT_DURABILITY_WATER_CEMENT_LIMITS))
+            raise ValueError(f"validator.context_type must be one of: {valid_contexts}")
+
+    def _durability_water_cement_limit(self) -> float:
+        """Return the water/cement durability threshold for the active context."""
+        return float(
+            CONTEXT_DURABILITY_WATER_CEMENT_LIMITS.get(
+                self.context_type,
+                self.durability_water_cement_warn,
+            )
         )
 
     def _prepare_frame(self, x_test: pd.DataFrame) -> pd.DataFrame:
@@ -80,6 +103,7 @@ class EngineeringValidator:
         """Evaluate a single prediction against engineering rules."""
         warning_reasons: list[str] = []
         failure_reasons: list[str] = []
+        statistical_error_reasons: list[str] = []
         durability_caution_reasons: list[str] = []
         dataset_anomaly_reasons: list[str] = []
         triggered_rules: list[str] = []
@@ -88,12 +112,15 @@ class EngineeringValidator:
             reason: str,
             rule_name: str,
             *,
+            statistical: bool = False,
             durability: bool = False,
             dataset_anomaly: bool = False,
         ) -> None:
             """Append a warning once and optionally classify it."""
             if reason not in warning_reasons:
                 warning_reasons.append(reason)
+            if statistical and reason not in statistical_error_reasons:
+                statistical_error_reasons.append(reason)
             if durability and reason not in durability_caution_reasons:
                 durability_caution_reasons.append(reason)
             if dataset_anomaly and reason not in dataset_anomaly_reasons:
@@ -105,6 +132,8 @@ class EngineeringValidator:
             """Append a hard failure once."""
             if reason not in failure_reasons:
                 failure_reasons.append(reason)
+            if reason not in statistical_error_reasons:
+                statistical_error_reasons.append(reason)
             if rule_name not in triggered_rules:
                 triggered_rules.append(rule_name)
 
@@ -163,22 +192,25 @@ class EngineeringValidator:
                     add_warning(
                         "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
                         "high_water_cement_ratio_with_high_strength_warn",
+                        statistical=True,
                         dataset_anomaly=True,
                     )
                     if scm_present:
                         add_warning(
                             "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
                             "scm_mix_water_binder_context_used",
+                            statistical=True,
                         )
                     if early_age and unfavorable_water_binder_ratio:
                         add_warning(
                             "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
                             "early_age_high_strength_with_unfavorable_water_binder_ratio_warn",
+                            statistical=True,
                         )
 
-        if water_cement_ratio > self.durability_water_cement_warn:
+        if water_cement_ratio > self._durability_water_cement_limit():
             add_warning(
-                "Water/cement ratio exceeds the typical durability limit for moderate exposure.",
+                f"Water/cement ratio exceeds the typical durability limit for {self.context_type} concrete.",
                 "water_cement_ratio_warn_exceeds_durability_limit",
                 durability=True,
             )
@@ -186,6 +218,7 @@ class EngineeringValidator:
             add_warning(
                 "Water/binder ratio is very low; workability may be compromised.",
                 "water_binder_ratio_warn_too_low",
+                durability=True,
             )
         if total_binder < self.total_binder_low_warn:
             add_warning(
@@ -197,6 +230,7 @@ class EngineeringValidator:
             add_warning(
                 "Total binder content is high; shrinkage risk increases.",
                 "total_binder_warn_too_high",
+                durability=True,
             )
         if fly_ash_replacement_ratio > self.fly_ash_replacement_warn:
             add_warning(
@@ -214,6 +248,7 @@ class EngineeringValidator:
             add_warning(
                 "Early-age strength prediction is suspiciously high for the curing age.",
                 "early_age_strength_warn_suspicious",
+                statistical=True,
             )
         if (
             scm_present
@@ -225,6 +260,7 @@ class EngineeringValidator:
             add_warning(
                 "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
                 "scm_mix_high_water_binder_ratio_warn",
+                statistical=True,
             )
 
         overall_verdict = "PASS"
@@ -237,6 +273,7 @@ class EngineeringValidator:
             "index": int(row_index) if isinstance(row_index, (int, np.integer)) else str(row_index),
             "prediction_mpa": float(prediction),
             "actual_mpa": actual_value,
+            "context_type": self.context_type,
             "water_cement_ratio": water_cement_ratio,
             "water_binder_ratio": water_binder_ratio,
             "total_binder": total_binder,
@@ -244,16 +281,20 @@ class EngineeringValidator:
             "fly_ash_replacement_ratio": fly_ash_replacement_ratio,
             "slag_replacement_ratio": slag_replacement_ratio,
             "age_days": age,
+            "statistical_error_reasons": statistical_error_reasons,
             "warning_reasons": warning_reasons,
             "failure_reasons": failure_reasons,
             "hard_failure_reasons": list(failure_reasons),
             "durability_caution_reasons": durability_caution_reasons,
+            "durability_warning_reasons": list(durability_caution_reasons),
             "dataset_anomaly_reasons": dataset_anomaly_reasons,
             "triggered_rules": triggered_rules,
+            "statistical_error_count": len(statistical_error_reasons),
             "warning_count": len(warning_reasons),
             "failure_count": len(failure_reasons),
             "hard_failure_count": len(failure_reasons),
             "durability_caution_count": len(durability_caution_reasons),
+            "durability_warning_count": len(durability_caution_reasons),
             "dataset_anomaly_count": len(dataset_anomaly_reasons),
             "overall_verdict": overall_verdict,
         }
@@ -303,6 +344,9 @@ class EngineeringValidator:
         failed_samples = [sample for sample in sample_reports if sample["overall_verdict"] == "FAIL"]
         warning_samples = [sample for sample in sample_reports if sample["warning_reasons"]]
         warning_only_samples = [sample for sample in sample_reports if sample["overall_verdict"] == "WARN"]
+        statistical_error_samples = [
+            sample for sample in sample_reports if sample["statistical_error_reasons"]
+        ]
         durability_caution_samples = [
             sample for sample in sample_reports if sample["durability_caution_reasons"]
         ]
@@ -321,6 +365,13 @@ class EngineeringValidator:
                 reason
                 for sample in sample_reports
                 for reason in sample["warning_reasons"]
+            }
+        )
+        statistical_error_reasons = sorted(
+            {
+                reason
+                for sample in sample_reports
+                for reason in sample["statistical_error_reasons"]
             }
         )
         hard_fail_reasons = sorted(
@@ -350,21 +401,31 @@ class EngineeringValidator:
                 rule_violations_by_sample[rule_name] = rule_violations_by_sample.get(rule_name, 0) + 1
 
         return {
+            "context_type": self.context_type,
             "pass_rate": pass_rate,
             "failed_samples": failed_samples,
             "warning_samples": warning_samples,
-            "suspicious_samples": warning_samples,
+            "suspicious_samples": statistical_error_samples,
+            "statistical_error_samples": statistical_error_samples,
             "durability_caution_samples": durability_caution_samples,
+            "durability_warning_samples": durability_caution_samples,
             "dataset_anomaly_samples": dataset_anomaly_samples,
             "failed_count": len(failed_samples),
             "hard_failed_count": len(failed_samples),
             "warning_count": len(warning_samples),
-            "suspicious_count": len(warning_samples),
+            "suspicious_count": len(statistical_error_samples),
+            "statistical_errors": len(statistical_error_samples),
+            "statistical_error_count": len(statistical_error_samples),
+            "durability_warnings": len(durability_caution_samples),
             "durability_caution_count": len(durability_caution_samples),
+            "durability_warning_count": len(durability_caution_samples),
+            "dataset_anomalies": len(dataset_anomaly_samples),
             "dataset_anomaly_count": len(dataset_anomaly_samples),
             "warn_reasons": warn_reasons,
+            "statistical_error_reasons": statistical_error_reasons,
             "hard_fail_reasons": hard_fail_reasons,
             "durability_caution_reasons": durability_caution_reasons,
+            "durability_warning_reasons": durability_caution_reasons,
             "dataset_anomaly_reasons": dataset_anomaly_reasons,
             "rule_violations_by_sample": rule_violations_by_sample,
             "sample_reports": sample_reports,

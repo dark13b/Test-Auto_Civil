@@ -6,7 +6,11 @@ import json
 import os
 import pickle
 import random
+import re
 import sys
+import warnings
+from hashlib import sha256
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +37,17 @@ try:
     from xgboost import XGBRegressor
 except ImportError:
     XGBRegressor = None
+
+
+ARTIFACT_VERSION_MODULES = {
+    "scikit-learn": "sklearn",
+    "lightgbm": "lightgbm",
+    "xgboost": "xgboost",
+    "optuna": "optuna",
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "joblib": "joblib",
+}
 
 
 def log_status(message: str) -> None:
@@ -354,26 +369,193 @@ def evaluate_candidate(
             "holdout_mae": test_metrics["mae"],
             "holdout_r2": test_metrics["r2"],
             "holdout_composite": test_metrics["composite_score"],
+            "validator_context_type": validation_report.get("context_type", "general"),
             "validation_pass_rate": validation_report["pass_rate"],
             "failed_count": validation_report["failed_count"],
             "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
             "warning_count": validation_report["warning_count"],
             "suspicious_count": validation_report["suspicious_count"],
+            "statistical_errors": validation_report.get(
+                "statistical_errors",
+                validation_report.get("statistical_error_count", validation_report["suspicious_count"]),
+            ),
+            "statistical_error_count": validation_report.get(
+                "statistical_error_count",
+                validation_report.get("statistical_errors", validation_report["suspicious_count"]),
+            ),
+            "durability_warnings": validation_report.get(
+                "durability_warnings",
+                validation_report.get("durability_warning_count", validation_report.get("durability_caution_count", 0)),
+            ),
+            "durability_warning_count": validation_report.get(
+                "durability_warning_count",
+                validation_report.get("durability_warnings", validation_report.get("durability_caution_count", 0)),
+            ),
             "durability_caution_count": validation_report.get("durability_caution_count", 0),
+            "dataset_anomalies": validation_report.get(
+                "dataset_anomalies",
+                validation_report.get("dataset_anomaly_count", 0),
+            ),
             "dataset_anomaly_count": validation_report.get("dataset_anomaly_count", 0),
             "warn_reasons": validation_report["warn_reasons"],
+            "statistical_error_reasons": validation_report.get("statistical_error_reasons", []),
             "hard_fail_reasons": validation_report.get("hard_fail_reasons", []),
+            "durability_warning_reasons": validation_report.get(
+                "durability_warning_reasons",
+                validation_report.get("durability_caution_reasons", []),
+            ),
             "durability_caution_reasons": validation_report.get("durability_caution_reasons", []),
             "dataset_anomaly_reasons": validation_report.get("dataset_anomaly_reasons", []),
         }
     )
     return candidate_model, result
 
+def get_runtime_library_versions() -> dict[str, str]:
+    """Return the currently installed versions for tracked runtime libraries."""
+    versions: dict[str, str] = {}
+    for package_name, module_name in ARTIFACT_VERSION_MODULES.items():
+        try:
+            versions[package_name] = str(import_module(module_name).__version__)
+        except Exception:
+            versions[package_name] = "unavailable"
+    return versions
 
-def save_pickle_artifact(path: Path, obj: Any) -> None:
-    """Serialize an object as a pickle file."""
+
+def compute_config_hash(config: dict[str, Any] | None) -> str | None:
+    """Return a stable hash of the active configuration."""
+    if config is None:
+        return None
+    normalized = json.dumps(to_serializable(config), sort_keys=True, separators=(",", ":"))
+    return sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def build_pickle_artifact_metadata(
+    obj: Any,
+    config: dict[str, Any] | None = None,
+    model_id: str | None = None,
+) -> dict[str, Any]:
+    """Build metadata stored alongside pickled model artifacts."""
+    return {
+        "artifact_schema_version": 1,
+        "library_versions": get_runtime_library_versions(),
+        "saved_at": pd.Timestamp.now().isoformat(),
+        "model_id": model_id or type(obj).__name__,
+        "config_hash": compute_config_hash(config),
+    }
+
+
+def _emit_artifact_version_warning(path: Path, metadata: dict[str, Any]) -> None:
+    """Log a structured warning when a saved artifact differs from the runtime environment."""
+    saved_versions = metadata.get("library_versions")
+    if not isinstance(saved_versions, dict):
+        return
+
+    current_versions = get_runtime_library_versions()
+    mismatches = []
+    for package_name, saved_version in saved_versions.items():
+        current_version = current_versions.get(package_name)
+        if current_version is None or str(saved_version) == str(current_version):
+            continue
+        mismatches.append(
+            {
+                "package": package_name,
+                "saved": str(saved_version),
+                "current": str(current_version),
+            }
+        )
+
+    if not mismatches:
+        return
+
+    warning_payload = {
+        "path": str(path),
+        "model_id": metadata.get("model_id"),
+        "saved_at": metadata.get("saved_at"),
+        "config_hash": metadata.get("config_hash"),
+        "mismatches": mismatches,
+    }
+    log_status(
+        "WARNING artifact_version_mismatch "
+        + json.dumps(to_serializable(warning_payload), sort_keys=True)
+    )
+
+
+def save_pickle_artifact(
+    path: Path,
+    obj: Any,
+    *,
+    config: dict[str, Any] | None = None,
+    model_id: str | None = None,
+) -> None:
+    """Serialize an object as a pickle file with backward-compatible metadata."""
+    artifact_bundle = {
+        "artifact_metadata": build_pickle_artifact_metadata(obj, config=config, model_id=model_id),
+        "payload": obj,
+    }
     with path.open("wb") as handle:
-        pickle.dump(obj, handle)
+        pickle.dump(artifact_bundle, handle)
+
+
+def load_pickle_artifact(path: Path, *, return_metadata: bool = False) -> Any:
+    """Load a pickle artifact, preserving compatibility with older raw-model pickles."""
+    if not path.exists():
+        raise FileNotFoundError(f"Required artifact not found: {path}")
+
+    with path.open("rb") as handle:
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            raw_artifact = pickle.load(handle)
+
+    current_versions = get_runtime_library_versions()
+    emitted_warnings: set[tuple[str, str | None, str | None]] = set()
+    for caught_warning in caught_warnings:
+        category_name = caught_warning.category.__name__
+        warning_text = str(caught_warning.message)
+        if category_name != "InconsistentVersionWarning":
+            continue
+        mismatch_match = re.search(
+            r"from version\s+(?P<saved>[^\s]+)\s+when using version\s+(?P<current>[^\s]+)",
+            warning_text,
+        )
+        saved_version = None if mismatch_match is None else mismatch_match.group("saved")
+        current_version = current_versions.get("scikit-learn")
+        warning_signature = ("scikit-learn", saved_version, current_version)
+        if warning_signature in emitted_warnings:
+            continue
+        emitted_warnings.add(warning_signature)
+        warning_payload = {
+            "path": str(path),
+            "model_id": None,
+            "saved_at": None,
+            "config_hash": None,
+            "mismatches": [
+                {
+                    "package": "scikit-learn",
+                    "saved": saved_version,
+                    "current": current_version,
+                }
+            ],
+        }
+        log_status(
+            "WARNING artifact_version_mismatch "
+            + json.dumps(to_serializable(warning_payload), sort_keys=True)
+        )
+
+    if (
+        isinstance(raw_artifact, dict)
+        and "payload" in raw_artifact
+        and isinstance(raw_artifact.get("artifact_metadata"), dict)
+    ):
+        metadata = dict(raw_artifact["artifact_metadata"])
+        _emit_artifact_version_warning(path, metadata)
+        payload = raw_artifact["payload"]
+    else:
+        metadata = None
+        payload = raw_artifact
+
+    if return_metadata:
+        return payload, metadata
+    return payload
 
 
 def to_serializable(value: Any) -> Any:
@@ -433,7 +615,12 @@ def main() -> int:
 
         baseline_model_path = outputs_dir / "baseline_model.pkl"
         baseline_metrics_path = outputs_dir / "baseline_metrics.json"
-        save_pickle_artifact(baseline_model_path, baseline_model)
+        save_pickle_artifact(
+            baseline_model_path,
+            baseline_model,
+            config=config,
+            model_id=baseline_name,
+        )
         save_json_artifact(baseline_metrics_path, baseline_result)
 
         log_status(f"Saved baseline model to {baseline_model_path}")

@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import pickle
 import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import optuna
 import pandas as pd
-from scipy.stats import qmc
 
 from feature_engineering import build_engineering_features
 from train import (
@@ -19,7 +18,10 @@ from train import (
     get_input_columns,
     get_outputs_dir,
     get_project_root,
+    get_target_column,
     load_config,
+    load_dataset,
+    load_pickle_artifact,
     log_status,
     save_json_artifact,
     set_global_seed,
@@ -31,7 +33,7 @@ class MixDesignOptimizer:
     """Search for low-cement mix designs that meet a target compressive strength."""
 
     def __init__(self, model_path: str | Path | None = None, config_path: str | Path | None = None) -> None:
-        """Load the trained model, configuration, and engineering validator."""
+        """Load the trained model, configuration, validator, and reference dataset."""
         self.project_root = get_project_root()
         self.config = self._load_config(config_path)
         self.outputs_dir = get_outputs_dir(self.config)
@@ -45,9 +47,12 @@ class MixDesignOptimizer:
         set_global_seed(self.seed)
         self.base_columns = get_base_input_columns(self.config)
         self.feature_columns = get_input_columns(self.config)
+        self.target_column = get_target_column(self.config)
         self.design_config = self.config["engineering"]["design_tool"]
         self.validator = EngineeringValidator.from_config(self.config)
-        self.model = self._load_pickle(self.model_path)
+        self.model = load_pickle_artifact(self.model_path)
+        dataset = load_dataset(self.config)
+        self.reference_dataset = dataset[self.base_columns + [self.target_column]].copy()
 
     def _load_config(self, config_path: str | Path | None) -> dict[str, Any]:
         """Load the project configuration from disk."""
@@ -79,12 +84,6 @@ class MixDesignOptimizer:
             resolved_path = self.project_root / resolved_path
         return resolved_path
 
-    @staticmethod
-    def _load_pickle(path: Path) -> Any:
-        """Load a pickle artifact."""
-        with path.open("rb") as handle:
-            return pickle.load(handle)
-
     def _normalize_constraints(self, constraints: dict[str, Any] | None) -> dict[str, Any]:
         """Merge user constraints into the config-defined defaults."""
         merged = deepcopy(self.design_config["constraints"])
@@ -103,6 +102,43 @@ class MixDesignOptimizer:
                 merged[key] = {"fixed": float(value)}
         return merged
 
+    def _apply_target_dependent_bounds(
+        self,
+        target_strength: float,
+        constraints: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Overlay target-dependent cement, water, and water/cement bounds."""
+        bounded = deepcopy(constraints)
+        if target_strength < 30.0:
+            cement_bounds = (120.0, 280.0)
+            water_bounds = (140.0, 200.0)
+            water_cement_max = 0.65
+        elif target_strength <= 45.0:
+            cement_bounds = (160.0, 320.0)
+            water_bounds = (150.0, 210.0)
+            water_cement_max = 0.55
+        else:
+            cement_bounds = (280.0, 500.0)
+            water_bounds = (150.0, 200.0)
+            water_cement_max = 0.45
+
+        bounded.setdefault("cement", {})
+        bounded.setdefault("water", {})
+        bounded.setdefault("water_cement_ratio", {})
+        bounded["cement"]["min"] = max(float(bounded["cement"].get("min", cement_bounds[0])), cement_bounds[0])
+        bounded["cement"]["max"] = min(float(bounded["cement"].get("max", cement_bounds[1])), cement_bounds[1])
+        bounded["water"]["min"] = max(float(bounded["water"].get("min", water_bounds[0])), water_bounds[0])
+        bounded["water"]["max"] = min(float(bounded["water"].get("max", water_bounds[1])), water_bounds[1])
+        bounded["water_cement_ratio"]["max"] = min(
+            float(bounded["water_cement_ratio"].get("max", water_cement_max)),
+            water_cement_max,
+        )
+        if float(bounded["cement"]["min"]) > float(bounded["cement"]["max"]):
+            raise ValueError("Target-dependent cement bounds conflict with the configured constraints.")
+        if float(bounded["water"]["min"]) > float(bounded["water"]["max"]):
+            raise ValueError("Target-dependent water bounds conflict with the configured constraints.")
+        return bounded
+
     def _target_tolerance(self, constraints: dict[str, Any]) -> float:
         """Resolve the design tolerance."""
         if "tolerance_mpa" in constraints:
@@ -117,89 +153,6 @@ class MixDesignOptimizer:
         if cost_proxy in mix_design:
             return float(mix_design[cost_proxy])
         raise ValueError(f"Unsupported design-tool cost proxy: {self.design_config['cost_proxy']}")
-
-    def _variable_bounds(self, constraints: dict[str, Any]) -> tuple[list[str], list[tuple[float, float]]]:
-        """Return free variables and their min/max bounds."""
-        variable_columns: list[str] = []
-        bounds: list[tuple[float, float]] = []
-        for column in self.base_columns:
-            column_constraints = constraints.get(column, {})
-            if "fixed" in column_constraints:
-                continue
-            if "min" not in column_constraints or "max" not in column_constraints:
-                raise ValueError(f"Constraint for '{column}' must define min/max or fixed.")
-            variable_columns.append(column)
-            bounds.append((float(column_constraints["min"]), float(column_constraints["max"])))
-        return variable_columns, bounds
-
-    def _frame_from_matrix(
-        self,
-        matrix: np.ndarray | None,
-        variable_columns: list[str],
-        constraints: dict[str, Any],
-    ) -> pd.DataFrame:
-        """Build a candidate dataframe from a sample matrix and fixed constraints."""
-        row_count = 1 if matrix is None else int(matrix.shape[0])
-        frame = pd.DataFrame(index=np.arange(row_count))
-        if matrix is not None:
-            for position, column in enumerate(variable_columns):
-                frame[column] = matrix[:, position]
-
-        for column in self.base_columns:
-            column_constraints = constraints.get(column, {})
-            if column not in frame.columns:
-                if "fixed" in column_constraints:
-                    frame[column] = float(column_constraints["fixed"])
-                else:
-                    minimum = float(column_constraints["min"])
-                    maximum = float(column_constraints["max"])
-                    frame[column] = (minimum + maximum) / 2.0
-        return frame[self.base_columns].astype(float)
-
-    def _sample_global_candidates(
-        self,
-        variable_columns: list[str],
-        bounds: list[tuple[float, float]],
-        constraints: dict[str, Any],
-    ) -> pd.DataFrame:
-        """Generate a global Latin-hypercube candidate pool."""
-        initial_samples = int(self.design_config["search"]["initial_samples"])
-        if not variable_columns:
-            return self._frame_from_matrix(None, variable_columns, constraints)
-
-        sampler = qmc.LatinHypercube(d=len(variable_columns), seed=self.seed)
-        unit_samples = sampler.random(n=initial_samples)
-        lower_bounds = np.asarray([bound[0] for bound in bounds], dtype=float)
-        upper_bounds = np.asarray([bound[1] for bound in bounds], dtype=float)
-        scaled_samples = qmc.scale(unit_samples, lower_bounds, upper_bounds)
-        return self._frame_from_matrix(scaled_samples, variable_columns, constraints)
-
-    def _sample_local_candidates(
-        self,
-        center_mix: dict[str, float],
-        variable_columns: list[str],
-        bounds: list[tuple[float, float]],
-        constraints: dict[str, Any],
-        round_index: int,
-    ) -> pd.DataFrame:
-        """Generate local perturbations around a promising mix design."""
-        local_samples = int(self.design_config["search"]["local_samples_per_candidate"])
-        local_scale = float(self.design_config["search"]["local_scale"])
-        rng = np.random.default_rng(self.seed + round_index)
-        if not variable_columns:
-            return self._frame_from_matrix(None, variable_columns, constraints)
-
-        local_matrix = np.zeros((local_samples, len(variable_columns)), dtype=float)
-        for position, column in enumerate(variable_columns):
-            minimum, maximum = bounds[position]
-            spread = (maximum - minimum) * local_scale
-            local_matrix[:, position] = rng.normal(
-                loc=float(center_mix[column]),
-                scale=max(spread, 1e-6),
-                size=local_samples,
-            )
-            local_matrix[:, position] = np.clip(local_matrix[:, position], minimum, maximum)
-        return self._frame_from_matrix(local_matrix, variable_columns, constraints)
 
     def _check_design_constraints(
         self,
@@ -220,58 +173,149 @@ class MixDesignOptimizer:
                 violations.append(f"{column} falls below configured minimum.")
         return violations
 
-    def _ranking_key(self, candidate: dict[str, Any], tolerance: float) -> tuple[Any, ...]:
-        """Return a deterministic ranking key for candidate selection."""
-        deviation = abs(float(candidate["predicted_strength"]) - float(candidate["target_strength"]))
-        feasible = (
-            candidate["validation_verdict"] != "FAIL"
-            and not candidate["design_constraint_violations"]
-            and deviation <= tolerance
-        )
-        verdict_rank = {"PASS": 0, "WARN": 1, "FAIL": 2}.get(candidate["validation_verdict"], 3)
-        return (
-            0 if feasible else 1,
-            verdict_rank,
-            0 if not candidate["design_constraint_violations"] else 1,
-            max(0.0, deviation - tolerance),
-            self._cost_value(candidate["mix_design"]),
-            deviation,
-        )
+    def _frame_from_mix(self, mix_design: dict[str, float]) -> pd.DataFrame:
+        """Convert a mix-design dictionary into a one-row dataframe."""
+        return pd.DataFrame([{column: float(mix_design[column]) for column in self.base_columns}])
 
-    def _evaluate_candidates(
+    def _sample_trial_mix(
         self,
-        candidate_frame: pd.DataFrame,
-        target_strength_mpa: float,
+        trial: optuna.trial.Trial,
+        constraints: dict[str, Any],
+    ) -> dict[str, float]:
+        """Sample a mix design for one Optuna trial."""
+        mix_design: dict[str, float] = {}
+        water_cement_max = float(constraints.get("water_cement_ratio", {}).get("max", np.inf))
+        water_constraints = constraints.get("water", {})
+        water_minimum = float(water_constraints.get("fixed", water_constraints.get("min", 0.0)))
+        for column in self.base_columns:
+            column_constraints = constraints.get(column, {})
+            if "fixed" in column_constraints:
+                mix_design[column] = float(column_constraints["fixed"])
+                continue
+            minimum = float(column_constraints["min"])
+            maximum = float(column_constraints["max"])
+            if column == "cement" and np.isfinite(water_cement_max) and water_cement_max > 0.0:
+                minimum = max(minimum, water_minimum / water_cement_max)
+            if column == "water" and np.isfinite(water_cement_max) and water_cement_max > 0.0:
+                maximum = min(maximum, float(mix_design["cement"]) * water_cement_max)
+            if minimum > maximum:
+                raise ValueError(f"Constraint range is invalid for '{column}': min={minimum}, max={maximum}.")
+            mix_design[column] = float(trial.suggest_float(column, minimum, maximum))
+        return mix_design
+
+    def _evaluate_mix(
+        self,
+        mix_design: dict[str, float],
+        target_strength: float,
         tolerance: float,
         constraints: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """Predict, validate, and summarize a pool of candidate mixes."""
-        enriched = build_engineering_features(candidate_frame)
-        predictions = np.asarray(self.model.predict(enriched[self.feature_columns]), dtype=float)
-        sample_reports = self.validator.evaluate_samples(predictions, enriched[self.feature_columns])
+    ) -> dict[str, Any]:
+        """Predict and score a candidate mix design."""
+        candidate_frame = self._frame_from_mix(mix_design)
+        engineered = build_engineering_features(candidate_frame)
+        predicted_strength = float(self.model.predict(engineered[self.feature_columns])[0])
+        sample_report = self.validator.evaluate_samples(
+            np.asarray([predicted_strength], dtype=float),
+            engineered[self.feature_columns],
+        )[0]
+        engineered_row = engineered.iloc[0]
+        design_constraint_violations = self._check_design_constraints(engineered_row, constraints)
 
-        evaluated_candidates: list[dict[str, Any]] = []
-        for position in range(len(enriched)):
-            base_row = enriched.iloc[position]
-            sample_report = sample_reports[position]
-            engineered_snapshot = {
-                column: float(base_row[column])
-                for column in enriched.columns
+        progressive_penalty = max(0.0, mix_design["cement"] - target_strength * 8.0) ** 2 * 0.01
+        over_strength_penalty = 0.0
+        if predicted_strength > target_strength * 1.10:
+            over_strength_penalty = (predicted_strength - target_strength) * 0.5
+
+        deviation = abs(predicted_strength - target_strength)
+        objective = (
+            self._cost_value(mix_design)
+            + deviation * 12.0
+            + progressive_penalty
+            + over_strength_penalty
+        )
+        if predicted_strength < target_strength - tolerance:
+            objective += ((target_strength - tolerance) - predicted_strength) ** 2 * 1500.0
+        if predicted_strength > target_strength + tolerance:
+            objective += (predicted_strength - (target_strength + tolerance)) ** 2 * 1200.0
+        if design_constraint_violations:
+            objective += 100000.0 * len(design_constraint_violations)
+        if sample_report["overall_verdict"] == "FAIL":
+            objective += 1000000.0
+
+        feasible = (
+            sample_report["overall_verdict"] != "FAIL"
+            and not design_constraint_violations
+            and deviation <= tolerance
+        )
+        return {
+            "objective": float(objective),
+            "success": feasible,
+            "target_strength": float(target_strength),
+            "tolerance_mpa": float(tolerance),
+            "predicted_strength": predicted_strength,
+            "mix_design": {column: float(mix_design[column]) for column in self.base_columns},
+            "engineered_ratios": {
+                column: float(engineered_row[column])
+                for column in engineered.columns
                 if column not in self.base_columns
-            }
-            mix_design = {column: float(base_row[column]) for column in self.base_columns}
-            candidate = {
-                "target_strength": float(target_strength_mpa),
-                "predicted_strength": float(predictions[position]),
-                "mix_design": mix_design,
-                "engineered_ratios": engineered_snapshot,
-                "validation_verdict": sample_report["overall_verdict"],
-                "validation_warning_reasons": list(sample_report["warning_reasons"]),
-                "validation_failure_reasons": list(sample_report["failure_reasons"]),
-                "design_constraint_violations": self._check_design_constraints(base_row, constraints),
-            }
-            evaluated_candidates.append(candidate)
-        return evaluated_candidates
+            },
+            "validation_verdict": sample_report["overall_verdict"],
+            "validation_warning_reasons": list(sample_report["warning_reasons"]),
+            "validation_failure_reasons": list(sample_report["failure_reasons"]),
+            "design_constraint_violations": design_constraint_violations,
+            "progressive_cement_penalty": float(progressive_penalty),
+            "over_strength_penalty": float(over_strength_penalty),
+            "deviation_mpa": float(deviation),
+        }
+
+    def _ranking_key(self, candidate: dict[str, Any]) -> tuple[Any, ...]:
+        """Return a deterministic ranking key for candidate selection."""
+        return (
+            0 if candidate["success"] else 1,
+            float(candidate["objective"]),
+            float(candidate["deviation_mpa"]),
+            self._cost_value(candidate["mix_design"]),
+        )
+
+    def _warm_start_mixes(self, target_strength: float, constraints: dict[str, Any]) -> list[dict[str, float]]:
+        """Select known low-strength reference mixes for Optuna warm starts."""
+        if target_strength >= 30.0:
+            return []
+
+        candidate_rows = self.reference_dataset[self.reference_dataset[self.target_column] <= 30.0].copy()
+        if candidate_rows.empty:
+            return []
+
+        candidate_rows["target_gap"] = (candidate_rows[self.target_column] - target_strength).abs()
+        candidate_rows = candidate_rows.sort_values(["target_gap", "cement", self.target_column]).head(30)
+
+        warm_starts: list[dict[str, float]] = []
+        seen_signatures: set[tuple[float, ...]] = set()
+        water_cement_max = float(constraints.get("water_cement_ratio", {}).get("max", np.inf))
+        water_constraints = constraints.get("water", {})
+        water_minimum = float(water_constraints.get("fixed", water_constraints.get("min", 0.0)))
+        for _, row in candidate_rows.iterrows():
+            mix_design = {column: float(row[column]) for column in self.base_columns}
+            if np.isfinite(water_cement_max) and water_cement_max > 0.0:
+                mix_design["cement"] = max(mix_design["cement"], water_minimum / water_cement_max)
+                if "water" in mix_design:
+                    mix_design["water"] = min(mix_design["water"], mix_design["cement"] * water_cement_max)
+            for column in self.base_columns:
+                column_constraints = constraints.get(column, {})
+                if "fixed" in column_constraints:
+                    mix_design[column] = float(column_constraints["fixed"])
+                else:
+                    minimum = float(column_constraints["min"])
+                    maximum = float(column_constraints["max"])
+                    mix_design[column] = float(np.clip(mix_design[column], minimum, maximum))
+            signature = tuple(round(mix_design[column], 4) for column in self.base_columns)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            warm_starts.append(mix_design)
+            if len(warm_starts) == 3:
+                break
+        return warm_starts
 
     def _estimate_reference_mix(
         self,
@@ -352,46 +396,44 @@ class MixDesignOptimizer:
         """Search for a mix design that meets the target strength with minimum cement."""
         target_strength = float(target_strength_mpa)
         merged_constraints = self._normalize_constraints(constraints)
+        merged_constraints = self._apply_target_dependent_bounds(target_strength, merged_constraints)
         tolerance = self._target_tolerance(merged_constraints)
         if "age" not in merged_constraints:
             merged_constraints["age"] = {"fixed": float(self.design_config["default_age_days"])}
         elif "fixed" not in merged_constraints["age"]:
             merged_constraints["age"]["fixed"] = float(self.design_config["default_age_days"])
 
-        variable_columns, bounds = self._variable_bounds(merged_constraints)
-        evaluated_candidates = self._evaluate_candidates(
-            self._sample_global_candidates(variable_columns, bounds, merged_constraints),
-            target_strength,
-            tolerance,
-            merged_constraints,
-        )
+        initial_samples = int(self.design_config["search"]["initial_samples"])
+        default_budget = max(300, initial_samples // 8)
+        if target_strength < 30.0:
+            default_budget = max(default_budget, 420)
+        trial_budget = int(self.design_config["search"].get("optuna_trials", default_budget))
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        sampler = optuna.samplers.TPESampler(seed=self.seed, warn_independent_sampling=False)
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        evaluated_candidates: list[dict[str, Any]] = []
 
-        refinement_rounds = int(self.design_config["search"]["refinement_rounds"])
-        top_candidates = int(self.design_config["search"]["top_candidates"])
-        for round_index in range(1, refinement_rounds + 1):
-            current_best = sorted(evaluated_candidates, key=lambda item: self._ranking_key(item, tolerance))
-            local_candidates: list[pd.DataFrame] = []
-            for candidate in current_best[:top_candidates]:
-                local_candidates.append(
-                    self._sample_local_candidates(
-                        candidate["mix_design"],
-                        variable_columns,
-                        bounds,
-                        merged_constraints,
-                        round_index,
-                    )
-                )
-            if not local_candidates:
-                continue
-            local_frame = pd.concat(local_candidates, ignore_index=True)
-            evaluated_candidates.extend(
-                self._evaluate_candidates(local_frame, target_strength, tolerance, merged_constraints)
-            )
+        for warm_start_mix in self._warm_start_mixes(target_strength, merged_constraints):
+            enqueued_params = {
+                column: value
+                for column, value in warm_start_mix.items()
+                if "fixed" not in merged_constraints.get(column, {})
+            }
+            study.enqueue_trial(enqueued_params)
 
-        best_candidate = min(evaluated_candidates, key=lambda item: self._ranking_key(item, tolerance))
-        feasible = self._ranking_key(best_candidate, tolerance)[0] == 0
+        def objective(trial: optuna.trial.Trial) -> float:
+            mix_design = self._sample_trial_mix(trial, merged_constraints)
+            candidate = self._evaluate_mix(mix_design, target_strength, tolerance, merged_constraints)
+            evaluated_candidates.append(candidate)
+            return float(candidate["objective"])
+
+        study.optimize(objective, n_trials=trial_budget, show_progress_bar=False)
+        if not evaluated_candidates:
+            raise RuntimeError("No candidate mixes were evaluated during Optuna optimization.")
+
+        best_candidate = min(evaluated_candidates, key=self._ranking_key)
         result = {
-            "success": feasible,
+            "success": bool(best_candidate["success"]),
             "target_strength": target_strength,
             "tolerance_mpa": tolerance,
             "predicted_strength": float(best_candidate["predicted_strength"]),

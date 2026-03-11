@@ -49,6 +49,7 @@ engineering_bounds:
   max: 120.0
 
 validator:
+  context_type: general
   suspicious_water_cement_ratio: 0.7
   suspicious_strength_mpa: 30.0
   durability_water_cement_warn: 0.6
@@ -114,7 +115,7 @@ engineering:
 
 uncertainty:
   calibration_fraction: 0.2
-  coverage_level: 0.9
+  coverage_level: 0.92
   reliability_bins: 10
   lower_alpha: 0.05
   median_alpha: 0.5
