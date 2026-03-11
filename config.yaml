@@ -51,6 +51,78 @@ engineering_bounds:
 validator:
   suspicious_water_cement_ratio: 0.7
   suspicious_strength_mpa: 30.0
+  durability_water_cement_warn: 0.6
+  low_water_binder_warn: 0.25
+  total_binder_low_warn: 250.0
+  total_binder_high_warn: 550.0
+  fly_ash_replacement_warn: 0.4
+  slag_replacement_warn: 0.7
+  early_age_days_warn: 3.0
+  early_age_strength_warn: 30.0
+
+engineering:
+  feature_engineering: true
+  uncertainty_method: conformal  # options: conformal, quantile, both
+  design_tool:
+    default_age_days: 28
+    target_tolerance_mpa: 2.0
+    cost_proxy: cement_content
+    reference_mix:
+      water_cement_ratio: 0.5
+    search:
+      initial_samples: 3000
+      refinement_rounds: 2
+      top_candidates: 40
+      local_samples_per_candidate: 24
+      local_scale: 0.12
+      reference_grid_points: 120
+    constraints:
+      cement:
+        min: 100.0
+        max: 600.0
+      slag:
+        min: 0.0
+        max: 350.0
+      fly_ash:
+        min: 0.0
+        max: 200.0
+      water:
+        min: 120.0
+        max: 230.0
+      superplasticizer:
+        min: 0.0
+        max: 32.0
+      coarse_aggregate:
+        min: 800.0
+        max: 1200.0
+      fine_aggregate:
+        min: 500.0
+        max: 950.0
+      age:
+        fixed: 28.0
+      water_cement_ratio:
+        max: 0.6
+      fly_ash_replacement_ratio:
+        max: 0.35
+      slag_replacement_ratio:
+        max: 0.65
+
+uncertainty:
+  calibration_fraction: 0.2
+  coverage_level: 0.9
+  reliability_bins: 10
+  lower_alpha: 0.05
+  median_alpha: 0.5
+  upper_alpha: 0.95
+  tight_threshold_mpa: 5.0
+  wide_threshold_mpa: 10.0
+  quantile_model:
+    n_estimators: 250
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 10
+    subsample: 0.9
+    colsample_bytree: 0.9
 
 experiment:
   optuna_trials: 30

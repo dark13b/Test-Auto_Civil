@@ -14,6 +14,8 @@ import pandas as pd
 import requests
 import yaml
 
+from feature_engineering import build_engineering_features, validate_features
+
 
 def log_status(message: str) -> None:
     """Print a timestamped status message."""
@@ -237,6 +239,12 @@ def main() -> int:
         else:
             dataset = generate_synthetic_dataset(config)
             data_origin = "synthetic"
+
+        if bool(config.get("engineering", {}).get("feature_engineering", False)):
+            log_status("Applying engineering feature generation to normalized dataset.")
+            dataset = build_engineering_features(dataset)
+            if not validate_features(dataset):
+                raise ValueError("Engineered feature validation failed during data generation.")
 
         dataset_path = save_dataset(dataset, config)
         log_status(f"Saved {data_origin} dataset to {dataset_path} with {len(dataset)} rows.")

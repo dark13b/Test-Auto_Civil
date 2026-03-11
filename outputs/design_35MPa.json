@@ -1,0 +1,42 @@
+{
+  "success": true,
+  "target_strength": 35.0,
+  "tolerance_mpa": 2.0,
+  "predicted_strength": 34.18455742360884,
+  "mix_design": {
+    "cement": 203.19641901883736,
+    "slag": 26.21170153489296,
+    "fly_ash": 52.365725567751554,
+    "water": 120.0,
+    "superplasticizer": 7.792915860155652,
+    "coarse_aggregate": 1191.9127114897533,
+    "fine_aggregate": 905.2377551486261,
+    "age": 28.0
+  },
+  "engineered_ratios": {
+    "water_cement_ratio": 0.5905615885330902,
+    "water_binder_ratio": 0.4258734501152534,
+    "slag_replacement_ratio": 0.0930238980504679,
+    "fly_ash_replacement_ratio": 0.18584310179439076,
+    "aggregate_paste_ratio": 5.21972867791966,
+    "fine_to_coarse_ratio": 0.759483262844964,
+    "total_binder": 281.7738461214819,
+    "supplementary_replacement_ratio": 0.2788669998448587,
+    "superplasticizer_binder_ratio": 0.027656633031853044,
+    "paste_volume_proxy": 409.5667619816375,
+    "log_age": 3.367295829986474,
+    "cement_age_interaction": 684.2224544303153,
+    "binder_age_interaction": 948.8158970441164,
+    "water_binder_age": 0.12647342901171948
+  },
+  "validation_verdict": "PASS",
+  "validation_warning_reasons": [],
+  "validation_failure_reasons": [],
+  "design_constraint_violations": [],
+  "estimated_cement_saving_vs_reference": {
+    "reference_cement_content": 289.07563025210084,
+    "reference_predicted_strength": 33.04584604959796,
+    "cement_saving_kg_per_m3": 85.87921123326348,
+    "cement_saving_percent": 29.708215513832425
+  }
+}

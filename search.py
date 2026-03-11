@@ -173,6 +173,7 @@ def build_trial_record(
                 "test_composite_score": None,
                 "validation_pass_rate": None,
                 "failed_count": None,
+                "warning_count": None,
                 "suspicious_count": None,
             }
         )
@@ -191,6 +192,7 @@ def build_trial_record(
             "test_composite_score": result["test_metrics"]["composite_score"],
             "validation_pass_rate": validation_report["pass_rate"],
             "failed_count": validation_report["failed_count"],
+            "warning_count": validation_report["warning_count"],
             "suspicious_count": validation_report["suspicious_count"],
         }
     )

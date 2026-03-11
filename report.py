@@ -24,6 +24,7 @@ from train import (
     set_global_seed,
     split_dataset,
 )
+from uncertainty import UncertaintyEstimator
 
 
 def load_json_artifact(path: Path) -> dict[str, Any]:
@@ -203,6 +204,35 @@ def create_performance_by_range_plot(
     return rmse_by_range
 
 
+def create_uncertainty_plot(interval_frame: pd.DataFrame, outputs_dir: Path) -> dict[str, Any]:
+    """Create the interval-width plot across the predicted strength range."""
+    color_map = {
+        "TIGHT": "#2a9d8f",
+        "MODERATE": "#e9c46a",
+        "WIDE": "#e76f51",
+    }
+    plt.style.use("seaborn-v0_8-whitegrid")
+    plt.figure(figsize=(8, 5))
+    for label, color in color_map.items():
+        mask = interval_frame["confidence_label"] == label
+        plt.scatter(
+            interval_frame.loc[mask, "predicted"],
+            interval_frame.loc[mask, "interval_width"],
+            label=label,
+            alpha=0.8,
+            color=color,
+        )
+    plt.xlabel("Predicted Strength (MPa)")
+    plt.ylabel("Interval Width (MPa)")
+    plt.title("Prediction Uncertainty by Strength Range")
+    plt.legend()
+    save_figure(outputs_dir / "uncertainty_plot.png")
+    return {
+        "mean_interval_width": float(interval_frame["interval_width"].mean()),
+        "label_counts": interval_frame["confidence_label"].value_counts().to_dict(),
+    }
+
+
 def calculate_improvement_percentage(baseline_score: float, best_score: float) -> float:
     """Calculate percentage improvement in composite score relative to baseline."""
     denominator = max(abs(baseline_score), 1e-8)
@@ -232,6 +262,9 @@ def main() -> int:
         feature_importance = compute_feature_importance(best_model, x_test, y_test, config, best_search_result)
         create_feature_importance_plot(feature_importance, outputs_dir)
         rmse_by_range = create_performance_by_range_plot(y_test, y_pred, outputs_dir)
+        uncertainty_estimator = UncertaintyEstimator(method=str(config["engineering"]["uncertainty_method"]))
+        interval_frame = uncertainty_estimator.predict_with_interval(x_test)
+        uncertainty_summary = create_uncertainty_plot(interval_frame, outputs_dir)
 
         improvement_percentage = calculate_improvement_percentage(
             float(baseline_metrics["composite_score"]),
@@ -246,6 +279,7 @@ def main() -> int:
             "best_model_hyperparameters": best_search_result["hyperparameters"],
             "holdout_metrics": holdout_metrics,
             "rmse_by_range": rmse_by_range,
+            "uncertainty_summary": uncertainty_summary,
         }
         save_json_artifact(outputs_dir / "final_metrics.json", final_metrics)
 

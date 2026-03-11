@@ -25,11 +25,14 @@ auto-civil-lab/
 |-- data/
 |-- outputs/
 |-- config.yaml
+|-- design_tool.py
+|-- feature_engineering.py
 |-- generate_data.py
 |-- validator.py
 |-- train.py
 |-- search.py
 |-- report.py
+|-- uncertainty.py
 |-- requirements.txt
 `-- README.md
 ```
@@ -49,6 +52,76 @@ python generate_data.py
 python train.py
 python search.py
 python report.py
+python uncertainty.py
+python design_tool.py --target 35
+```
+
+## Engineering Upgrades
+
+### 1. Engineering feature engineering
+
+`feature_engineering.py` adds mix-design ratios, binder chemistry proxies, and age-interaction terms such as:
+
+- `water_cement_ratio`
+- `water_binder_ratio`
+- `slag_replacement_ratio`
+- `fly_ash_replacement_ratio`
+- `total_binder`
+- `supplementary_replacement_ratio`
+- `paste_volume_proxy`
+- `cement_age_interaction`
+- `binder_age_interaction`
+
+`generate_data.py` now enriches the normalized dataset before saving `data/concrete_data.csv`, and the training/search/report stack consumes the enriched feature set automatically.
+
+Run:
+
+```bash
+python generate_data.py
+```
+
+### 2. Extended engineering validator
+
+`validator.py` now keeps the original strength-bound checks and adds ACI 318 / BS 8500 inspired warning rules for:
+
+- durability-oriented `water_cement_ratio` limits
+- unusually low `water_binder_ratio`
+- low or high `total_binder`
+- aggressive fly ash or slag replacement levels
+- suspicious early-age high-strength claims
+
+Validation reports now include `warn_reasons`, `rule_violations_by_sample`, and an `overall_verdict` of `PASS`, `WARN`, or `FAIL`.
+
+### 3. Inverse design tool
+
+`design_tool.py` turns the trained model into a mix-design search utility. It searches for mixes that satisfy a target compressive strength while minimizing cement content and screening candidates through the engineering validator.
+
+Run:
+
+```bash
+python design_tool.py --target 35
+python design_tool.py --batch 25,30,35,40,45
+```
+
+Outputs:
+
+- `outputs/design_35MPa.json`
+- `outputs/batch_design_results.csv`
+
+### 4. Uncertainty quantification
+
+`uncertainty.py` supports two interval methods:
+
+- quantile LightGBM regression (`5th`, `50th`, `95th` percentiles)
+- conformal prediction around the saved best model
+
+`report.py` now adds `outputs/uncertainty_plot.png`, and `uncertainty.py` saves `outputs/uncertainty_calibration.json`.
+
+Run:
+
+```bash
+python report.py
+python uncertainty.py
 ```
 
 ## Output files
@@ -65,6 +138,10 @@ python report.py
 - `outputs/residuals_plot.png`: residual structure plot for the best model.
 - `outputs/feature_importance.png`: feature-importance chart for the best model.
 - `outputs/performance_by_range.png`: RMSE by low, mid, and high strength ranges.
+- `outputs/uncertainty_plot.png`: interval width versus predicted strength with confidence bands.
+- `outputs/uncertainty_calibration.json`: interval coverage, sharpness, and reliability summary.
+- `outputs/design_35MPa.json`: single-target inverse mix design report.
+- `outputs/batch_design_results.csv`: batch inverse-design output table.
 
 ## Configuration
 
@@ -110,16 +187,13 @@ python generate_data.py
 python train.py
 python search.py
 python report.py
+python uncertainty.py
+python design_tool.py --target 35
 ```
 
 ## Engineering validator
 
-`validator.py` excludes any model whose predictions:
-
-- fall below `0 MPa`
-- exceed `120 MPa`
-
-Suspicious high-strength predictions at water/cement ratios above `0.7` produce a `WARN`. Out-of-bounds predictions produce a `FAIL` and remove the model from selection.
+`validator.py` excludes any model whose predictions fall outside the configured strength bounds or exceed the hard water/cement screening limit. Durability, workability, replacement-ratio, and early-age plausibility checks are reported as warnings and preserved in the search and design artifacts.
 
 ## Growth path
 

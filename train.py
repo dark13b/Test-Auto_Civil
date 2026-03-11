@@ -21,6 +21,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
+from feature_engineering import ENGINEERED_FEATURE_COLUMNS, build_engineering_features
 from validator import EngineeringValidator
 
 try:
@@ -78,7 +79,20 @@ def get_outputs_dir(config: dict[str, Any]) -> Path:
 
 def get_input_columns(config: dict[str, Any]) -> list[str]:
     """Return the configured feature columns."""
+    feature_columns = get_base_input_columns(config)
+    if feature_engineering_enabled(config):
+        feature_columns.extend(ENGINEERED_FEATURE_COLUMNS)
+    return feature_columns
+
+
+def get_base_input_columns(config: dict[str, Any]) -> list[str]:
+    """Return the configured base mix-design input columns."""
     return list(config["task"]["input_columns"])
+
+
+def feature_engineering_enabled(config: dict[str, Any]) -> bool:
+    """Return whether engineering features should be applied."""
+    return bool(config.get("engineering", {}).get("feature_engineering", False))
 
 
 def get_target_column(config: dict[str, Any]) -> str:
@@ -103,6 +117,13 @@ def validate_loaded_dataset(frame: pd.DataFrame, config: dict[str, Any]) -> None
         raise ValueError("Dataset contains non-finite numeric values.")
 
 
+def ensure_engineered_dataset(frame: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    """Ensure configured engineered features are present and refreshed."""
+    if not feature_engineering_enabled(config):
+        return frame.copy()
+    return build_engineering_features(frame)
+
+
 def load_dataset(config: dict[str, Any]) -> pd.DataFrame:
     """Load the prepared dataset from disk."""
     data_path = get_data_path(config)
@@ -111,6 +132,7 @@ def load_dataset(config: dict[str, Any]) -> pd.DataFrame:
             f"Dataset not found at {data_path}. Run generate_data.py before training."
         )
     frame = pd.read_csv(data_path)
+    frame = ensure_engineered_dataset(frame, config)
     validate_loaded_dataset(frame, config)
     return frame
 
