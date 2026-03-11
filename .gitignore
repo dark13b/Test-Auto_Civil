@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+outputs/
+data/concrete_data.csv
+*.pkl
+*.egg-info/
+.env
+.venv/
+dist/
+build/
