@@ -114,8 +114,8 @@ class MixDesignOptimizer:
             water_bounds = (140.0, 200.0)
             water_cement_max = 0.65
         elif target_strength <= 45.0:
-            cement_bounds = (160.0, 320.0)
-            water_bounds = (150.0, 210.0)
+            cement_bounds = (140.0, 300.0)
+            water_bounds = (140.0, 210.0)
             water_cement_max = 0.55
         else:
             cement_bounds = (280.0, 500.0)
@@ -175,7 +175,11 @@ class MixDesignOptimizer:
 
     def _frame_from_mix(self, mix_design: dict[str, float]) -> pd.DataFrame:
         """Convert a mix-design dictionary into a one-row dataframe."""
-        return pd.DataFrame([{column: float(mix_design[column]) for column in self.base_columns}])
+        normalized_mix = {column: float(mix_design[column]) for column in self.base_columns}
+        for column in ("slag", "fly_ash"):
+            if abs(normalized_mix[column]) < 1.0:
+                normalized_mix[column] = 0.0
+        return pd.DataFrame([normalized_mix])
 
     def _sample_trial_mix(
         self,
@@ -225,6 +229,7 @@ class MixDesignOptimizer:
         over_strength_penalty = 0.0
         if predicted_strength > target_strength * 1.10:
             over_strength_penalty = (predicted_strength - target_strength) * 0.5
+        warning_penalty = float(sample_report["warning_count"]) * 5000.0
 
         deviation = abs(predicted_strength - target_strength)
         objective = (
@@ -232,6 +237,7 @@ class MixDesignOptimizer:
             + deviation * 12.0
             + progressive_penalty
             + over_strength_penalty
+            + warning_penalty
         )
         if predicted_strength < target_strength - tolerance:
             objective += ((target_strength - tolerance) - predicted_strength) ** 2 * 1500.0
@@ -265,13 +271,20 @@ class MixDesignOptimizer:
             "design_constraint_violations": design_constraint_violations,
             "progressive_cement_penalty": float(progressive_penalty),
             "over_strength_penalty": float(over_strength_penalty),
+            "warning_penalty": float(warning_penalty),
             "deviation_mpa": float(deviation),
         }
 
     def _ranking_key(self, candidate: dict[str, Any]) -> tuple[Any, ...]:
         """Return a deterministic ranking key for candidate selection."""
+        verdict_rank = {
+            "PASS": 0,
+            "WARN": 1,
+            "FAIL": 2,
+        }.get(str(candidate["validation_verdict"]), 3)
         return (
             0 if candidate["success"] else 1,
+            verdict_rank,
             float(candidate["objective"]),
             float(candidate["deviation_mpa"]),
             self._cost_value(candidate["mix_design"]),
@@ -279,7 +292,7 @@ class MixDesignOptimizer:
 
     def _warm_start_mixes(self, target_strength: float, constraints: dict[str, Any]) -> list[dict[str, float]]:
         """Select known low-strength reference mixes for Optuna warm starts."""
-        if target_strength >= 30.0:
+        if target_strength > 30.0:
             return []
 
         candidate_rows = self.reference_dataset[self.reference_dataset[self.target_column] <= 30.0].copy()
@@ -296,10 +309,6 @@ class MixDesignOptimizer:
         water_minimum = float(water_constraints.get("fixed", water_constraints.get("min", 0.0)))
         for _, row in candidate_rows.iterrows():
             mix_design = {column: float(row[column]) for column in self.base_columns}
-            if np.isfinite(water_cement_max) and water_cement_max > 0.0:
-                mix_design["cement"] = max(mix_design["cement"], water_minimum / water_cement_max)
-                if "water" in mix_design:
-                    mix_design["water"] = min(mix_design["water"], mix_design["cement"] * water_cement_max)
             for column in self.base_columns:
                 column_constraints = constraints.get(column, {})
                 if "fixed" in column_constraints:
@@ -308,6 +317,14 @@ class MixDesignOptimizer:
                     minimum = float(column_constraints["min"])
                     maximum = float(column_constraints["max"])
                     mix_design[column] = float(np.clip(mix_design[column], minimum, maximum))
+            if np.isfinite(water_cement_max) and water_cement_max > 0.0:
+                mix_design["cement"] = max(mix_design["cement"], water_minimum / water_cement_max)
+                cement_constraints = constraints.get("cement", {})
+                if "max" in cement_constraints:
+                    mix_design["cement"] = min(mix_design["cement"], float(cement_constraints["max"]))
+                if "water" in mix_design:
+                    mix_design["water"] = min(mix_design["water"], mix_design["cement"] * water_cement_max)
+                    mix_design["water"] = max(mix_design["water"], water_minimum)
             signature = tuple(round(mix_design[column], 4) for column in self.base_columns)
             if signature in seen_signatures:
                 continue
