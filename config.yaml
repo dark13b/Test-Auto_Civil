@@ -146,6 +146,9 @@ baseline_model:
 
 search:
   progress_interval: 10
+  # Search keeps running until it satisfies both this runtime floor and
+  # experiment.optuna_trials.
+  min_runtime_minutes: 50
   models:
     RandomForestRegressor:
       enabled: true

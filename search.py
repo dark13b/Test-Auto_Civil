@@ -6,6 +6,7 @@ import copy
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -211,6 +212,11 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     config = load_config()
     set_global_seed(int(config["experiment"]["random_seed"]))
     outputs_dir = get_outputs_dir(config)
+    min_runtime_minutes = float(config["search"].get("min_runtime_minutes", 0.0))
+    if min_runtime_minutes < 0.0:
+        raise ValueError("search.min_runtime_minutes must be non-negative.")
+    min_runtime_seconds = min_runtime_minutes * 60.0
+    search_start_time = time.perf_counter()
     baseline_metrics_path = outputs_dir / "baseline_metrics.json"
     baseline_metrics = load_json_artifact(baseline_metrics_path)
 
@@ -230,7 +236,9 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     study = optuna.create_study(direction="maximize", study_name="autocivil_search")
     trial_records: list[dict[str, Any]] = []
 
-    for trial_number in range(1, n_trials + 1):
+    trial_number = 0
+    while True:
+        trial_number += 1
         trial = study.ask()
         model_name, display_name, params = sample_model_configuration(trial, available_models)
         try:
@@ -310,15 +318,25 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
             )
             append_research_log(research_log_path, log_line)
 
+        elapsed_seconds = time.perf_counter() - search_start_time
+        trials_floor_reached = trial_number >= n_trials
+        runtime_floor_reached = elapsed_seconds >= min_runtime_seconds
         progress_interval = int(config["search"]["progress_interval"])
-        if trial_number % progress_interval == 0 or trial_number == n_trials:
+        if trial_number % progress_interval == 0:
             valid_trials = [
                 row for row in trial_records if row["selection_status"] not in {"error", "rejected_validation_fail"}
             ]
+            remaining_seconds = max(0.0, min_runtime_seconds - elapsed_seconds)
             log_status(
-                f"Progress {trial_number}/{n_trials} trials | valid_trials={len(valid_trials)} | "
-                f"current_best_model={current_best_name} | current_best_composite={current_best_composite:.4f}"
+                f"Progress trial={trial_number} | target_trials={n_trials} | "
+                f"elapsed={elapsed_seconds / 60.0:.1f}m | "
+                f"min_runtime_remaining={remaining_seconds / 60.0:.1f}m | "
+                f"valid_trials={len(valid_trials)} | "
+                f"current_best_model={current_best_name} | "
+                f"current_best_composite={current_best_composite:.4f}"
             )
+        if trials_floor_reached and runtime_floor_reached:
+            break
 
     pd.DataFrame(trial_records).to_csv(outputs_dir / "optuna_results.csv", index=False)
     save_json_artifact(outputs_dir / "best_search_result.json", best_result)
