@@ -17,6 +17,7 @@ import pandas as pd
 
 from train import (
     EngineeringValidator,
+    build_stacking_ensemble,
     evaluate_candidate,
     get_outputs_dir,
     load_config,
@@ -526,6 +527,164 @@ def repair_optuna_results_csv(outputs_dir: Path, config: dict[str, Any]) -> Path
     return csv_path
 
 
+def build_post_search_ensemble(
+    outputs_dir: Path,
+    config: dict[str, Any],
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    validator: EngineeringValidator,
+) -> dict[str, Any]:
+    """Build and evaluate a stacking ensemble from the best unique model families in the Optuna CSV."""
+    ensemble_metrics_path = outputs_dir / "ensemble_metrics.json"
+    optuna_results_path = outputs_dir / "optuna_results.csv"
+    best_result_path = outputs_dir / "best_search_result.json"
+    current_best_result = load_json_artifact(best_result_path)
+
+    if not optuna_results_path.exists() or optuna_results_path.stat().st_size == 0:
+        ensemble_summary = {
+            "status": "skipped",
+            "reason": "optuna_results_missing",
+            "selected_base_models": [],
+        }
+        save_json_artifact(ensemble_metrics_path, ensemble_summary)
+        return current_best_result
+
+    optuna_frame = pd.read_csv(optuna_results_path)
+    if optuna_frame.empty:
+        ensemble_summary = {
+            "status": "skipped",
+            "reason": "optuna_results_empty",
+            "selected_base_models": [],
+        }
+        save_json_artifact(ensemble_metrics_path, ensemble_summary)
+        return current_best_result
+
+    filtered = optuna_frame.loc[
+        optuna_frame["composite_score"].notna()
+        & optuna_frame["model_name"].notna()
+        & (optuna_frame["validation_verdict"].fillna("").astype(str) != "FAIL")
+        & (optuna_frame["model_name"].astype(str) != "StackingRegressor")
+    ].copy()
+    if filtered.empty:
+        ensemble_summary = {
+            "status": "skipped",
+            "reason": "no_valid_trials",
+            "selected_base_models": [],
+        }
+        save_json_artifact(ensemble_metrics_path, ensemble_summary)
+        return current_best_result
+
+    filtered["composite_score"] = filtered["composite_score"].astype(float)
+    ranked = filtered.sort_values(["composite_score", "trial_number"], ascending=[False, True])
+    top_family_rows = ranked.drop_duplicates(subset=["model_name"], keep="first").head(3)
+
+    selected_base_models: list[dict[str, Any]] = []
+    ensemble_configs: list[tuple[str, dict[str, Any]]] = []
+    for row in top_family_rows.to_dict(orient="records"):
+        raw_hyperparameters = row.get("hyperparameters", "{}")
+        parsed_hyperparameters = (
+            json.loads(raw_hyperparameters)
+            if isinstance(raw_hyperparameters, str) and raw_hyperparameters.strip()
+            else {}
+        )
+        model_name = str(row["model_name"])
+        ensemble_configs.append((model_name, parsed_hyperparameters))
+        selected_base_models.append(
+            {
+                "trial_number": _safe_int(row.get("trial_number")),
+                "model_name": model_name,
+                "composite_score": float(row["composite_score"]),
+                "hyperparameters": parsed_hyperparameters,
+            }
+        )
+
+    ensemble_model, ensemble_result = build_stacking_ensemble(
+        ensemble_configs,
+        x_train,
+        y_train,
+        x_test,
+        y_test,
+        validator,
+        config,
+    )
+    ensemble_result = copy.deepcopy(ensemble_result)
+    ensemble_result["source"] = "post_search_ensemble"
+    ensemble_result["selected_base_models"] = selected_base_models
+    ensemble_result["ensemble_size"] = len(selected_base_models)
+    ensemble_result["status"] = "built"
+    save_json_artifact(ensemble_metrics_path, ensemble_result)
+
+    previous_best_score = float(
+        current_best_result.get(
+            "holdout_composite",
+            current_best_result.get("test_metrics", {}).get(
+                "composite_score",
+                current_best_result["composite_score"],
+            ),
+        )
+    )
+    ensemble_score = float(ensemble_result["composite_score"])
+    if ensemble_score > previous_best_score:
+        numeric_trial_numbers = pd.to_numeric(optuna_frame["trial_number"], errors="coerce")
+        max_trial_number = numeric_trial_numbers.max()
+        next_trial_number = 1 if pd.isna(max_trial_number) else int(max_trial_number) + 1
+        ensemble_result["trial_number"] = next_trial_number
+        ensemble_result["best_trial"] = next_trial_number
+        ensemble_result["beats_baseline"] = True
+        ensemble_result["status"] = "new_best"
+
+        save_pickle_artifact(
+            outputs_dir / "best_search_model.pkl",
+            ensemble_model,
+            config=config,
+            model_id="StackingRegressor",
+        )
+        save_json_artifact(ensemble_metrics_path, ensemble_result)
+        save_json_artifact(best_result_path, ensemble_result)
+
+        ensemble_record = build_trial_record(
+            next_trial_number,
+            "StackingRegressor",
+            "StackingEnsemble",
+            ensemble_result["hyperparameters"],
+            ensemble_result,
+            "new_best",
+        )
+        append_optuna_trial_record(optuna_results_path, ensemble_record)
+
+        research_log_path = outputs_dir / "research_log.txt"
+        timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+        append_research_log(
+            research_log_path,
+            (
+                f"[{timestamp}] Trial {next_trial_number:03d} | Model: StackingEnsemble | "
+                f"ensemble_size={len(selected_base_models)} meta_learner=Ridge passthrough=True | "
+                f"RMSE: {ensemble_result['rmse']:.2f} | R2: {ensemble_result['r2']:.2f} | "
+                f"Composite: {ensemble_result['composite_score']:.3f} | "
+                f"Validation: {ensemble_result['validation_verdict']} | New best ensemble"
+            ),
+        )
+        log_status(
+            f"INFO ensemble_beats_best | ensemble={ensemble_score:.4f} | previous_best={previous_best_score:.4f}"
+        )
+        try:
+            from uncertainty import recalibrate_uncertainty_artifacts
+
+            recalibrate_uncertainty_artifacts(
+                model_path=outputs_dir / "best_search_model.pkl",
+                method=str(config["engineering"]["uncertainty_method"]),
+            )
+        except Exception as recalibration_exc:
+            log_status(f"WARNING uncertainty_recalibration_failed | trial={next_trial_number} | {recalibration_exc}")
+        return ensemble_result
+
+    ensemble_result["status"] = "no_improvement"
+    save_json_artifact(ensemble_metrics_path, ensemble_result)
+    return current_best_result
+
+
 def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     """Execute the visible propose-run-compare-keep research loop."""
     config = load_config()
@@ -698,6 +857,16 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
 
     save_json_artifact(outputs_dir / "best_search_result.json", best_result)
     sync_check(outputs_dir)
+    if bool(config["search"].get("build_ensemble_after_search", True)):
+        best_result = build_post_search_ensemble(
+            outputs_dir,
+            config,
+            x_train,
+            y_train,
+            x_test,
+            y_test,
+            validator,
+        )
     return best_result
 
 

@@ -195,6 +195,32 @@ python design_tool.py --target 35
 
 `validator.py` excludes any model whose predictions fall outside the configured strength bounds or exceed the hard water/cement screening limit. Durability, workability, replacement-ratio, and early-age plausibility checks are reported as warnings and preserved in the search and design artifacts.
 
+## Deployment
+
+Free web hosts do not preserve local files written after deploy. For this dashboard, that means the `outputs/` artifacts shown by Flask must either be committed into the repo before deploy or regenerated during your release workflow.
+
+### Railway
+
+1. Push the project to GitHub with `outputs/` populated with the JSON, CSV, and PNG artifacts you want the team to see.
+2. In Railway, create a new project and choose `Deploy from GitHub repo`.
+3. Select this repository and let Railway detect the Python service.
+4. In Railway Variables, set `PORT=5050` only if you want a local-style default; Railway will inject its own runtime `PORT` automatically.
+5. Set `DASHBOARD_PASSWORD` to protect the dashboard with HTTP Basic Auth. The username is always `autocivil`.
+6. Confirm the start command uses the `Procfile` entry: `gunicorn dashboard:app --bind 0.0.0.0:$PORT --workers 2`.
+7. Deploy the service and wait for the first successful build.
+8. Open `/health` to verify the app is live, then open `/` and log in with `autocivil` plus your `DASHBOARD_PASSWORD`.
+
+### Render
+
+1. Push the repository to GitHub with the dashboard artifacts already present in `outputs/`.
+2. In Render, create a new Web Service and connect the repository.
+3. Choose the included `render.yaml`, or manually set the environment to `Python`.
+4. Keep the build command as `pip install -r requirements.txt`.
+5. Keep the start command as `gunicorn dashboard:app --bind 0.0.0.0:$PORT`.
+6. Add the environment variable `DASHBOARD_PASSWORD` if you want the dashboard protected. The username remains `autocivil`.
+7. Deploy the service and wait for Render to finish building the container.
+8. Visit `/health` first to confirm `{"status":"ok"}`, then open the main dashboard URL and verify the `outputs/` artifacts load correctly.
+
 ## Growth path
 
 - v1 (current): local automated experimentation for one civil-engineering regression task.

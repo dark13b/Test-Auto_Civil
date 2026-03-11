@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import random
 import sys
+import warnings
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ import numpy as np
 import pandas as pd
 import requests
 import yaml
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
 
 from feature_engineering import build_engineering_features, validate_features
 
@@ -72,41 +76,207 @@ def resolve_local_data_path(config: dict[str, Any]) -> Path:
     return get_project_root() / configured_path
 
 
-def load_local_dataset(config: dict[str, Any]) -> pd.DataFrame:
-    """Load a local CSV or Excel dataset and normalize it to the project schema."""
+def load_and_harmonize_lab_data(config: dict[str, Any]) -> pd.DataFrame:
+    """Load local lab data, harmonize headers and units, and preserve source-sheet metadata."""
+    from difflib import get_close_matches
+
     local_settings = config["data"]["local_file"]
     local_path = resolve_local_data_path(config)
     if not local_path.exists():
         raise FileNotFoundError(f"Configured local dataset was not found: {local_path}")
 
+    expected_inputs = [str(column) for column in config["task"]["input_columns"]]
+    target_column = str(config["task"]["target_column"])
+    expected_columns = expected_inputs + [target_column]
+    optional_columns = {"slag", "fly_ash", "superplasticizer"}
+    required_columns = [column for column in expected_columns if column not in optional_columns]
+
+    column_mapping = {
+        str(source): str(destination)
+        for source, destination in local_settings.get("column_mapping", {}).items()
+    }
+    unit_conversions = {
+        str(source): spec for source, spec in local_settings.get("unit_conversions", {}).items()
+    }
+    drop_columns = [str(column) for column in local_settings.get("drop_columns", [])]
+
+    def normalize_header(value: Any) -> str:
+        text = str(value).strip().lower()
+        return "".join(character for character in text if character.isalnum())
+
+    def find_matching_column(alias: str, candidates: list[str]) -> tuple[str | None, bool]:
+        alias_normalized = normalize_header(alias)
+        if not alias_normalized:
+            return None, False
+
+        normalized_to_columns: dict[str, list[str]] = {}
+        for candidate in candidates:
+            normalized_candidate = normalize_header(candidate)
+            normalized_to_columns.setdefault(normalized_candidate, []).append(candidate)
+
+        if alias_normalized in normalized_to_columns:
+            return normalized_to_columns[alias_normalized][0], False
+
+        close_matches = get_close_matches(
+            alias_normalized,
+            [value for value in normalized_to_columns if value],
+            n=1,
+            cutoff=0.72,
+        )
+        if not close_matches:
+            return None, False
+        return normalized_to_columns[close_matches[0]][0], True
+
+    alias_specs: list[tuple[str, str, float]] = []
+    processed_aliases: set[str] = set()
+
+    for source_column, destination_column in column_mapping.items():
+        conversion_spec = unit_conversions.get(source_column, {})
+        multiplier = float(conversion_spec.get("multiplier", 1.0)) if isinstance(conversion_spec, dict) else 1.0
+        alias_specs.append((source_column, destination_column, multiplier))
+        processed_aliases.add(source_column)
+
+    for source_column, conversion_spec in unit_conversions.items():
+        if isinstance(conversion_spec, dict):
+            destination_column = str(conversion_spec.get("rename", column_mapping.get(source_column, source_column)))
+            multiplier = float(conversion_spec.get("multiplier", 1.0))
+        else:
+            destination_column = str(column_mapping.get(source_column, source_column))
+            multiplier = float(conversion_spec)
+        if source_column in processed_aliases:
+            continue
+        alias_specs.append((source_column, destination_column, multiplier))
+        processed_aliases.add(source_column)
+
+    for canonical_column in expected_columns:
+        if canonical_column in processed_aliases:
+            continue
+        alias_specs.append((canonical_column, canonical_column, 1.0))
+        processed_aliases.add(canonical_column)
+
     suffix = local_path.suffix.lower()
+    sheet_frames: dict[str, pd.DataFrame]
     if suffix == ".csv":
-        frame = pd.read_csv(local_path)
+        sheet_frames = {local_path.stem: pd.read_csv(local_path)}
     elif suffix in {".xlsx", ".xls"}:
-        sheet_name = local_settings.get("sheet_name", 0)
         engine = "openpyxl" if suffix == ".xlsx" else "xlrd"
-        frame = pd.read_excel(local_path, sheet_name=sheet_name, engine=engine)
+        workbook = pd.ExcelFile(local_path, engine=engine)
+        configured_sheet = local_settings.get("sheet_name")
+        if configured_sheet in {None, "", "*", "all", "ALL"}:
+            sheet_names = workbook.sheet_names
+        elif isinstance(configured_sheet, list):
+            sheet_names = [str(sheet_name) for sheet_name in configured_sheet]
+        elif isinstance(configured_sheet, int):
+            sheet_names = [workbook.sheet_names[configured_sheet]]
+        else:
+            sheet_names = [str(configured_sheet)]
+        sheet_frames = {sheet_name: workbook.parse(sheet_name) for sheet_name in sheet_names}
     else:
         raise ValueError(f"Unsupported local dataset format: {local_path.suffix}")
 
-    frame = frame.copy()
-    drop_columns = [str(column) for column in local_settings.get("drop_columns", [])]
-    existing_drop_columns = [column for column in drop_columns if column in frame.columns]
-    if existing_drop_columns:
-        frame = frame.drop(columns=existing_drop_columns)
+    harmonized_frames: list[pd.DataFrame] = []
+    for sheet_name, raw_frame in sheet_frames.items():
+        frame = raw_frame.dropna(axis=0, how="all").dropna(axis=1, how="all").copy()
+        if frame.empty:
+            log_status(f"WARNING local_sheet_empty | sheet={sheet_name} | skipping")
+            continue
 
-    column_mapping = {str(key): str(value) for key, value in local_settings.get("column_mapping", {}).items()}
-    if column_mapping:
-        frame = frame.rename(columns=column_mapping)
+        matched_drop_columns: list[str] = []
+        available_columns = [str(column) for column in frame.columns]
+        for drop_column in drop_columns:
+            matched_column, _ = find_matching_column(drop_column, available_columns)
+            if matched_column is not None and matched_column not in matched_drop_columns:
+                matched_drop_columns.append(matched_column)
+        if matched_drop_columns:
+            frame = frame.drop(columns=matched_drop_columns)
 
+        harmonized_frame = pd.DataFrame(index=frame.index)
+        harmonized_frame["source_sheet"] = str(sheet_name)
+        matched_source_columns: set[str] = set()
+
+        for source_alias, canonical_column, multiplier in alias_specs:
+            candidate_columns = [
+                str(column)
+                for column in frame.columns
+                if str(column) not in matched_source_columns
+            ]
+            matched_column, used_fuzzy_match = find_matching_column(source_alias, candidate_columns)
+            if matched_column is None:
+                continue
+
+            numeric_series = pd.to_numeric(frame[matched_column], errors="coerce") * multiplier
+            if canonical_column in harmonized_frame.columns:
+                harmonized_frame[canonical_column] = harmonized_frame[canonical_column].combine_first(
+                    numeric_series
+                )
+            else:
+                harmonized_frame[canonical_column] = numeric_series
+
+            matched_source_columns.add(matched_column)
+            if used_fuzzy_match:
+                log_status(
+                    f"Fuzzy-mapped local column '{matched_column}' to '{canonical_column}' using alias '{source_alias}'."
+                )
+
+        harmonized_frames.append(harmonized_frame)
+
+    if not harmonized_frames:
+        raise ValueError(f"No usable rows were found in local dataset: {local_path}")
+
+    harmonized = pd.concat(harmonized_frames, ignore_index=True, sort=False)
+
+    for column_name in optional_columns:
+        if column_name not in harmonized.columns:
+            harmonized[column_name] = 0.0
+            log_status(
+                f"WARNING optional_column_imputed | column={column_name} | rows={len(harmonized)} | fill_value=0.0"
+            )
+            continue
+        missing_count = int(harmonized[column_name].isna().sum())
+        if missing_count > 0:
+            harmonized[column_name] = harmonized[column_name].fillna(0.0)
+            log_status(
+                f"WARNING optional_column_imputed | column={column_name} | rows={missing_count} | fill_value=0.0"
+            )
+
+    missing_required_columns = [column for column in required_columns if column not in harmonized.columns]
+    if missing_required_columns:
+        raise ValueError(
+            "Local lab dataset is missing required columns after harmonization: "
+            f"{missing_required_columns}"
+        )
+
+    selected_columns = ["source_sheet"] + expected_columns
+    harmonized = harmonized[selected_columns].copy()
+    numeric_values = harmonized[expected_columns].apply(pd.to_numeric, errors="coerce")
+    invalid_row_mask = numeric_values.isnull().any(axis=1)
+    if invalid_row_mask.any():
+        dropped_rows = int(invalid_row_mask.sum())
+        harmonized = harmonized.loc[~invalid_row_mask].copy()
+        numeric_values = numeric_values.loc[~invalid_row_mask].copy()
+        log_status(
+            f"WARNING dropped_invalid_local_rows | rows={dropped_rows} | reason=missing_or_non_numeric_values"
+        )
+    harmonized[expected_columns] = numeric_values.astype(float)
+
+    initial_row_count = len(harmonized)
+    harmonized = harmonized.drop_duplicates(subset=expected_inputs, keep="first").reset_index(drop=True)
+    duplicate_count = initial_row_count - len(harmonized)
+    if duplicate_count > 0:
+        log_status(f"Removed {duplicate_count} duplicate local lab rows based on configured input columns.")
+
+    log_status(
+        f"Harmonized local lab dataset from {local_path} with {len(harmonized)} rows across "
+        f"{harmonized['source_sheet'].nunique()} sheet(s)."
+    )
+    return harmonized
+
+
+def load_local_dataset(config: dict[str, Any]) -> pd.DataFrame:
+    """Load a local CSV or Excel dataset and normalize it to the project schema."""
+    harmonized = load_and_harmonize_lab_data(config)
     expected_columns = config["task"]["input_columns"] + [config["task"]["target_column"]]
-    missing_columns = [column for column in expected_columns if column not in frame.columns]
-    if missing_columns:
-        raise ValueError(f"Local dataset is missing required columns after mapping: {missing_columns}")
-
-    normalized = frame[expected_columns].copy()
-    normalized = normalized.dropna(axis=0, how="any")
-    return normalized
+    return harmonized[expected_columns].copy()
 
 
 def load_from_download_bytes(raw_bytes: bytes, config: dict[str, Any], source_url: str) -> pd.DataFrame:
@@ -206,6 +376,90 @@ def generate_synthetic_dataset(config: dict[str, Any]) -> pd.DataFrame:
     return frame.round(4)
 
 
+# OUTLIER DETECTION
+def get_outlier_detection_settings(config: dict[str, Any]) -> tuple[bool, float]:
+    """Return validated outlier-detection settings with safe defaults."""
+    outlier_config = config.get("data", {}).get("outlier_detection", {})
+    enabled = bool(outlier_config.get("enabled", True))
+    contamination = float(outlier_config.get("contamination", 0.03))
+    if not 0.0 < contamination <= 0.5:
+        raise ValueError("data.outlier_detection.contamination must be in the range (0.0, 0.5].")
+    return enabled, contamination
+
+
+# OUTLIER DETECTION
+def detect_consensus_outliers(frame: pd.DataFrame, config: dict[str, Any]) -> pd.Series:
+    """Identify conservative outliers where IsolationForest and LOF agree."""
+    _, contamination = get_outlier_detection_settings(config)
+    if len(frame) < 3:
+        log_status("Skipping outlier detection because the dataset has fewer than 3 rows.")
+        return pd.Series(False, index=frame.index, dtype=bool)
+
+    numeric_frame = frame.apply(pd.to_numeric, errors="coerce")
+    if numeric_frame.isnull().any().any():
+        invalid_columns = numeric_frame.columns[numeric_frame.isnull().any()].tolist()
+        raise ValueError(
+            "Outlier detection requires a fully numeric dataset after feature engineering. "
+            f"Invalid columns: {invalid_columns}"
+        )
+
+    scaled_values = StandardScaler().fit_transform(numeric_frame.to_numpy(dtype=float))
+    random_seed = int(config["experiment"]["random_seed"])
+    primary_detector = IsolationForest(
+        contamination=contamination,
+        random_state=random_seed,
+    )
+    secondary_detector = LocalOutlierFactor(
+        contamination=contamination,
+        n_neighbors=max(2, min(20, len(frame) - 1)),
+    )
+
+    primary_flags = primary_detector.fit_predict(scaled_values) == -1
+    secondary_flags = secondary_detector.fit_predict(scaled_values) == -1
+    consensus_flags = primary_flags & secondary_flags
+
+    log_status(
+        "Outlier detection summary: "
+        f"IsolationForest={int(primary_flags.sum())}, "
+        f"LOF={int(secondary_flags.sum())}, "
+        f"consensus={int(consensus_flags.sum())}"
+    )
+    return pd.Series(consensus_flags, index=frame.index, dtype=bool)
+
+
+# OUTLIER DETECTION
+def apply_outlier_detection(frame: pd.DataFrame, config: dict[str, Any], mode: str) -> pd.DataFrame:
+    """Remove consensus outliers unless the active mode is local_file."""
+    enabled, _ = get_outlier_detection_settings(config)
+    if not enabled:
+        log_status("Outlier detection disabled in config; saving dataset without removal.")
+        return frame
+
+    consensus_flags = detect_consensus_outliers(frame, config)
+    flagged_count = int(consensus_flags.sum())
+    if flagged_count == 0:
+        log_status("Outlier detection found no consensus outliers.")
+        return frame
+
+    target_column = str(config["task"]["target_column"])
+    strength_values = frame.loc[consensus_flags, target_column].round(4).tolist()
+
+    if mode == "local_file":
+        warning_message = (
+            f"Outlier detection flagged {flagged_count} rows in local_file mode but kept them. "
+            f"{target_column} values: {strength_values}"
+        )
+        warnings.warn(warning_message, UserWarning, stacklevel=2)
+        log_status(warning_message)
+        return frame
+
+    log_status(
+        f"Removing {flagged_count} consensus outliers before saving. "
+        f"{target_column} values: {strength_values}"
+    )
+    return frame.loc[~consensus_flags].reset_index(drop=True)
+
+
 def save_dataset(frame: pd.DataFrame, config: dict[str, Any]) -> Path:
     """Persist the prepared dataset to disk."""
     dataset_path = get_dataset_path(config)
@@ -216,11 +470,37 @@ def save_dataset(frame: pd.DataFrame, config: dict[str, Any]) -> Path:
 def main() -> int:
     """Run the dataset preparation workflow."""
     try:
+        import argparse
+
+        parser = argparse.ArgumentParser(description="Prepare the concrete dataset for AutoCivil-Lab.")
+        parser.add_argument(
+            "--validate-only",
+            action="store_true",
+            help="Load and harmonize local lab data, print a validation summary, and exit without saving.",
+        )
+        args = parser.parse_args()
+
         config = load_config()
         set_global_seed(int(config["experiment"]["random_seed"]))
         mode = str(config["data"]["mode"]).strip().lower()
         if mode not in {"real", "synthetic", "local_file"}:
             raise ValueError("config.yaml data.mode must be 'real', 'synthetic', or 'local_file'.")
+
+        if args.validate_only:
+            if mode != "local_file":
+                raise ValueError("--validate-only is only supported when config.yaml data.mode is 'local_file'.")
+            harmonized = load_and_harmonize_lab_data(config)
+            target_column = str(config["task"]["target_column"])
+            input_columns = [str(column) for column in config["task"]["input_columns"]]
+            log_status(
+                f"Validation summary | rows={len(harmonized)} | sheets={harmonized['source_sheet'].nunique()} | "
+                f"target_mean={harmonized[target_column].mean():.3f}"
+            )
+            log_status(f"Validated schema: {', '.join(['source_sheet'] + input_columns + [target_column])}")
+            sheet_counts = harmonized["source_sheet"].value_counts().sort_index()
+            for sheet_name, row_count in sheet_counts.items():
+                log_status(f"Sheet {sheet_name}: {int(row_count)} rows")
+            return 0
 
         if mode == "local_file":
             dataset = load_local_dataset(config)
@@ -245,6 +525,9 @@ def main() -> int:
             dataset = build_engineering_features(dataset)
             if not validate_features(dataset):
                 raise ValueError("Engineered feature validation failed during data generation.")
+
+        # OUTLIER DETECTION
+        dataset = apply_outlier_detection(dataset, config, mode)
 
         dataset_path = save_dataset(dataset, config)
         log_status(f"Saved {data_origin} dataset to {dataset_path} with {len(dataset)} rows.")

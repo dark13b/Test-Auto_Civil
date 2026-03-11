@@ -32,9 +32,16 @@ data:
     column_mapping:
       blast_furnace_slag: slag
       concrete_compressive_strength: compressive_strength
+    unit_conversions:
+      fly_ash_g_per_L:
+        rename: fly_ash
+        multiplier: 1.0
   synthetic_rows: 1030
   test_size: 0.2
   stratify_bins: 5
+  outlier_detection:
+    enabled: true
+    contamination: 0.03
 
 metrics:
   primary_metric: rmse
@@ -114,7 +121,7 @@ engineering:
         max: 0.65
 
 uncertainty:
-  calibration_fraction: 0.2
+  calibration_fraction: 0.28
   coverage_level: 0.92
   reliability_bins: 10
   lower_alpha: 0.05
@@ -147,6 +154,7 @@ baseline_model:
 
 search:
   progress_interval: 10
+  build_ensemble_after_search: true
   # Search keeps running until it satisfies both this runtime floor and
   # experiment.optuna_trials.
   min_runtime_minutes: 50

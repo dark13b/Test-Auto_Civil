@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, cross_validate, train_test_split
@@ -409,6 +409,112 @@ def evaluate_candidate(
         }
     )
     return candidate_model, result
+
+
+def build_stacking_ensemble(
+    configs: list[tuple[str, dict[str, Any]]],
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    validator: EngineeringValidator,
+    config: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Train a stacking ensemble from a list of base-model configurations."""
+    if not configs:
+        raise ValueError("At least one base-model configuration is required to build a stacking ensemble.")
+
+    estimators: list[tuple[str, Any]] = []
+    base_model_specs: list[dict[str, Any]] = []
+    for index, (model_name, hyperparams) in enumerate(configs, start=1):
+        estimator_name = f"{model_name.lower()}_{index}"
+        estimators.append((estimator_name, instantiate_model(model_name, hyperparams, config)))
+        base_model_specs.append(
+            {
+                "model_name": model_name,
+                "hyperparameters": dict(hyperparams),
+            }
+        )
+
+    seed = int(config["experiment"]["random_seed"])
+    stacking_model = StackingRegressor(
+        estimators=estimators,
+        final_estimator=Ridge(random_state=seed),
+        passthrough=True,
+        cv=build_cv_splitter(config),
+        n_jobs=-1,
+    )
+    stacking_model.fit(x_train, y_train)
+
+    test_predictions = np.asarray(stacking_model.predict(x_test), dtype=float)
+    test_metrics = compute_regression_metrics(y_test, test_predictions, config, float(y_train.mean()))
+    validation_report = validator.validate_predictions(test_predictions, x_test, y_test)
+    result = {
+        "model_name": "StackingRegressor",
+        "hyperparameters": {
+            "base_models": base_model_specs,
+            "meta_learner": "Ridge",
+            "passthrough": True,
+        },
+        "rmse": test_metrics["rmse"],
+        "mae": test_metrics["mae"],
+        "r2": test_metrics["r2"],
+        "composite_score": test_metrics["composite_score"],
+        "cv_metrics": test_metrics,
+        "test_metrics": test_metrics,
+        "validation_verdict": validation_report["verdict"],
+        "validation_report": validation_report,
+    }
+    result.update(
+        {
+            "cv_rmse": test_metrics["rmse"],
+            "cv_mae": test_metrics["mae"],
+            "cv_r2": test_metrics["r2"],
+            "cv_composite": test_metrics["composite_score"],
+            "holdout_rmse": test_metrics["rmse"],
+            "holdout_mae": test_metrics["mae"],
+            "holdout_r2": test_metrics["r2"],
+            "holdout_composite": test_metrics["composite_score"],
+            "validator_context_type": validation_report.get("context_type", "general"),
+            "validation_pass_rate": validation_report["pass_rate"],
+            "failed_count": validation_report["failed_count"],
+            "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
+            "warning_count": validation_report["warning_count"],
+            "suspicious_count": validation_report["suspicious_count"],
+            "statistical_errors": validation_report.get(
+                "statistical_errors",
+                validation_report.get("statistical_error_count", validation_report["suspicious_count"]),
+            ),
+            "statistical_error_count": validation_report.get(
+                "statistical_error_count",
+                validation_report.get("statistical_errors", validation_report["suspicious_count"]),
+            ),
+            "durability_warnings": validation_report.get(
+                "durability_warnings",
+                validation_report.get("durability_warning_count", validation_report.get("durability_caution_count", 0)),
+            ),
+            "durability_warning_count": validation_report.get(
+                "durability_warning_count",
+                validation_report.get("durability_warnings", validation_report.get("durability_caution_count", 0)),
+            ),
+            "durability_caution_count": validation_report.get("durability_caution_count", 0),
+            "dataset_anomalies": validation_report.get(
+                "dataset_anomalies",
+                validation_report.get("dataset_anomaly_count", 0),
+            ),
+            "dataset_anomaly_count": validation_report.get("dataset_anomaly_count", 0),
+            "warn_reasons": validation_report["warn_reasons"],
+            "statistical_error_reasons": validation_report.get("statistical_error_reasons", []),
+            "hard_fail_reasons": validation_report.get("hard_fail_reasons", []),
+            "durability_warning_reasons": validation_report.get(
+                "durability_warning_reasons",
+                validation_report.get("durability_caution_reasons", []),
+            ),
+            "durability_caution_reasons": validation_report.get("durability_caution_reasons", []),
+            "dataset_anomaly_reasons": validation_report.get("dataset_anomaly_reasons", []),
+        }
+    )
+    return stacking_model, result
 
 def get_runtime_library_versions() -> dict[str, str]:
     """Return the currently installed versions for tracked runtime libraries."""

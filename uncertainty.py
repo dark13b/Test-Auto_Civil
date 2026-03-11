@@ -150,10 +150,12 @@ class UncertaintyEstimator:
                     self.conformal_bin_calibration_coverage[int(bin_id)] = float(self.coverage_level)
                     continue
                 bin_quantile = self._quantile(bin_scores, quantile_level)
+                observed_coverage = float(np.mean(bin_scores <= bin_quantile))
+                if observed_coverage < 0.90:
+                    bin_quantile *= 1.08
+                    observed_coverage = float(np.mean(bin_scores <= bin_quantile))
                 self.conformal_bin_quantiles[int(bin_id)] = float(bin_quantile)
-                self.conformal_bin_calibration_coverage[int(bin_id)] = float(
-                    np.mean(bin_scores <= bin_quantile)
-                )
+                self.conformal_bin_calibration_coverage[int(bin_id)] = observed_coverage
 
         if self.method in {"quantile", "both"}:
             if LGBMRegressor is None:
@@ -421,6 +423,18 @@ class UncertaintyEstimator:
         )
         return report
 
+    def validate_coverage_target(self) -> bool:
+        """Run the calibration audit and validate it against the configured target."""
+        report = self.calibration_report()
+        actual_coverage = float(report["coverage"])
+        coverage_target = float(report["coverage_target"])
+        meets_target = actual_coverage >= coverage_target
+        if not meets_target:
+            log_status(
+                f"WARNING coverage_below_target | actual={actual_coverage:.4f} | target={coverage_target:.4f}"
+            )
+        return meets_target
+
 
 def recalibrate_uncertainty_artifacts(
     model_path: str | Path | None = None,
@@ -436,7 +450,7 @@ def main() -> int:
     """Generate the configured uncertainty calibration report."""
     try:
         estimator = UncertaintyEstimator()
-        estimator.calibration_report()
+        estimator.validate_coverage_target()
         return 0
     except Exception as exc:
         log_status(f"Uncertainty estimation failed: {exc}")

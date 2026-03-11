@@ -4,20 +4,21 @@ import csv
 import re
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, jsonify, send_from_directory, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory
 
 app = Flask(__name__)
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 DATA_DIR = BASE_DIR / "data"
 CONFIG_PATH = BASE_DIR / "config.yaml"
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
 def safe_read_json(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -32,6 +33,16 @@ def safe_read_csv(path):
         return rows
     except Exception:
         return None
+
+def load_required_output_json(filename):
+    path = OUTPUTS_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(filename)
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+def json_not_found(filename):
+    return jsonify({"error": "not_found", "file": filename}), 404
 
 def coerce_number(value):
     try:
@@ -214,11 +225,31 @@ def parse_research_log(path):
 
 # ─── API endpoints ──────────────────────────────────────────────────────────
 
+@app.before_request
+def require_dashboard_auth():
+    if not DASHBOARD_PASSWORD or request.path == "/health":
+        return None
+    auth = request.authorization
+    if auth and auth.username == "autocivil" and auth.password == DASHBOARD_PASSWORD:
+        return None
+    return Response(
+        "Authentication required",
+        401,
+        {"WWW-Authenticate": 'Basic realm="AutoCivil-Lab"'},
+    )
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "outputs_exist": OUTPUTS_DIR.exists()})
+
 @app.route("/api/overview")
 def api_overview():
-    baseline = normalize_result_payload(safe_read_json(OUTPUTS_DIR / "baseline_metrics.json") or {})
-    best     = normalize_result_payload(safe_read_json(OUTPUTS_DIR / "best_search_result.json") or {})
-    final    = normalize_final_payload(safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {})
+    try:
+        baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
+        best = normalize_result_payload(load_required_output_json("best_search_result.json") or {})
+        final = normalize_final_payload(load_required_output_json("final_metrics.json") or {})
+    except FileNotFoundError as exc:
+        return json_not_found(exc.args[0])
     # dataset info
     dataset_rows = 0
     try:
@@ -240,8 +271,19 @@ def api_optuna_results():
 
 @app.route("/api/validation_details")
 def api_validation_details():
-    best = normalize_result_payload(safe_read_json(OUTPUTS_DIR / "best_search_result.json") or {})
+    try:
+        best = normalize_result_payload(load_required_output_json("best_search_result.json") or {})
+    except FileNotFoundError as exc:
+        return json_not_found(exc.args[0])
     return jsonify(best)
+
+@app.route("/api/field_validation")
+def api_field_validation():
+    try:
+        records = load_required_output_json("field_validation_log.json")
+    except FileNotFoundError as exc:
+        return json_not_found(exc.args[0])
+    return jsonify(records if isinstance(records, list) else [])
 
 @app.route("/api/design_results")
 def api_design_results():
@@ -601,6 +643,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
     </div>
   </div>
   <nav>
+    <a href="#field-results"     ><span class="icon">#</span> Field Results</a>
     <a href="#overview"   class="active"><span class="icon">◈</span> Overview</a>
     <a href="#log"               ><span class="icon">◎</span> Research Log</a>
     <a href="#models"            ><span class="icon">◫</span> Model Comparison</a>
@@ -727,6 +770,12 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 </section>
 
 <!-- ══ GALLERY ════════════════════════════════════════════════════════════ -->
+<section class="section" id="field-results">
+  <div class="section-title">Field Results</div>
+  <div class="section-sub">Recorded lab outcomes - compare predicted and measured compressive strength</div>
+  <div id="field-results-content">Loading...</div>
+</section>
+
 <section class="section" id="gallery">
   <div class="section-title">Plots Gallery</div>
   <div class="section-sub">All generated figures from the pipeline</div>
@@ -749,6 +798,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 // ─── state ──────────────────────────────────────────────────────────────────
 let allTrials = [];
 let allOptuna = [];
+let fieldValidationRecords = [];
 let overviewData = {};
 let chartProgress, chartFamilies, chartRmse, chartRange, chartImprovement;
 let tablePage = 0;
@@ -770,6 +820,7 @@ async function loadAll() {
     loadOptuna(),
     loadValidation(),
     loadDesign(),
+    loadFieldValidation(),
     loadPlots(),
   ]);
 }
@@ -1257,6 +1308,74 @@ async function loadDesign() {
 }
 
 // ─── gallery ─────────────────────────────────────────────────────────────────
+async function loadFieldValidation() {
+  const el = document.getElementById('field-results-content');
+  const response = await fetch('/api/field_validation').catch(()=>null);
+  if(!response){
+    el.innerHTML = '<div class="design-placeholder">Unable to load field validation records.</div>';
+    return;
+  }
+
+  const payload = await response.json().catch(()=>[]);
+  if(!response.ok || !Array.isArray(payload) || !payload.length){
+    const missingFile = payload && payload.file ? payload.file : 'field_validation_log.json';
+    el.innerHTML = `
+      <div class="design-placeholder">
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px">No Field Validation Records Yet</div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Record lab outcomes after testing saved mix designs.</div>
+        <code>python field_tracker.py record --design outputs/design_35MPa.json --actual-strength 33.7 --notes "28-day cube test, batch #4"</code>
+        <div style="margin-top:12px;color:var(--muted);font-family:var(--mono);font-size:10px">Expected log file: ${missingFile}</div>
+      </div>`;
+    return;
+  }
+
+  fieldValidationRecords = [...payload].sort((a,b)=>new Date(b.timestamp) - new Date(a.timestamp));
+  const errors = fieldValidationRecords.map(r=>+(r.prediction_error_mpa || 0));
+  const rmse = Math.sqrt(errors.reduce((sum,value)=>sum + value * value, 0) / fieldValidationRecords.length);
+  const meanError = errors.reduce((sum,value)=>sum + value, 0) / fieldValidationRecords.length;
+  const withinTolerance = fieldValidationRecords.filter(r=>r.within_tolerance).length / fieldValidationRecords.length * 100;
+
+  el.innerHTML = `
+    <div class="card-grid" style="margin-bottom:20px">
+      <div class="card"><div class="card-label">Field Tests</div><div class="metric-value">${fieldValidationRecords.length}</div></div>
+      <div class="card"><div class="card-label">Mean Error</div><div class="metric-value sm">${meanError.toFixed(3)} MPa</div></div>
+      <div class="card"><div class="card-label">RMSE</div><div class="metric-value sm">${rmse.toFixed(3)} MPa</div></div>
+      <div class="card"><div class="card-label">Within +/- 2 MPa</div><div class="metric-value sm">${withinTolerance.toFixed(1)}%</div></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Design File</th>
+            <th>Target</th>
+            <th>Predicted</th>
+            <th>Actual</th>
+            <th>Error</th>
+            <th>Tolerance</th>
+            <th>Verdict</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${fieldValidationRecords.map(record=>`
+            <tr>
+              <td>${record.timestamp || '—'}</td>
+              <td>${record.design_file || '—'}</td>
+              <td>${record.target_strength != null ? Number(record.target_strength).toFixed(2) : '—'}</td>
+              <td>${record.predicted_strength != null ? Number(record.predicted_strength).toFixed(2) : '—'}</td>
+              <td>${record.actual_strength != null ? Number(record.actual_strength).toFixed(2) : '—'}</td>
+              <td>${record.prediction_error_mpa != null ? Number(record.prediction_error_mpa).toFixed(2) : '—'}</td>
+              <td><span class="badge ${record.within_tolerance ? 'pass' : 'warn'}">${record.within_tolerance ? 'WITHIN' : 'OUTSIDE'}</span></td>
+              <td><span class="badge ${String(record.validation_verdict || 'warn').toLowerCase()}">${record.validation_verdict || '—'}</span></td>
+              <td>${record.notes || '—'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
 async function loadPlots() {
   const plots = await fetch('/api/plots').then(r=>r.json()).catch(()=>[]);
   document.getElementById('plot-grid').innerHTML = plots.length
@@ -1301,9 +1420,10 @@ def index():
 
 if __name__ == "__main__":
     import webbrowser, threading
+    port = int(os.environ.get("PORT", 5050))
     def open_browser():
-        webbrowser.open("http://localhost:5050")
+        webbrowser.open(f"http://localhost:{port}")
     threading.Timer(1.2, open_browser).start()
     print("\n  AutoCivil-Lab Dashboard")
-    print("  http://localhost:5050\n")
-    app.run(debug=False, port=5050)
+    print(f"  http://localhost:{port}\n")
+    app.run(debug=False, port=port)
