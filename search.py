@@ -137,6 +137,7 @@ def seed_best_result_from_baseline(
     baseline_result["source"] = "baseline"
     baseline_result["beats_baseline"] = False
     baseline_result["trial_number"] = None
+    baseline_result["best_trial"] = None
     save_json_artifact(outputs_dir / "best_search_result.json", baseline_result)
     return baseline_result
 
@@ -173,8 +174,11 @@ def build_trial_record(
                 "test_composite_score": None,
                 "validation_pass_rate": None,
                 "failed_count": None,
+                "hard_failed_count": None,
                 "warning_count": None,
                 "suspicious_count": None,
+                "durability_caution_count": None,
+                "dataset_anomaly_count": None,
             }
         )
         return base_record
@@ -192,8 +196,11 @@ def build_trial_record(
             "test_composite_score": result["test_metrics"]["composite_score"],
             "validation_pass_rate": validation_report["pass_rate"],
             "failed_count": validation_report["failed_count"],
+            "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
             "warning_count": validation_report["warning_count"],
             "suspicious_count": validation_report["suspicious_count"],
+            "durability_caution_count": validation_report.get("durability_caution_count", 0),
+            "dataset_anomaly_count": validation_report.get("dataset_anomaly_count", 0),
         }
     )
     return base_record
@@ -238,6 +245,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                 config,
             )
             verdict = result["validation_verdict"]
+            # FAIL is reserved for impossible outputs; engineering warnings are still
+            # logged but remain eligible for selection.
             if verdict == "FAIL":
                 selection_status = "rejected_validation_fail"
                 study.tell(trial, -1e9)
@@ -264,6 +273,7 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     best_result["source"] = "search"
                     best_result["beats_baseline"] = True
                     best_result["trial_number"] = trial_number
+                    best_result["best_trial"] = trial_number
                     save_pickle_artifact(outputs_dir / "best_search_model.pkl", model)
                     save_json_artifact(outputs_dir / "best_search_result.json", best_result)
 

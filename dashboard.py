@@ -33,6 +33,148 @@ def safe_read_csv(path):
     except Exception:
         return None
 
+def coerce_number(value):
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def normalize_result_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized = dict(payload)
+    cv_metrics = normalized.get("cv_metrics") or {}
+    test_metrics = normalized.get("test_metrics") or {}
+    validation_report = normalized.get("validation_report") or {}
+
+    normalized["validation"] = normalized.get("validation_verdict") or normalized.get("validation")
+    normalized["cv_rmse"] = coerce_number(normalized.get("cv_rmse") or cv_metrics.get("rmse") or normalized.get("rmse"))
+    normalized["cv_mae"] = coerce_number(normalized.get("cv_mae") or cv_metrics.get("mae") or normalized.get("mae"))
+    normalized["cv_r2"] = coerce_number(normalized.get("cv_r2") or cv_metrics.get("r2") or normalized.get("r2"))
+    normalized["cv_composite"] = coerce_number(
+        normalized.get("cv_composite") or cv_metrics.get("composite_score") or normalized.get("composite_score")
+    )
+    normalized["holdout_rmse"] = coerce_number(
+        normalized.get("holdout_rmse") or test_metrics.get("rmse")
+    )
+    normalized["holdout_mae"] = coerce_number(
+        normalized.get("holdout_mae") or test_metrics.get("mae")
+    )
+    normalized["holdout_r2"] = coerce_number(
+        normalized.get("holdout_r2") or test_metrics.get("r2")
+    )
+    normalized["holdout_composite"] = coerce_number(
+        normalized.get("holdout_composite") or test_metrics.get("composite_score")
+    )
+    normalized["best_trial"] = normalized.get("best_trial", normalized.get("trial_number"))
+
+    hard_failed_count = int(
+        coerce_number(
+            normalized.get("hard_failed_count")
+            or validation_report.get("hard_failed_count")
+            or normalized.get("failed_count")
+            or validation_report.get("failed_count")
+            or 0
+        )
+        or 0
+    )
+    warning_count = int(
+        coerce_number(
+            normalized.get("warning_count") or validation_report.get("warning_count") or 0
+        )
+        or 0
+    )
+    durability_caution_count = int(
+        coerce_number(
+            normalized.get("durability_caution_count")
+            or validation_report.get("durability_caution_count")
+            or 0
+        )
+        or 0
+    )
+    dataset_anomaly_count = int(
+        coerce_number(
+            normalized.get("dataset_anomaly_count")
+            or validation_report.get("dataset_anomaly_count")
+            or 0
+        )
+        or 0
+    )
+
+    normalized["failed_count"] = hard_failed_count
+    normalized["hard_failed_count"] = hard_failed_count
+    normalized["warning_count"] = warning_count
+    normalized["durability_caution_count"] = durability_caution_count
+    normalized["dataset_anomaly_count"] = dataset_anomaly_count
+    # API responses flatten list-valued artifact fields into counts where the
+    # dashboard expects summary numbers.
+    normalized["failed_samples"] = hard_failed_count
+    normalized["warning_samples"] = warning_count
+    normalized["suspicious_samples"] = dataset_anomaly_count
+    normalized["suspicious_count"] = dataset_anomaly_count
+    normalized["warn_reasons"] = normalized.get("warn_reasons") or validation_report.get("warn_reasons") or []
+    normalized["hard_fail_reasons"] = (
+        normalized.get("hard_fail_reasons") or validation_report.get("hard_fail_reasons") or []
+    )
+    normalized["durability_caution_reasons"] = (
+        normalized.get("durability_caution_reasons")
+        or validation_report.get("durability_caution_reasons")
+        or []
+    )
+    normalized["dataset_anomaly_reasons"] = (
+        normalized.get("dataset_anomaly_reasons")
+        or validation_report.get("dataset_anomaly_reasons")
+        or []
+    )
+    normalized["validation_pass_rate"] = coerce_number(
+        normalized.get("validation_pass_rate") or validation_report.get("pass_rate")
+    )
+    return normalized
+
+def normalize_final_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    normalized = dict(payload)
+    normalized["composite_improvement_pct"] = coerce_number(
+        normalized.get("composite_improvement_pct") or normalized.get("improvement_percentage")
+    )
+    return normalized
+
+def normalize_optuna_rows(rows):
+    normalized_rows = []
+    for row in rows or []:
+        normalized = dict(row)
+        hyperparameters = {}
+        if row.get("hyperparameters"):
+            try:
+                hyperparameters = json.loads(row["hyperparameters"])
+            except Exception:
+                hyperparameters = {}
+
+        trial_number = int(coerce_number(row.get("trial_number")) or 0)
+        normalized["number"] = trial_number
+        normalized["trial"] = trial_number
+        normalized["params_model_name"] = row.get("display_name") or row.get("model_name") or "Other"
+        normalized["params_model"] = row.get("model_name") or row.get("display_name") or "Other"
+        for key, value in hyperparameters.items():
+            normalized[f"params_{key}"] = value
+
+        normalized["value"] = coerce_number(row.get("rmse"))
+        normalized["rmse"] = coerce_number(row.get("rmse"))
+        normalized["mae"] = coerce_number(row.get("mae"))
+        normalized["r2"] = coerce_number(row.get("r2"))
+        normalized["composite"] = coerce_number(row.get("composite_score"))
+        normalized["user_attrs_mae"] = normalized["mae"]
+        normalized["user_attrs_r2"] = normalized["r2"]
+        normalized["user_attrs_composite"] = normalized["composite"]
+        normalized["user_attrs_validation"] = row.get("validation_verdict")
+        normalized["user_attrs_improved"] = row.get("selection_status") == "new_best"
+        normalized_rows.append(normalized)
+    return normalized_rows
+
 def parse_research_log(path):
     trials = []
     pattern = re.compile(
@@ -74,9 +216,9 @@ def parse_research_log(path):
 
 @app.route("/api/overview")
 def api_overview():
-    baseline = safe_read_json(OUTPUTS_DIR / "baseline_metrics.json") or {}
-    best     = safe_read_json(OUTPUTS_DIR / "best_search_result.json") or {}
-    final    = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
+    baseline = normalize_result_payload(safe_read_json(OUTPUTS_DIR / "baseline_metrics.json") or {})
+    best     = normalize_result_payload(safe_read_json(OUTPUTS_DIR / "best_search_result.json") or {})
+    final    = normalize_final_payload(safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {})
     # dataset info
     dataset_rows = 0
     try:
@@ -94,11 +236,11 @@ def api_research_log():
 @app.route("/api/optuna_results")
 def api_optuna_results():
     rows = safe_read_csv(OUTPUTS_DIR / "optuna_results.csv")
-    return jsonify(rows or [])
+    return jsonify(normalize_optuna_rows(rows))
 
 @app.route("/api/validation_details")
 def api_validation_details():
-    best = safe_read_json(OUTPUTS_DIR / "best_search_result.json") or {}
+    best = normalize_result_payload(safe_read_json(OUTPUTS_DIR / "best_search_result.json") or {})
     return jsonify(best)
 
 @app.route("/api/design_results")
@@ -682,8 +824,9 @@ async function loadOverview() {
     <div class="card">
       <div class="card-label">06 · Validation Status</div>
       <div class="card-title">Engineering Checks</div>
-      <div class="metric"><div class="metric-label">Failed Samples</div><div class="metric-value" style="color:${(best.failed_samples||0)>0?'var(--red)':'var(--green)'}">${best.failed_samples??'—'}</div></div>
-      <div class="metric"><div class="metric-label">Suspicious Samples</div><div class="metric-value sm">${best.suspicious_samples??'—'}</div></div>
+      <div class="metric"><div class="metric-label">Hard Fails</div><div class="metric-value" style="color:${(best.hard_failed_count||0)>0?'var(--red)':'var(--green)'}">${best.hard_failed_count??'—'}</div></div>
+      <div class="metric"><div class="metric-label">Durability Cautions</div><div class="metric-value sm" style="color:${(best.durability_caution_count||0)>0?'var(--yellow)':'var(--green)'}">${best.durability_caution_count??'—'}</div></div>
+      <div class="metric"><div class="metric-label">Dataset Anomalies</div><div class="metric-value sm">${best.dataset_anomaly_count??'—'}</div></div>
       <div style="margin-top:8px">${verdictBadge(best.validation_verdict||best.validation)}</div>
     </div>
   `;
@@ -942,35 +1085,55 @@ function chartDefaults(){
 async function loadValidation() {
   const d = await fetch('/api/validation_details').then(r=>r.json()).catch(()=>({}));
   const v = d.validation_verdict || d.validation || '—';
-  const fail = d.failed_samples ?? '—';
-  const sus  = d.suspicious_samples ?? '—';
+  const fail = d.hard_failed_count ?? d.failed_samples ?? 0;
+  const warn = d.warning_count ?? 0;
+  const durability = d.durability_caution_count ?? 0;
+  const anomalies = d.dataset_anomaly_count ?? d.suspicious_samples ?? 0;
+  const passRate = d.validation_pass_rate;
+  const hardFailReasons = d.hard_fail_reasons || [];
   const warns = d.warn_reasons || [];
+  const durabilityReasons = d.durability_caution_reasons || [];
+  const anomalyReasons = d.dataset_anomaly_reasons || [];
+  const renderReasonGroup = (title, items, emptyText, styles) => `
+    <div style="margin-bottom:16px">
+      <div class="metric-label" style="margin-bottom:8px">${title}</div>
+      ${items.length
+        ? `<ul class="warn-list">${items.map(w=>`<li style="background:${styles.bg};border-left-color:${styles.border};color:${styles.text}">${w}</li>`).join('')}</ul>`
+        : `<div style="color:var(--muted);font-family:var(--mono);font-size:11px">${emptyText}</div>`
+      }
+    </div>
+  `;
 
   document.getElementById('val-summary').innerHTML = `
     <h3>Validation Summary</h3>
     <div class="verdict-big ${v.toLowerCase()}">${v}</div>
     <div class="metric"><div class="metric-label">Hard Failures</div><div class="metric-value sm" style="color:${fail>0?'var(--red)':'var(--green)'}">${fail}</div></div>
-    <div class="metric"><div class="metric-label">Suspicious Samples</div><div class="metric-value sm" style="color:${sus>0?'var(--yellow)':'var(--green)'}">${sus}</div></div>
+    <div class="metric"><div class="metric-label">Warning Samples</div><div class="metric-value sm" style="color:${warn>0?'var(--yellow)':'var(--green)'}">${warn}</div></div>
+    <div class="metric"><div class="metric-label">Durability Cautions</div><div class="metric-value sm" style="color:${durability>0?'var(--yellow)':'var(--green)'}">${durability}</div></div>
+    <div class="metric"><div class="metric-label">Dataset Anomalies</div><div class="metric-value sm" style="color:${anomalies>0?'var(--yellow)':'var(--green)'}">${anomalies}</div></div>
+    <div class="metric"><div class="metric-label">Pass Rate</div><div class="metric-value sm">${passRate!=null?(passRate*100).toFixed(2)+'%':'—'}</div></div>
     <div class="metric"><div class="metric-label">Model</div><div class="metric-value sm">${d.model_name||'—'}</div></div>
   `;
 
   document.getElementById('val-warnings').innerHTML = `
-    <h3>Warning Reasons</h3>
-    ${warns.length
-      ? `<ul class="warn-list">${warns.map(w=>`<li>${w}</li>`).join('')}</ul>`
-      : `<div style="color:var(--green);font-family:var(--mono);font-size:12px;margin-top:8px">✓ No warnings triggered</div>`
-    }
+    <h3>Validation Breakdown</h3>
+    ${renderReasonGroup('Hard-Fail Reasons', hardFailReasons, 'No hard failures triggered', {bg:'rgba(244,63,94,.06)', border:'var(--red)', text:'var(--red)'})}
+    ${renderReasonGroup('Warning Reasons', warns, 'No warnings triggered', {bg:'rgba(245,158,11,.06)', border:'var(--yellow)', text:'var(--yellow)'})}
+    ${renderReasonGroup('Durability Cautions', durabilityReasons, 'No durability cautions triggered', {bg:'rgba(245,158,11,.06)', border:'var(--yellow)', text:'var(--yellow)'})}
+    ${renderReasonGroup('Dataset Anomalies', anomalyReasons, 'No dataset anomalies triggered', {bg:'rgba(0,212,255,.06)', border:'var(--accent)', text:'var(--accent)'})}
     <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
       <div class="metric-label" style="margin-bottom:8px">RULE REFERENCE</div>
       ${[
-        ['w/c > 0.60','Durability limit (moderate exposure)','WARN'],
-        ['w/c > 0.70','Hard engineering flag','WARN'],
+        ['w/c > 0.60','Durability caution for moderate exposure','WARN'],
+        ['w/c > 0.70 and strength > 30 MPa','Review with SCM, age, and w/b context','WARN'],
+        ['w/c > 0.70 + strength > 30 MPa + age <= 28 d + low SCM + high w/b','Implausible early-age binder context','FAIL'],
         ['Binder < 250 kg/m³','Low binder content','WARN'],
         ['Binder > 550 kg/m³','Shrinkage risk','WARN'],
         ['Fly ash > 40%','Exceeds ACI substitution limit','WARN'],
         ['Slag > 70%','Exceeds BS 8500 GGBS limit','WARN'],
+        ['Predicted NaN / inf','Numerically invalid model output','FAIL'],
         ['Predicted < 0 MPa','Physical impossibility','FAIL'],
-        ['Predicted > 120 MPa','Outside normal concrete range','FAIL'],
+        ['Predicted outside configured bounds','Outside configured engineering range','FAIL'],
       ].map(([rule,desc,sev])=>`
         <div class="rule-item">
           <span style="color:var(--txt)">${rule}</span>
@@ -1081,6 +1244,6 @@ if __name__ == "__main__":
     def open_browser():
         webbrowser.open("http://localhost:5050")
     threading.Timer(1.2, open_browser).start()
-    print("\n  ◈ AutoCivil-Lab Dashboard")
-    print("  → http://localhost:5050\n")
+    print("\n  AutoCivil-Lab Dashboard")
+    print("  http://localhost:5050\n")
     app.run(debug=False, port=5050)

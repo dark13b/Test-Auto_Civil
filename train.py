@@ -342,6 +342,31 @@ def evaluate_candidate(
         "validation_verdict": validation_report["verdict"],
         "validation_report": validation_report,
     }
+    # Keep nested metrics as the source of truth, but expose flat aliases for
+    # downstream artifacts and the dashboard.
+    result.update(
+        {
+            "cv_rmse": cv_metrics["rmse"],
+            "cv_mae": cv_metrics["mae"],
+            "cv_r2": cv_metrics["r2"],
+            "cv_composite": cv_metrics["composite_score"],
+            "holdout_rmse": test_metrics["rmse"],
+            "holdout_mae": test_metrics["mae"],
+            "holdout_r2": test_metrics["r2"],
+            "holdout_composite": test_metrics["composite_score"],
+            "validation_pass_rate": validation_report["pass_rate"],
+            "failed_count": validation_report["failed_count"],
+            "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
+            "warning_count": validation_report["warning_count"],
+            "suspicious_count": validation_report["suspicious_count"],
+            "durability_caution_count": validation_report.get("durability_caution_count", 0),
+            "dataset_anomaly_count": validation_report.get("dataset_anomaly_count", 0),
+            "warn_reasons": validation_report["warn_reasons"],
+            "hard_fail_reasons": validation_report.get("hard_fail_reasons", []),
+            "durability_caution_reasons": validation_report.get("durability_caution_reasons", []),
+            "dataset_anomaly_reasons": validation_report.get("dataset_anomaly_reasons", []),
+        }
+    )
     return candidate_model, result
 
 

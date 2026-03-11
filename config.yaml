@@ -52,6 +52,11 @@ validator:
   suspicious_water_cement_ratio: 0.7
   suspicious_strength_mpa: 30.0
   durability_water_cement_warn: 0.6
+  # Keep very high w/c + high strength as a hard reject only when the
+  # binder context also looks implausible for early-age concrete.
+  high_water_cement_strength_hard_fail_max_age_days: 28.0
+  high_water_cement_strength_low_scm_threshold: 0.20
+  high_water_cement_strength_unfavorable_water_binder_ratio: 0.50
   low_water_binder_warn: 0.25
   total_binder_low_warn: 250.0
   total_binder_high_warn: 550.0

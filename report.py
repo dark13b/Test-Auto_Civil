@@ -175,12 +175,8 @@ def create_feature_importance_plot(feature_importance: pd.Series, outputs_dir: P
     save_figure(outputs_dir / "feature_importance.png")
 
 
-def create_performance_by_range_plot(
-    y_true: pd.Series,
-    y_pred: np.ndarray,
-    outputs_dir: Path,
-) -> dict[str, float]:
-    """Create a plot showing RMSE across low, mid, and high target ranges."""
+def compute_rmse_by_range(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
+    """Compute RMSE across low, mid, and high target ranges without plotting."""
     lower_bound = float(y_true.quantile(0.2))
     upper_bound = float(y_true.quantile(0.8))
     ranges = {
@@ -193,7 +189,16 @@ def create_performance_by_range_plot(
         group_true = y_true[mask]
         group_pred = y_pred[mask]
         rmse_by_range[label] = float(np.sqrt(np.mean((np.asarray(group_true) - np.asarray(group_pred)) ** 2)))
+    return rmse_by_range
 
+
+def create_performance_by_range_plot(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    outputs_dir: Path,
+) -> dict[str, float]:
+    """Create a plot showing RMSE across low, mid, and high target ranges."""
+    rmse_by_range = compute_rmse_by_range(y_true, y_pred)
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.figure(figsize=(7, 5))
     plt.bar(rmse_by_range.keys(), rmse_by_range.values(), color=["#9ec1a3", "#f4b860", "#d96c75"])
@@ -247,14 +252,17 @@ def main() -> int:
         outputs_dir = get_outputs_dir(config)
 
         baseline_metrics = load_json_artifact(outputs_dir / "baseline_metrics.json")
+        baseline_model = load_pickle_artifact(outputs_dir / "baseline_model.pkl")
         best_search_result = load_json_artifact(outputs_dir / "best_search_result.json")
         best_model = load_pickle_artifact(outputs_dir / "best_search_model.pkl")
         optuna_results = pd.read_csv(outputs_dir / "optuna_results.csv")
 
         data = load_dataset(config)
         x_train, x_test, y_train, y_test = split_dataset(data, config)
+        baseline_pred = np.asarray(baseline_model.predict(x_test), dtype=float)
         y_pred = np.asarray(best_model.predict(x_test), dtype=float)
         holdout_metrics = compute_regression_metrics(y_test, y_pred, config, float(y_train.mean()))
+        baseline_rmse_by_range = compute_rmse_by_range(y_test, baseline_pred)
 
         create_search_progress_plot(optuna_results, float(baseline_metrics["composite_score"]), outputs_dir)
         create_actual_vs_predicted_plot(y_test, y_pred, outputs_dir)
@@ -274,11 +282,13 @@ def main() -> int:
             "baseline_metrics": baseline_metrics,
             "best_search_metrics": best_search_result,
             "improvement_percentage": improvement_percentage,
+            "composite_improvement_pct": improvement_percentage,
             "validation_verdict": best_search_result["validation_verdict"],
             "best_model_name": best_search_result["model_name"],
             "best_model_hyperparameters": best_search_result["hyperparameters"],
             "holdout_metrics": holdout_metrics,
             "rmse_by_range": rmse_by_range,
+            "baseline_rmse_by_range": baseline_rmse_by_range,
             "uncertainty_summary": uncertainty_summary,
         }
         save_json_artifact(outputs_dir / "final_metrics.json", final_metrics)
