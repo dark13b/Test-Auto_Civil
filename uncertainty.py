@@ -41,15 +41,18 @@ class UncertaintyEstimator:
         model_path: str | Path | None = None,
         config_path: str | Path | None = None,
         method: str | None = None,
+        outputs_dir: str | Path | None = None,
+        report_filename: str = "uncertainty_calibration.json",
     ) -> None:
         """Load configuration, data, and interval estimators."""
         self.project_root = get_project_root()
         self.config = self._load_config(config_path)
-        self.outputs_dir = get_outputs_dir(self.config)
+        self.outputs_dir = self._resolve_outputs_dir(outputs_dir)
         self.model_path = self._resolve_model_path(model_path)
         self.method = str(
             method or self.config.get("engineering", {}).get("uncertainty_method", "conformal")
         ).strip().lower()
+        self.report_filename = str(report_filename)
         self.seed = int(self.config["experiment"]["random_seed"])
         self.coverage_level = max(0.92, float(self.config["uncertainty"]["coverage_level"]))
         self.feature_columns = get_input_columns(self.config)
@@ -121,6 +124,16 @@ class UncertaintyEstimator:
         resolved_path = Path(model_path)
         if not resolved_path.is_absolute():
             resolved_path = self.project_root / resolved_path
+        return resolved_path
+
+    def _resolve_outputs_dir(self, outputs_dir: str | Path | None) -> Path:
+        """Resolve the output directory relative to the project root."""
+        if outputs_dir is None:
+            return get_outputs_dir(self.config)
+        resolved_path = Path(outputs_dir)
+        if not resolved_path.is_absolute():
+            resolved_path = self.project_root / resolved_path
+        resolved_path.mkdir(parents=True, exist_ok=True)
         return resolved_path
 
     def _fit_estimators(self) -> None:
@@ -404,7 +417,7 @@ class UncertaintyEstimator:
                 "bin_details": grouped.to_dict(orient="records"),
             },
         }
-        report_path = self.outputs_dir / "uncertainty_calibration.json"
+        report_path = self.outputs_dir / self.report_filename
         save_json_artifact(report_path, report)
         for row in grouped.to_dict(orient="records"):
             flag = row["coverage_flag"]
@@ -440,9 +453,17 @@ def recalibrate_uncertainty_artifacts(
     model_path: str | Path | None = None,
     config_path: str | Path | None = None,
     method: str | None = None,
+    outputs_dir: str | Path | None = None,
+    report_filename: str = "uncertainty_calibration.json",
 ) -> dict[str, Any]:
     """Recompute and save uncertainty calibration artifacts for the current best model."""
-    estimator = UncertaintyEstimator(model_path=model_path, config_path=config_path, method=method)
+    estimator = UncertaintyEstimator(
+        model_path=model_path,
+        config_path=config_path,
+        method=method,
+        outputs_dir=outputs_dir,
+        report_filename=report_filename,
+    )
     return estimator.calibration_report()
 
 

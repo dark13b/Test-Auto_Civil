@@ -1,0 +1,4 @@
+[2026-03-12T14:39:23+03:00] Cleared outputs directory at E:\Random IDEA\AutoResearch\auto-civil-lab\outputs
+[2026-03-12T14:39:24+03:00] Starting baseline with dataset E:\Random IDEA\AutoResearch\auto-civil-lab\concrete_combined.xlsx
+[2026-03-12T14:39:26+03:00] Baseline complete
+[2026-03-12T14:39:26+03:00] Starting LLM-enabled search with target_trials=100 and min_runtime_minutes=30.56

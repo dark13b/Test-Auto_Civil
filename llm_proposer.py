@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -31,6 +33,13 @@ class LLMProposer:
         self.smart_model = str(llm_config.get("smart_model", "qwen3:8b"))
         self.timeout_seconds = 30
         self.consecutive_invalid_responses = 0
+        self.include_no_think_directive = bool(llm_config.get("include_no_think_directive", False))
+        self.log_interactions = bool(llm_config.get("log_interactions", True))
+        outputs_dir = Path(__file__).resolve().parent / str(config.get("paths", {}).get("outputs_dir", "outputs"))
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        self.interaction_log_path = outputs_dir / str(
+            llm_config.get("interaction_log_filename", "llm_interactions.jsonl")
+        )
 
     def is_available(self) -> bool:
         """Return True when Ollama is reachable and responding."""
@@ -46,6 +55,7 @@ class LLMProposer:
         trial_history: list[dict[str, Any]],
         available_models: dict[str, dict[str, Any]],
         current_best: dict[str, Any] | None,
+        search_progress: dict[str, Any] | None = None,
     ) -> str:
         """Build a compact JSON-only prompt for trial suggestions."""
         recent_trials = trial_history[-min(15, len(trial_history)) :] if trial_history else []
@@ -53,12 +63,38 @@ class LLMProposer:
         best_composite = self._format_metric(None if current_best is None else current_best.get("composite_score"))
         best_rmse = self._format_metric(None if current_best is None else current_best.get("rmse"))
 
-        lines = [
-            "/no_think",
-            "You are guiding Optuna trial proposals for concrete compressive strength regression.",
-            f"Current best: {best_name} | composite={best_composite} | RMSE={best_rmse}",
-            "Recent trials:",
-        ]
+        lines: list[str] = []
+        if self.include_no_think_directive:
+            lines.append("/no_think")
+        lines.extend(
+            [
+                "You are guiding Optuna trial proposals for concrete compressive strength regression.",
+                f"Current best: {best_name} | composite={best_composite} | RMSE={best_rmse}",
+                "Do not repeat any recent model-plus-parameter configuration.",
+                "If one family appears saturated, diversify to another strong family instead of repeating it.",
+            ]
+        )
+        if search_progress:
+            lines.extend(
+                [
+                    "Run progress:",
+                    (
+                        f"stage={search_progress.get('stage', 'unknown')} | "
+                        f"interaction_index={search_progress.get('interaction_index', 'n/a')} | "
+                        f"elapsed_minutes={self._format_metric(search_progress.get('elapsed_minutes'))} | "
+                        f"remaining_minutes={self._format_metric(search_progress.get('remaining_minutes'))} | "
+                        f"progress_percent={self._format_metric(search_progress.get('progress_percent'))}"
+                    ),
+                    "Guidance by stage: early=diversify across strong families, mid=compare contenders, late=refine the strongest families without duplicating configs.",
+                ]
+            )
+            family_counts = search_progress.get("family_counts", {})
+            if isinstance(family_counts, dict) and family_counts:
+                lines.append(f"Family trial counts so far: {json.dumps(family_counts, sort_keys=True)}")
+            underexplored = search_progress.get("underexplored_families", [])
+            if isinstance(underexplored, list) and underexplored:
+                lines.append(f"Underexplored families: {', '.join(str(item) for item in underexplored)}")
+        lines.append("Recent trials:")
         if recent_trials:
             for index, trial in enumerate(recent_trials, start=1):
                 trial_number = trial.get("trial_number", index)
@@ -67,9 +103,11 @@ class LLMProposer:
                 r2 = self._format_metric(trial.get("r2"))
                 composite = self._format_metric(trial.get("composite_score"))
                 verdict = str(trial.get("validation_verdict", "UNKNOWN"))
+                params = self._extract_params(trial)
                 lines.append(
                     f"Trial {trial_number}: {model_name} | RMSE={rmse} | "
-                    f"R2={r2} | composite={composite} | {verdict}"
+                    f"R2={r2} | composite={composite} | {verdict} | "
+                    f"params={json.dumps(params, sort_keys=True)}"
                 )
         else:
             lines.append("No completed trials yet.")
@@ -100,19 +138,30 @@ class LLMProposer:
         available_models: dict[str, dict[str, Any]],
         current_best: dict[str, Any] | None,
         use_smart_model: bool = False,
+        search_progress: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Request a single trial proposal from Ollama."""
         model_to_use = self.smart_model if use_smart_model else self.fast_model
-        prompt = self._build_prompt(trial_history, available_models, current_best)
+        prompt = self._build_prompt(trial_history, available_models, current_best, search_progress=search_progress)
         response_format = self._build_proposal_schema(available_models)
 
-        raw_text = self._generate(model_to_use, prompt, response_format=response_format, num_predict=256)
-        if raw_text is None:
+        generation = self._generate(model_to_use, prompt, response_format=response_format, num_predict=256)
+        if generation is None:
+            self._write_interaction_log(
+                interaction_kind="proposal",
+                model_used=model_to_use,
+                prompt=prompt,
+                response_text=None,
+                thinking_text=None,
+                parsed=None,
+                valid=False,
+            )
             self._emit_log(
                 f"INFO llm_proposal | model_used={model_to_use} | suggested=None | params={{}} | valid=False"
             )
             return None
 
+        raw_text = generation["response_text"] or generation["thinking_text"] or ""
         parsed = self._parse_response(raw_text, available_models)
         if parsed is None:
             self.consecutive_invalid_responses += 1
@@ -121,6 +170,15 @@ class LLMProposer:
 
         suggested_model = None if parsed is None else parsed["model_name"]
         suggested_params = {} if parsed is None else parsed["params"]
+        self._write_interaction_log(
+            interaction_kind="proposal",
+            model_used=model_to_use,
+            prompt=prompt,
+            response_text=generation["response_text"],
+            thinking_text=generation["thinking_text"],
+            parsed=parsed,
+            valid=parsed is not None,
+        )
         self._emit_log(
             f"INFO llm_proposal | model_used={model_to_use} | suggested={suggested_model} | "
             f"params={json.dumps(suggested_params, sort_keys=True)} | valid={parsed is not None}"
@@ -133,12 +191,16 @@ class LLMProposer:
         available_models: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]] | None:
         """Request up to three stacking candidates from the smart model."""
-        prompt_lines = [
-            "/no_think",
-            "Pick the best 3 model configs for a stacking ensemble.",
-            "Choose only from the provided top trials.",
-            "Top trials:",
-        ]
+        prompt_lines: list[str] = []
+        if self.include_no_think_directive:
+            prompt_lines.append("/no_think")
+        prompt_lines.extend(
+            [
+                "Pick the best 3 model configs for a stacking ensemble.",
+                "Choose only from the provided top trials.",
+                "Top trials:",
+            ]
+        )
         if top_trials:
             for trial in top_trials:
                 prompt_lines.append(
@@ -160,27 +222,64 @@ class LLMProposer:
             'Format: [{"model_name": "XGBRegressor", "params": {"n_estimators": 300}}]'
         )
 
-        raw_text = self._generate(
+        generation = self._generate(
             self.smart_model,
             "\n".join(prompt_lines),
             response_format=self._build_ensemble_schema(available_models),
             num_predict=512,
         )
-        if raw_text is None:
+        if generation is None:
+            self._write_interaction_log(
+                interaction_kind="ensemble",
+                model_used=self.smart_model,
+                prompt="\n".join(prompt_lines),
+                response_text=None,
+                thinking_text=None,
+                parsed=None,
+                valid=False,
+            )
             return None
 
         try:
+            raw_text = generation["response_text"] or generation["thinking_text"] or ""
             match = JSON_ARRAY_PATTERN.search(raw_text.strip())
             if match is None:
                 self.consecutive_invalid_responses += 1
+                self._write_interaction_log(
+                    interaction_kind="ensemble",
+                    model_used=self.smart_model,
+                    prompt="\n".join(prompt_lines),
+                    response_text=generation["response_text"],
+                    thinking_text=generation["thinking_text"],
+                    parsed=None,
+                    valid=False,
+                )
                 return None
             payload = json.loads(match.group(0))
         except Exception:
             self.consecutive_invalid_responses += 1
+            self._write_interaction_log(
+                interaction_kind="ensemble",
+                model_used=self.smart_model,
+                prompt="\n".join(prompt_lines),
+                response_text=generation["response_text"],
+                thinking_text=generation["thinking_text"],
+                parsed=None,
+                valid=False,
+            )
             return None
 
         if not isinstance(payload, list):
             self.consecutive_invalid_responses += 1
+            self._write_interaction_log(
+                interaction_kind="ensemble",
+                model_used=self.smart_model,
+                prompt="\n".join(prompt_lines),
+                response_text=generation["response_text"],
+                thinking_text=generation["thinking_text"],
+                parsed=None,
+                valid=False,
+            )
             return None
 
         validated: list[dict[str, Any]] = []
@@ -202,9 +301,27 @@ class LLMProposer:
 
         if not validated:
             self.consecutive_invalid_responses += 1
+            self._write_interaction_log(
+                interaction_kind="ensemble",
+                model_used=self.smart_model,
+                prompt="\n".join(prompt_lines),
+                response_text=generation["response_text"],
+                thinking_text=generation["thinking_text"],
+                parsed=None,
+                valid=False,
+            )
             return None
 
         self.consecutive_invalid_responses = 0
+        self._write_interaction_log(
+            interaction_kind="ensemble",
+            model_used=self.smart_model,
+            prompt="\n".join(prompt_lines),
+            response_text=generation["response_text"],
+            thinking_text=generation["thinking_text"],
+            parsed=validated,
+            valid=True,
+        )
         return validated
 
     def _generate(
@@ -213,8 +330,8 @@ class LLMProposer:
         prompt: str,
         response_format: Any | None = None,
         num_predict: int = 256,
-    ) -> str | None:
-        """Call the Ollama generate endpoint and return raw text."""
+    ) -> dict[str, Any] | None:
+        """Call the Ollama generate endpoint and return the raw response payload."""
         try:
             payload = {
                 "model": model_name,
@@ -233,11 +350,56 @@ class LLMProposer:
                 timeout=self.timeout_seconds,
             )
             response.raise_for_status()
-            payload = response.json()
-            raw_text = payload.get("response") or payload.get("thinking", "")
-            return raw_text if isinstance(raw_text, str) else str(raw_text)
+            response_payload = response.json()
+            response_text = response_payload.get("response", "")
+            thinking_text = response_payload.get("thinking", "")
+            return {
+                "response_text": response_text if isinstance(response_text, str) else str(response_text),
+                "thinking_text": thinking_text if isinstance(thinking_text, str) else str(thinking_text),
+                "payload": response_payload,
+            }
         except Exception:
             return None
+
+    def _extract_params(self, trial: dict[str, Any]) -> dict[str, Any]:
+        """Normalize trial parameters from either an in-memory dict or CSV-shaped record."""
+        raw_params = trial.get("params", trial.get("hyperparameters", {}))
+        if isinstance(raw_params, dict):
+            return raw_params
+        if isinstance(raw_params, str):
+            try:
+                parsed = json.loads(raw_params)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _write_interaction_log(
+        self,
+        *,
+        interaction_kind: str,
+        model_used: str,
+        prompt: str,
+        response_text: str | None,
+        thinking_text: str | None,
+        parsed: Any,
+        valid: bool,
+    ) -> None:
+        """Persist one LLM prompt/response exchange as JSONL."""
+        if not self.log_interactions:
+            return
+        record = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "interaction_kind": interaction_kind,
+            "model_used": model_used,
+            "valid": bool(valid),
+            "prompt": prompt,
+            "response_text": response_text,
+            "thinking_text": thinking_text,
+            "parsed": parsed,
+        }
+        with self.interaction_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
 
     def _validate_suggestion(
         self,

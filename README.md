@@ -31,6 +31,7 @@ auto-civil-lab/
 |-- validator.py
 |-- train.py
 |-- search.py
+|-- benchmark.py
 |-- report.py
 |-- uncertainty.py
 |-- requirements.txt
@@ -51,6 +52,7 @@ pip install -r requirements.txt
 python generate_data.py
 python train.py
 python search.py
+python benchmark.py
 python report.py
 python uncertainty.py
 python design_tool.py --target 35
@@ -142,6 +144,17 @@ python uncertainty.py
 - `outputs/uncertainty_calibration.json`: interval coverage, sharpness, and reliability summary.
 - `outputs/design_35MPa.json`: single-target inverse mix design report.
 - `outputs/batch_design_results.csv`: batch inverse-design output table.
+- `outputs/benchmark_results.csv`: one row per benchmark model with CV, holdout, timing, validator, and reference-delta metrics.
+- `outputs/benchmark_trials.csv`: per-model Optuna benchmark tuning records.
+- `outputs/benchmark_range_metrics.csv`: low-, mid-, and high-strength RMSE by benchmark model.
+- `outputs/benchmark_results.json`: canonical benchmark payload including the ranking, winner, and reference comparison.
+- `outputs/benchmark_best_model.pkl`: saved best model from the academic benchmark run.
+- `outputs/benchmark_best_result.json`: best benchmark result payload.
+- `outputs/benchmark_uncertainty.json`: conformal uncertainty comparison between the benchmark winner and the current reference.
+- `outputs/benchmark_comparison.md`: paper-ready markdown comparison against the current LightGBM reference.
+- `outputs/benchmark_holdout_rmse.png`: ranked holdout RMSE plot for the academic benchmark.
+- `outputs/benchmark_reference_deltas.png`: metric deltas versus the current LightGBM reference.
+- `outputs/benchmark_strength_range_heatmap.png`: strength-range RMSE heatmap across benchmarked models.
 
 ## Configuration
 

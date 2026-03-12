@@ -127,7 +127,7 @@ def compute_feature_importance(
     feature_names = get_input_columns(config)
     model_name = str(best_search_result["model_name"])
 
-    if model_name in {"SVR", "Ridge"}:
+    if model_name in {"SVR", "Ridge", "LinearRegression", "ElasticNet", "KNeighborsRegressor"}:
         importance = permutation_importance(
             model,
             x_test,

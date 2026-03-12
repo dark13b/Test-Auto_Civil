@@ -140,7 +140,293 @@ uncertainty:
 experiment:
   optuna_trials: 30
   cv_folds: 5
+  cv_repeats: 1
   random_seed: 42
+
+benchmark:
+  trials_per_model: 30
+  cv_folds: 5
+  cv_repeats: 1
+  reference_result_path: outputs/best_search_result.json
+  reference_uncertainty_path: outputs/uncertainty_calibration.json
+  uncertainty_method: conformal
+  models:
+    LinearRegression:
+      enabled: true
+      display_name: LinearRegression
+      tune: false
+      search_space: {}
+    Ridge:
+      enabled: true
+      display_name: Ridge
+      search_space:
+        alpha:
+          type: float
+          low: 0.0001
+          high: 100.0
+          log: true
+        fit_intercept:
+          type: categorical
+          choices: [true, false]
+        solver:
+          type: categorical
+          choices: [auto, svd, cholesky, lsqr]
+    ElasticNet:
+      enabled: true
+      display_name: ElasticNet
+      search_space:
+        alpha:
+          type: float
+          low: 0.0001
+          high: 10.0
+          log: true
+        l1_ratio:
+          type: float
+          low: 0.05
+          high: 0.95
+        fit_intercept:
+          type: categorical
+          choices: [true, false]
+    SVR:
+      enabled: true
+      display_name: SVR
+      search_space:
+        C:
+          type: float
+          low: 0.1
+          high: 1000.0
+          log: true
+        epsilon:
+          type: float
+          low: 0.001
+          high: 1.0
+          log: true
+        gamma:
+          type: float
+          low: 0.0001
+          high: 1.0
+          log: true
+    KNeighborsRegressor:
+      enabled: true
+      display_name: KNN
+      search_space:
+        n_neighbors:
+          type: int
+          low: 3
+          high: 31
+          step: 2
+        weights:
+          type: categorical
+          choices: [uniform, distance]
+        p:
+          type: categorical
+          choices: [1, 2]
+    RandomForestRegressor:
+      enabled: true
+      display_name: RandomForest
+      search_space:
+        n_estimators:
+          type: int
+          low: 200
+          high: 800
+          step: 100
+        max_depth:
+          type: categorical
+          choices: [null, 6, 10, 14, 18]
+        min_samples_split:
+          type: int
+          low: 2
+          high: 12
+        min_samples_leaf:
+          type: int
+          low: 1
+          high: 5
+        max_features:
+          type: categorical
+          choices: [sqrt, log2, 0.5, 1.0]
+    ExtraTreesRegressor:
+      enabled: true
+      display_name: ExtraTrees
+      search_space:
+        n_estimators:
+          type: int
+          low: 200
+          high: 800
+          step: 100
+        max_depth:
+          type: categorical
+          choices: [null, 6, 10, 14, 18]
+        min_samples_split:
+          type: int
+          low: 2
+          high: 12
+        min_samples_leaf:
+          type: int
+          low: 1
+          high: 5
+        max_features:
+          type: categorical
+          choices: [sqrt, log2, 0.5, 1.0]
+    GradientBoostingRegressor:
+      enabled: true
+      display_name: GradientBoosting
+      search_space:
+        n_estimators:
+          type: int
+          low: 100
+          high: 600
+          step: 50
+        learning_rate:
+          type: float
+          low: 0.01
+          high: 0.2
+          log: true
+        max_depth:
+          type: int
+          low: 2
+          high: 5
+        min_samples_split:
+          type: int
+          low: 2
+          high: 12
+        min_samples_leaf:
+          type: int
+          low: 1
+          high: 10
+        subsample:
+          type: float
+          low: 0.6
+          high: 1.0
+    HistGradientBoostingRegressor:
+      enabled: true
+      display_name: HistGradientBoosting
+      search_space:
+        learning_rate:
+          type: float
+          low: 0.01
+          high: 0.2
+          log: true
+        max_depth:
+          type: categorical
+          choices: [null, 3, 5, 7]
+        max_leaf_nodes:
+          type: int
+          low: 15
+          high: 63
+        min_samples_leaf:
+          type: int
+          low: 5
+          high: 30
+        l2_regularization:
+          type: float
+          low: 0.0001
+          high: 1.0
+          log: true
+    XGBRegressor:
+      enabled: true
+      display_name: XGBoost
+      search_space:
+        n_estimators:
+          type: int
+          low: 200
+          high: 800
+          step: 100
+        learning_rate:
+          type: float
+          low: 0.01
+          high: 0.2
+          log: true
+        max_depth:
+          type: int
+          low: 3
+          high: 10
+        min_child_weight:
+          type: float
+          low: 1.0
+          high: 10.0
+        subsample:
+          type: float
+          low: 0.6
+          high: 1.0
+        colsample_bytree:
+          type: float
+          low: 0.6
+          high: 1.0
+        reg_alpha:
+          type: float
+          low: 0.000001
+          high: 1.0
+          log: true
+        reg_lambda:
+          type: float
+          low: 0.001
+          high: 10.0
+          log: true
+    LGBMRegressor:
+      enabled: true
+      display_name: LightGBM
+      search_space:
+        n_estimators:
+          type: int
+          low: 200
+          high: 800
+          step: 100
+        learning_rate:
+          type: float
+          low: 0.01
+          high: 0.2
+          log: true
+        num_leaves:
+          type: int
+          low: 15
+          high: 127
+        min_child_samples:
+          type: int
+          low: 5
+          high: 40
+        subsample:
+          type: float
+          low: 0.6
+          high: 1.0
+        colsample_bytree:
+          type: float
+          low: 0.6
+          high: 1.0
+        reg_lambda:
+          type: float
+          low: 0.001
+          high: 10.0
+          log: true
+    CatBoostRegressor:
+      enabled: true
+      display_name: CatBoost
+      search_space:
+        iterations:
+          type: int
+          low: 200
+          high: 800
+          step: 100
+        learning_rate:
+          type: float
+          low: 0.01
+          high: 0.2
+          log: true
+        depth:
+          type: int
+          low: 4
+          high: 10
+        l2_leaf_reg:
+          type: float
+          low: 1.0
+          high: 10.0
+        bagging_temperature:
+          type: float
+          low: 0.0
+          high: 5.0
+        random_strength:
+          type: float
+          low: 0.0
+          high: 2.0
 
 baseline_model:
   model_name: RandomForestRegressor
@@ -158,9 +444,14 @@ search:
   llm_proposals:
     enabled: false
     interval_trials: 15
+    interaction_interval_minutes: 5
+    smart_model_after_progress: 0.67
     fast_model: "qwen3:4b"
     smart_model: "qwen3:8b"
     ollama_base_url: "http://localhost:11434"
+    include_no_think_directive: false
+    log_interactions: true
+    interaction_log_filename: "llm_interactions.jsonl"
   # Search keeps running until it satisfies both this runtime floor and
   # experiment.optuna_trials.
   min_runtime_minutes: 50
@@ -188,8 +479,31 @@ search:
         max_features:
           type: categorical
           choices: [sqrt, log2, null]
-    GradientBoostingRegressor:
+    ExtraTreesRegressor:
       enabled: true
+      display_name: ExtraTrees
+      search_space:
+        n_estimators:
+          type: int
+          low: 200
+          high: 800
+          step: 100
+        max_depth:
+          type: categorical
+          choices: [null, 6, 10, 14, 18]
+        min_samples_split:
+          type: int
+          low: 2
+          high: 12
+        min_samples_leaf:
+          type: int
+          low: 1
+          high: 5
+        max_features:
+          type: categorical
+          choices: [sqrt, log2, 0.5, 1.0]
+    GradientBoostingRegressor:
+      enabled: false
       display_name: GradientBoosting
       search_space:
         n_estimators:
@@ -218,6 +532,31 @@ search:
           type: float
           low: 0.6
           high: 1.0
+    HistGradientBoostingRegressor:
+      enabled: true
+      display_name: HistGradientBoosting
+      search_space:
+        learning_rate:
+          type: float
+          low: 0.01
+          high: 0.2
+          log: true
+        max_depth:
+          type: categorical
+          choices: [null, 3, 5, 7]
+        max_leaf_nodes:
+          type: int
+          low: 15
+          high: 63
+        min_samples_leaf:
+          type: int
+          low: 5
+          high: 30
+        l2_regularization:
+          type: float
+          low: 0.0001
+          high: 1.0
+          log: true
     XGBRegressor:
       enabled: true
       display_name: XGBoost
@@ -253,6 +592,11 @@ search:
           low: 0.000001
           high: 10.0
           log: true
+        reg_lambda:
+          type: float
+          low: 0.001
+          high: 10.0
+          log: true
     LGBMRegressor:
       enabled: true
       display_name: LightGBM
@@ -283,8 +627,43 @@ search:
           type: float
           low: 0.6
           high: 1.0
-    SVR:
+        reg_lambda:
+          type: float
+          low: 0.001
+          high: 10.0
+          log: true
+    CatBoostRegressor:
       enabled: true
+      display_name: CatBoost
+      search_space:
+        iterations:
+          type: int
+          low: 200
+          high: 800
+          step: 100
+        learning_rate:
+          type: float
+          low: 0.01
+          high: 0.2
+          log: true
+        depth:
+          type: int
+          low: 4
+          high: 10
+        l2_leaf_reg:
+          type: float
+          low: 1.0
+          high: 10.0
+        bagging_temperature:
+          type: float
+          low: 0.0
+          high: 5.0
+        random_strength:
+          type: float
+          low: 0.0
+          high: 2.0
+    SVR:
+      enabled: false
       display_name: SVR
       search_space:
         C:
@@ -304,7 +683,7 @@ search:
           type: categorical
           choices: [scale, auto]
     Ridge:
-      enabled: true
+      enabled: false
       display_name: Ridge
       search_space:
         alpha:

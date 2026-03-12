@@ -1,0 +1,226 @@
+{
+  "calibration_sample_count": 294,
+  "coverage": 0.9198473282442748,
+  "coverage_audit": {
+    "bin_coverage_pass_threshold": 0.8,
+    "bin_details": [
+      {
+        "bin_id": 0,
+        "confidence_label": "HIGH",
+        "coverage_flag": "OK",
+        "mean_interval_width": 7.329415696477287,
+        "observed_coverage": 0.9310344827586207,
+        "predicted_max": 14.78301246201083,
+        "predicted_min": 3.685694448146695,
+        "sample_count": 29
+      },
+      {
+        "bin_id": 1,
+        "confidence_label": "HIGH",
+        "coverage_flag": "OK",
+        "mean_interval_width": 8.313103531612322,
+        "observed_coverage": 1.0,
+        "predicted_max": 20.024907994315512,
+        "predicted_min": 15.136121296037715,
+        "sample_count": 15
+      },
+      {
+        "bin_id": 2,
+        "confidence_label": "MODERATE",
+        "coverage_flag": "OK",
+        "mean_interval_width": 8.40231886551637,
+        "observed_coverage": 0.8620689655172413,
+        "predicted_max": 25.746608289132784,
+        "predicted_min": 20.48303306041354,
+        "sample_count": 29
+      },
+      {
+        "bin_id": 3,
+        "confidence_label": "HIGH",
+        "coverage_flag": "OK",
+        "mean_interval_width": 11.153933739672894,
+        "observed_coverage": 0.9411764705882353,
+        "predicted_max": 30.929324017678905,
+        "predicted_min": 26.27200946948451,
+        "sample_count": 34
+      },
+      {
+        "bin_id": 4,
+        "confidence_label": "HIGH",
+        "coverage_flag": "OK",
+        "mean_interval_width": 14.847913962728498,
+        "observed_coverage": 1.0,
+        "predicted_max": 34.13843671353283,
+        "predicted_min": 31.195456341418566,
+        "sample_count": 19
+      },
+      {
+        "bin_id": 5,
+        "confidence_label": "LOW",
+        "coverage_flag": "LOW_COVERAGE",
+        "mean_interval_width": 8.550598284283026,
+        "observed_coverage": 0.76,
+        "predicted_max": 38.42857140875311,
+        "predicted_min": 34.830533160005906,
+        "sample_count": 25
+      },
+      {
+        "bin_id": 6,
+        "confidence_label": "LOW",
+        "coverage_flag": "OK",
+        "mean_interval_width": 8.161848527177497,
+        "observed_coverage": 0.8,
+        "predicted_max": 41.70137044628353,
+        "predicted_min": 38.56181400471192,
+        "sample_count": 20
+      },
+      {
+        "bin_id": 7,
+        "confidence_label": "HIGH",
+        "coverage_flag": "OK",
+        "mean_interval_width": 13.272632028284818,
+        "observed_coverage": 1.0,
+        "predicted_max": 47.42092289468966,
+        "predicted_min": 41.99867999258296,
+        "sample_count": 30
+      },
+      {
+        "bin_id": 8,
+        "confidence_label": "HIGH",
+        "coverage_flag": "OK",
+        "mean_interval_width": 34.24456927500988,
+        "observed_coverage": 1.0,
+        "predicted_max": 55.903978644712346,
+        "predicted_min": 47.5043333896484,
+        "sample_count": 34
+      },
+      {
+        "bin_id": 9,
+        "confidence_label": "MODERATE",
+        "coverage_flag": "OK",
+        "mean_interval_width": 16.743761319610854,
+        "observed_coverage": 0.8888888888888888,
+        "predicted_max": 78.4504022839257,
+        "predicted_min": 56.346293183733636,
+        "sample_count": 27
+      }
+    ],
+    "bins_below_threshold": [
+      {
+        "observed_coverage": 0.76,
+        "predicted_max": 38.42857140875311,
+        "predicted_min": 34.830533160005906,
+        "sample_count": 25
+      }
+    ],
+    "global_coverage_pass_threshold": 0.88,
+    "global_status": "PASS"
+  },
+  "coverage_target": 0.92,
+  "mean_interval_width": 13.869613615235572,
+  "method": "conformal",
+  "reliability_plot_data": [
+    {
+      "bin_id": 0,
+      "confidence_label": "HIGH",
+      "coverage_flag": "OK",
+      "mean_interval_width": 7.329415696477287,
+      "observed_coverage": 0.9310344827586207,
+      "predicted_max": 14.78301246201083,
+      "predicted_min": 3.685694448146695,
+      "sample_count": 29
+    },
+    {
+      "bin_id": 1,
+      "confidence_label": "HIGH",
+      "coverage_flag": "OK",
+      "mean_interval_width": 8.313103531612322,
+      "observed_coverage": 1.0,
+      "predicted_max": 20.024907994315512,
+      "predicted_min": 15.136121296037715,
+      "sample_count": 15
+    },
+    {
+      "bin_id": 2,
+      "confidence_label": "MODERATE",
+      "coverage_flag": "OK",
+      "mean_interval_width": 8.40231886551637,
+      "observed_coverage": 0.8620689655172413,
+      "predicted_max": 25.746608289132784,
+      "predicted_min": 20.48303306041354,
+      "sample_count": 29
+    },
+    {
+      "bin_id": 3,
+      "confidence_label": "HIGH",
+      "coverage_flag": "OK",
+      "mean_interval_width": 11.153933739672894,
+      "observed_coverage": 0.9411764705882353,
+      "predicted_max": 30.929324017678905,
+      "predicted_min": 26.27200946948451,
+      "sample_count": 34
+    },
+    {
+      "bin_id": 4,
+      "confidence_label": "HIGH",
+      "coverage_flag": "OK",
+      "mean_interval_width": 14.847913962728498,
+      "observed_coverage": 1.0,
+      "predicted_max": 34.13843671353283,
+      "predicted_min": 31.195456341418566,
+      "sample_count": 19
+    },
+    {
+      "bin_id": 5,
+      "confidence_label": "LOW",
+      "coverage_flag": "LOW_COVERAGE",
+      "mean_interval_width": 8.550598284283026,
+      "observed_coverage": 0.76,
+      "predicted_max": 38.42857140875311,
+      "predicted_min": 34.830533160005906,
+      "sample_count": 25
+    },
+    {
+      "bin_id": 6,
+      "confidence_label": "LOW",
+      "coverage_flag": "OK",
+      "mean_interval_width": 8.161848527177497,
+      "observed_coverage": 0.8,
+      "predicted_max": 41.70137044628353,
+      "predicted_min": 38.56181400471192,
+      "sample_count": 20
+    },
+    {
+      "bin_id": 7,
+      "confidence_label": "HIGH",
+      "coverage_flag": "OK",
+      "mean_interval_width": 13.272632028284818,
+      "observed_coverage": 1.0,
+      "predicted_max": 47.42092289468966,
+      "predicted_min": 41.99867999258296,
+      "sample_count": 30
+    },
+    {
+      "bin_id": 8,
+      "confidence_label": "HIGH",
+      "coverage_flag": "OK",
+      "mean_interval_width": 34.24456927500988,
+      "observed_coverage": 1.0,
+      "predicted_max": 55.903978644712346,
+      "predicted_min": 47.5043333896484,
+      "sample_count": 34
+    },
+    {
+      "bin_id": 9,
+      "confidence_label": "MODERATE",
+      "coverage_flag": "OK",
+      "mean_interval_width": 16.743761319610854,
+      "observed_coverage": 0.8888888888888888,
+      "predicted_max": 78.4504022839257,
+      "predicted_min": 56.346293183733636,
+      "sample_count": 27
+    }
+  ],
+  "sharpness": 13.869613615235572,
+  "test_sample_count": 262
+}

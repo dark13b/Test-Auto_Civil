@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,12 @@ def get_available_model_configs(config: dict[str, Any]) -> dict[str, dict[str, A
             except ImportError:
                 log_status("Skipping LGBMRegressor because lightgbm is not installed.")
                 continue
+        if family == "CatBoostRegressor":
+            try:
+                from catboost import CatBoostRegressor as _  # noqa: F401
+            except ImportError:
+                log_status("Skipping CatBoostRegressor because catboost is not installed.")
+                continue
         available_models[family] = family_config
     if not available_models:
         raise RuntimeError("No enabled model families are available for the search loop.")
@@ -139,6 +146,74 @@ def format_hyperparameters(params: dict[str, Any]) -> str:
         else:
             parts.append(f"{key}={value}")
     return " ".join(parts)
+
+
+def build_config_signature(model_name: str, params: dict[str, Any]) -> tuple[str, str]:
+    """Build a stable signature for one model configuration."""
+    return model_name, json.dumps(to_serializable(params), sort_keys=True, separators=(",", ":"))
+
+
+def llm_suggestion_is_duplicate(
+    suggestion: dict[str, Any],
+    trial_history: list[dict[str, Any]],
+    *,
+    lookback: int = 200,
+) -> bool:
+    """Return whether an LLM suggestion duplicates a recently evaluated configuration."""
+    suggestion_signature = build_config_signature(
+        str(suggestion["model_name"]),
+        dict(suggestion["params"]),
+    )
+    for trial_record in trial_history[-lookback:]:
+        trial_model_name = str(trial_record.get("model_name", ""))
+        raw_params = trial_record.get("hyperparameters", {})
+        if isinstance(raw_params, str):
+            try:
+                trial_params = json.loads(raw_params)
+            except Exception:
+                trial_params = {}
+        elif isinstance(raw_params, dict):
+            trial_params = raw_params
+        else:
+            trial_params = {}
+        if suggestion_signature == build_config_signature(trial_model_name, trial_params):
+            return True
+    return False
+
+
+def build_llm_progress_context(
+    *,
+    elapsed_seconds: float,
+    runtime_target_seconds: float,
+    interaction_index: int,
+    trial_records: list[dict[str, Any]],
+    available_models: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build run-progress context for timed LLM interactions."""
+    remaining_seconds = max(0.0, runtime_target_seconds - elapsed_seconds) if runtime_target_seconds > 0 else 0.0
+    progress_ratio = 0.0 if runtime_target_seconds <= 0 else min(elapsed_seconds / runtime_target_seconds, 1.0)
+    if progress_ratio < 1.0 / 3.0:
+        stage = "early"
+    elif progress_ratio < 2.0 / 3.0:
+        stage = "mid"
+    else:
+        stage = "late"
+
+    model_counts = Counter(str(record.get("model_name", "unknown")) for record in trial_records)
+    family_counts = {model_name: int(model_counts.get(model_name, 0)) for model_name in available_models}
+    minimum_count = min(family_counts.values(), default=0)
+    underexplored_families = [
+        model_name for model_name, count in family_counts.items() if count == minimum_count
+    ]
+    return {
+        "stage": stage,
+        "interaction_index": interaction_index,
+        "elapsed_minutes": elapsed_seconds / 60.0,
+        "remaining_minutes": remaining_seconds / 60.0 if runtime_target_seconds > 0 else 0.0,
+        "progress_percent": progress_ratio * 100.0,
+        "family_counts": family_counts,
+        "underexplored_families": underexplored_families,
+    }
 
 
 def initialize_research_log(log_path: Path, baseline_metrics: dict[str, Any]) -> None:
@@ -988,38 +1063,118 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
         llm_proposer = LLMProposer(config)
         if llm_proposer.is_available():
             log_status(
-                f"INFO llm_proposer_ready | fast={llm_proposer.fast_model} | smart={llm_proposer.smart_model}"
+                "INFO llm_proposer_ready | "
+                f"fast={llm_proposer.fast_model} | smart={llm_proposer.smart_model} | "
+                f"log_path={llm_proposer.interaction_log_path}"
             )
         else:
             llm_proposer = None
             log_status("INFO llm_proposer_unavailable | falling back to Optuna only")
 
+    llm_interaction_interval_minutes = float(llm_config.get("interaction_interval_minutes", 0.0))
+    llm_interaction_interval_seconds = max(0.0, llm_interaction_interval_minutes * 60.0)
+    llm_smart_model_after_progress = float(llm_config.get("smart_model_after_progress", 0.67))
+    next_llm_interaction_seconds = llm_interaction_interval_seconds if llm_interaction_interval_seconds > 0.0 else None
+    llm_interaction_count = 0
+
     trial_number = 0
     while True:
         trial_number += 1
+        elapsed_seconds = time.perf_counter() - search_start_time
         # LLM PROPOSAL
-        proposal_interval = int(llm_config.get("interval_trials", 15))
-        if (
-            llm_proposer is not None
-            and proposal_interval > 0
-            and trial_number % proposal_interval == 0
-            and trial_number > 0
-        ):
-            suggestion = llm_proposer.propose(
-                trial_history=trial_records[-proposal_interval:],
-                available_models=available_models,
-                current_best=best_result,
-            )
-            if suggestion:
-                namespaced = {
-                    f"{suggestion['model_name']}__{key}": value
-                    for key, value in suggestion["params"].items()
-                }
-                namespaced["model_family"] = suggestion["model_name"]
-                study.enqueue_trial(namespaced)
-            if llm_proposer is not None and llm_proposer.consecutive_invalid_responses >= 3:
-                llm_proposer = None
-                log_status("WARNING llm_proposer_disabled | 3_consecutive_failures")
+        if llm_proposer is not None and next_llm_interaction_seconds is not None:
+            while elapsed_seconds >= next_llm_interaction_seconds:
+                llm_interaction_count += 1
+                progress_context = build_llm_progress_context(
+                    elapsed_seconds=elapsed_seconds,
+                    runtime_target_seconds=min_runtime_seconds,
+                    interaction_index=llm_interaction_count,
+                    trial_records=trial_records,
+                    available_models=available_models,
+                )
+                use_smart_model = (
+                    min_runtime_seconds > 0.0
+                    and float(progress_context["progress_percent"]) / 100.0 >= llm_smart_model_after_progress
+                )
+                log_status(
+                    "INFO llm_interaction_due | "
+                    f"index={llm_interaction_count} | stage={progress_context['stage']} | "
+                    f"elapsed_min={progress_context['elapsed_minutes']:.1f} | "
+                    f"remaining_min={progress_context['remaining_minutes']:.1f} | "
+                    f"model_used={'smart' if use_smart_model else 'fast'}"
+                )
+                suggestion = llm_proposer.propose(
+                    trial_history=trial_records[-50:],
+                    available_models=available_models,
+                    current_best=best_result,
+                    use_smart_model=use_smart_model,
+                    search_progress=progress_context,
+                )
+                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records) and not use_smart_model:
+                    log_status(
+                        "INFO llm_proposal_duplicate | "
+                        f"model={suggestion['model_name']} | retrying_with={llm_proposer.smart_model}"
+                    )
+                    suggestion = llm_proposer.propose(
+                        trial_history=trial_records[-50:],
+                        available_models=available_models,
+                        current_best=best_result,
+                        use_smart_model=True,
+                        search_progress=progress_context,
+                    )
+                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
+                    log_status(
+                        "INFO llm_proposal_skipped_duplicate | "
+                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
+                    )
+                    suggestion = None
+                if suggestion:
+                    namespaced = {
+                        f"{suggestion['model_name']}__{key}": value
+                        for key, value in suggestion["params"].items()
+                    }
+                    namespaced["model_family"] = suggestion["model_name"]
+                    study.enqueue_trial(namespaced)
+                if llm_proposer is not None and llm_proposer.consecutive_invalid_responses >= 3:
+                    llm_proposer = None
+                    log_status("WARNING llm_proposer_disabled | 3_consecutive_failures")
+                    break
+                next_llm_interaction_seconds += llm_interaction_interval_seconds
+        elif llm_proposer is not None:
+            proposal_interval = int(llm_config.get("interval_trials", 15))
+            if proposal_interval > 0 and trial_number % proposal_interval == 0 and trial_number > 0:
+                suggestion = llm_proposer.propose(
+                    trial_history=trial_records[-proposal_interval:],
+                    available_models=available_models,
+                    current_best=best_result,
+                )
+                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
+                    log_status(
+                        "INFO llm_proposal_duplicate | "
+                        f"model={suggestion['model_name']} | retrying_with={llm_proposer.smart_model}"
+                    )
+                    suggestion = llm_proposer.propose(
+                        trial_history=trial_records[-proposal_interval:],
+                        available_models=available_models,
+                        current_best=best_result,
+                        use_smart_model=True,
+                    )
+                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
+                    log_status(
+                        "INFO llm_proposal_skipped_duplicate | "
+                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
+                    )
+                    suggestion = None
+                if suggestion:
+                    namespaced = {
+                        f"{suggestion['model_name']}__{key}": value
+                        for key, value in suggestion["params"].items()
+                    }
+                    namespaced["model_family"] = suggestion["model_name"]
+                    study.enqueue_trial(namespaced)
+                if llm_proposer is not None and llm_proposer.consecutive_invalid_responses >= 3:
+                    llm_proposer = None
+                    log_status("WARNING llm_proposer_disabled | 3_consecutive_failures")
         trial = study.ask()
         model_name, display_name, params = sample_model_configuration(trial, available_models)
         try:

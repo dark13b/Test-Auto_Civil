@@ -1,0 +1,1362 @@
+{
+  "artifact_health": {
+    "repaired_csv": false,
+    "search_artifacts_in_sync": true
+  },
+  "best_result": {
+    "beats_reference_all_primary_metrics": true,
+    "beats_reference_rmse": true,
+    "cv_composite": 0.9242567342419805,
+    "cv_composite_std": 0.008860176751603121,
+    "cv_mae": 2.1021629867845215,
+    "cv_mae_std": 0.07766487379071643,
+    "cv_r2": 0.9515751103848384,
+    "cv_r2_std": 0.009342162660894984,
+    "cv_rmse": 3.49368829984532,
+    "cv_rmse_std": 0.4064903438339063,
+    "dataset_anomaly_count": 81,
+    "delta_vs_reference_composite": 0.008272236167363833,
+    "delta_vs_reference_mae": -0.18339663467868195,
+    "delta_vs_reference_r2": 0.006919162645737553,
+    "delta_vs_reference_rmse": -0.3654007267735442,
+    "display_name": "CatBoost",
+    "durability_caution_count": 188,
+    "final_rank": 1,
+    "fold_metrics": {
+      "composite_score": [
+        0.9327920378503136,
+        0.9264037716076658,
+        0.909366433716602,
+        0.9280891872765643,
+        0.924632240758757
+      ],
+      "mae": [
+        2.0608749828927695,
+        2.0751449146140497,
+        2.20211786395311,
+        2.011502584804837,
+        2.161174587657841
+      ],
+      "r2": [
+        0.9618287223917902,
+        0.9523032337878006,
+        0.9362847768942476,
+        0.9541542522711497,
+        0.9533045665792033
+      ],
+      "rmse": [
+        3.1236483703555784,
+        3.367935661522605,
+        4.183252878791864,
+        3.3133720288713677,
+        3.4802325596851826
+      ]
+    },
+    "hard_failed_count": 0,
+    "holdout_composite": 0.9536774933058375,
+    "holdout_mae": 1.4632213594976837,
+    "holdout_r2": 0.980091768054259,
+    "holdout_rmse": 2.271807133807855,
+    "hyperparameters": {
+      "bagging_temperature": 1.2704581763191423,
+      "depth": 6,
+      "iterations": 800,
+      "l2_leaf_reg": 1.0409186543988211,
+      "learning_rate": 0.11714329483050778,
+      "random_strength": 1.399759534503985
+    },
+    "inference_time_ms_per_sample": 0.008935248090455464,
+    "model_name": "CatBoostRegressor",
+    "prediction_time_seconds": 0.0027842999988934025,
+    "range_high_rmse": 2.414684691973704,
+    "range_low_rmse": 2.042151776542849,
+    "range_metrics": {
+      "high": 2.414684691973704,
+      "low": 2.042151776542849,
+      "mid": 2.2964710495465184
+    },
+    "range_mid_rmse": 2.2964710495465184,
+    "suspicious_count": 65,
+    "training_time_seconds": 2.208309500005271,
+    "validation_pass_rate": 0.2824427480916031,
+    "validation_summary": {
+      "dataset_anomaly_count": 81,
+      "durability_caution_count": 188,
+      "failed_count": 0,
+      "hard_fail_reasons": [],
+      "hard_failed_count": 0,
+      "pass_rate": 0.2824427480916031,
+      "suspicious_count": 65,
+      "verdict": "WARN",
+      "warn_reasons": [
+        "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+        "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+        "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+        "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+        "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+        "Total binder content is high; shrinkage risk increases.",
+        "Total binder content is low; durability may be at risk.",
+        "Water/binder ratio is very low; workability may be compromised.",
+        "Water/cement ratio exceeds the typical durability limit for general concrete."
+      ],
+      "warning_count": 188
+    },
+    "validation_verdict": "WARN",
+    "warning_count": 188
+  },
+  "range_thresholds": {
+    "high_min": 49.15000000000001,
+    "low_max": 21.196
+  },
+  "reference_payload": {
+    "baseline": {
+      "holdout_composite": 0.9206410352246241,
+      "holdout_mae": 2.5082362580226065,
+      "holdout_r2": 0.9508100765016928,
+      "holdout_rmse": 3.5710274333792493,
+      "model_name": "RandomForestRegressor"
+    },
+    "reference_run": {
+      "cv_composite": 0.9194186921326492,
+      "cv_mae": 2.2486787366445595,
+      "cv_r2": 0.9465482908668663,
+      "cv_rmse": 3.6708715699960783,
+      "holdout_composite": 0.9454052571384737,
+      "holdout_mae": 1.6466179941763657,
+      "holdout_r2": 0.9731726054085215,
+      "holdout_rmse": 2.637207860581399,
+      "model_name": "LGBMRegressor",
+      "trial_number": 24,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_verdict": "WARN"
+    },
+    "reference_uncertainty": {
+      "coverage": 0.9045801526717557,
+      "global_status": "PASS",
+      "mean_interval_width": 13.924052328446123,
+      "method": "conformal"
+    }
+  },
+  "results": [
+    {
+      "beats_reference_all_primary_metrics": true,
+      "beats_reference_rmse": true,
+      "cv_composite": 0.9242567342419805,
+      "cv_composite_std": 0.008860176751603121,
+      "cv_mae": 2.1021629867845215,
+      "cv_mae_std": 0.07766487379071643,
+      "cv_r2": 0.9515751103848384,
+      "cv_r2_std": 0.009342162660894984,
+      "cv_rmse": 3.49368829984532,
+      "cv_rmse_std": 0.4064903438339063,
+      "dataset_anomaly_count": 81,
+      "delta_vs_reference_composite": 0.008272236167363833,
+      "delta_vs_reference_mae": -0.18339663467868195,
+      "delta_vs_reference_r2": 0.006919162645737553,
+      "delta_vs_reference_rmse": -0.3654007267735442,
+      "display_name": "CatBoost",
+      "durability_caution_count": 188,
+      "final_rank": 1,
+      "fold_metrics": {
+        "composite_score": [
+          0.9327920378503136,
+          0.9264037716076658,
+          0.909366433716602,
+          0.9280891872765643,
+          0.924632240758757
+        ],
+        "mae": [
+          2.0608749828927695,
+          2.0751449146140497,
+          2.20211786395311,
+          2.011502584804837,
+          2.161174587657841
+        ],
+        "r2": [
+          0.9618287223917902,
+          0.9523032337878006,
+          0.9362847768942476,
+          0.9541542522711497,
+          0.9533045665792033
+        ],
+        "rmse": [
+          3.1236483703555784,
+          3.367935661522605,
+          4.183252878791864,
+          3.3133720288713677,
+          3.4802325596851826
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9536774933058375,
+      "holdout_mae": 1.4632213594976837,
+      "holdout_r2": 0.980091768054259,
+      "holdout_rmse": 2.271807133807855,
+      "hyperparameters": {
+        "bagging_temperature": 1.2704581763191423,
+        "depth": 6,
+        "iterations": 800,
+        "l2_leaf_reg": 1.0409186543988211,
+        "learning_rate": 0.11714329483050778,
+        "random_strength": 1.399759534503985
+      },
+      "inference_time_ms_per_sample": 0.008935248090455464,
+      "model_name": "CatBoostRegressor",
+      "prediction_time_seconds": 0.0027842999988934025,
+      "range_high_rmse": 2.414684691973704,
+      "range_low_rmse": 2.042151776542849,
+      "range_metrics": {
+        "high": 2.414684691973704,
+        "low": 2.042151776542849,
+        "mid": 2.2964710495465184
+      },
+      "range_mid_rmse": 2.2964710495465184,
+      "suspicious_count": 65,
+      "training_time_seconds": 2.208309500005271,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 81,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 65,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": true,
+      "cv_composite": 0.9212388380306075,
+      "cv_composite_std": 0.0077851999162135786,
+      "cv_mae": 2.258422190495975,
+      "cv_mae_std": 0.08491720393654076,
+      "cv_r2": 0.9489186296965617,
+      "cv_r2_std": 0.008566291249448302,
+      "cv_rmse": 3.5884452512562204,
+      "cv_rmse_std": 0.35358335467403307,
+      "dataset_anomaly_count": 84,
+      "delta_vs_reference_composite": -8.755317888731184e-05,
+      "delta_vs_reference_mae": 0.08343191134877648,
+      "delta_vs_reference_r2": 0.00038504738554845375,
+      "delta_vs_reference_rmse": -0.018994017534911478,
+      "display_name": "XGBoost",
+      "durability_caution_count": 188,
+      "final_rank": 2,
+      "fold_metrics": {
+        "composite_score": [
+          0.9277847824160546,
+          0.9166434461990622,
+          0.9118867124882937,
+          0.9305795023359126,
+          0.9192997467137145
+        ],
+        "mae": [
+          2.2604362448977136,
+          2.2295562957335453,
+          2.3136306518591434,
+          2.1334368255744427,
+          2.35505093441503
+        ],
+        "r2": [
+          0.9573263358241418,
+          0.9407854039131343,
+          0.9403691060208623,
+          0.9580237449929931,
+          0.9480885577316776
+        ],
+        "rmse": [
+          3.302735228358507,
+          3.7526123577546304,
+          4.046953130319306,
+          3.170461737285716,
+          3.6694638025629436
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9453177039595864,
+      "holdout_mae": 1.7300499055251422,
+      "holdout_r2": 0.9735576527940699,
+      "holdout_rmse": 2.6182138430464876,
+      "hyperparameters": {
+        "colsample_bytree": 0.7235748170520961,
+        "learning_rate": 0.05852282306096114,
+        "max_depth": 7,
+        "min_child_weight": 7.013025990146367,
+        "n_estimators": 500,
+        "reg_alpha": 0.16692442527259527,
+        "reg_lambda": 0.40837209395337365,
+        "subsample": 0.638589145966503
+      },
+      "inference_time_ms_per_sample": 0.018001603053868054,
+      "model_name": "XGBRegressor",
+      "prediction_time_seconds": 0.005435799997940194,
+      "range_high_rmse": 2.6371334776915707,
+      "range_low_rmse": 2.1283051028575684,
+      "range_metrics": {
+        "high": 2.6371334776915707,
+        "low": 2.1283051028575684,
+        "mid": 2.7580983056890975
+      },
+      "range_mid_rmse": 2.7580983056890975,
+      "suspicious_count": 68,
+      "training_time_seconds": 0.8333997000008821,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 84,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 68,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.9212198485452004,
+      "cv_composite_std": 0.007509481709863513,
+      "cv_mae": 2.2235264686025493,
+      "cv_mae_std": 0.06724672747218315,
+      "cv_r2": 0.9486823678442791,
+      "cv_r2_std": 0.008073033909691106,
+      "cv_rmse": 3.5987293912637393,
+      "cv_rmse_std": 0.3494488186882825,
+      "dataset_anomaly_count": 81,
+      "delta_vs_reference_composite": -0.0025916392533822386,
+      "delta_vs_reference_mae": 0.1700884251115955,
+      "delta_vs_reference_r2": -0.0016577338436127853,
+      "delta_vs_reference_rmse": 0.08025867074185378,
+      "display_name": "LightGBM",
+      "durability_caution_count": 188,
+      "final_rank": 3,
+      "fold_metrics": {
+        "composite_score": [
+          0.9292144218448793,
+          0.9195719606732963,
+          0.9102764539304243,
+          0.927300911966456,
+          0.9197354943109466
+        ],
+        "mae": [
+          2.171259182988153,
+          2.232168241362582,
+          2.237819547523978,
+          2.1526139145575383,
+          2.3237714565804954
+        ],
+        "r2": [
+          0.9584155316263817,
+          0.9446831649592272,
+          0.9377355415001043,
+          0.9541652058773046,
+          0.9484123952583776
+        ],
+        "rmse": [
+          3.260313543853677,
+          3.627003550943505,
+          4.13535333085422,
+          3.3129761847403745,
+          3.658000345926919
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9428136178850914,
+      "holdout_mae": 1.8167064192879612,
+      "holdout_r2": 0.9715148715649087,
+      "holdout_rmse": 2.717466531323253,
+      "hyperparameters": {
+        "colsample_bytree": 0.6355190962925619,
+        "learning_rate": 0.055430587583232174,
+        "min_child_samples": 8,
+        "n_estimators": 500,
+        "num_leaves": 25,
+        "reg_lambda": 0.007614949256048352,
+        "subsample": 0.8108373821965429
+      },
+      "inference_time_ms_per_sample": 0.016223148854424066,
+      "model_name": "LGBMRegressor",
+      "prediction_time_seconds": 0.004985699997632764,
+      "range_high_rmse": 2.9680011633075463,
+      "range_low_rmse": 2.297768484642519,
+      "range_metrics": {
+        "high": 2.9680011633075463,
+        "low": 2.297768484642519,
+        "mid": 2.7610527760482713
+      },
+      "range_mid_rmse": 2.7610527760482713,
+      "suspicious_count": 65,
+      "training_time_seconds": 1.2007517000020016,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 81,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 65,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.9141791107919081,
+      "cv_composite_std": 0.007155440160440906,
+      "cv_mae": 2.45029801824613,
+      "cv_mae_std": 0.07426864221653273,
+      "cv_r2": 0.9413159892465799,
+      "cv_r2_std": 0.007822799196664038,
+      "cv_rmse": 3.8500806022061633,
+      "cv_rmse_std": 0.32136449985578963,
+      "dataset_anomaly_count": 83,
+      "delta_vs_reference_composite": -0.009646315599344923,
+      "delta_vs_reference_mae": 0.3050240521561851,
+      "delta_vs_reference_r2": -0.008365551929570447,
+      "delta_vs_reference_rmse": 0.3833205693001842,
+      "display_name": "HistGradientBoosting",
+      "durability_caution_count": 188,
+      "final_rank": 4,
+      "fold_metrics": {
+        "composite_score": [
+          0.9213656863802093,
+          0.9119805260918743,
+          0.9035127146738879,
+          0.920053647248873,
+          0.9139829795646958
+        ],
+        "mae": [
+          2.434149747353111,
+          2.435797401733771,
+          2.576399440589099,
+          2.3787481447871537,
+          2.4263953567675154
+        ],
+        "r2": [
+          0.9507505882872167,
+          0.9360515376075902,
+          0.931331591085448,
+          0.9466176580464095,
+          0.941828571206235
+        ],
+        "rmse": [
+          3.5480874455909612,
+          3.899728497120775,
+          4.342811776470794,
+          3.5753575786450593,
+          3.884417713203225
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9357589415391288,
+      "holdout_mae": 1.9516420463325508,
+      "holdout_r2": 0.964807053478951,
+      "holdout_rmse": 3.0205284298815833,
+      "hyperparameters": {
+        "l2_regularization": 0.205422682365368,
+        "learning_rate": 0.19324541597398429,
+        "max_depth": 7,
+        "max_leaf_nodes": 39,
+        "min_samples_leaf": 7
+      },
+      "inference_time_ms_per_sample": 0.014835725191186132,
+      "model_name": "HistGradientBoostingRegressor",
+      "prediction_time_seconds": 0.004160399999818765,
+      "range_high_rmse": 3.2448499267771407,
+      "range_low_rmse": 2.1140244256061447,
+      "range_metrics": {
+        "high": 3.2448499267771407,
+        "low": 2.1140244256061447,
+        "mid": 3.1983357405932917
+      },
+      "range_mid_rmse": 3.1983357405932917,
+      "suspicious_count": 66,
+      "training_time_seconds": 0.46162660000118194,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 83,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 66,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.9218705476981883,
+      "cv_composite_std": 0.008147214624802626,
+      "cv_mae": 2.3369413782743025,
+      "cv_mae_std": 0.1002859116880298,
+      "cv_r2": 0.9502363016928008,
+      "cv_r2_std": 0.008839819299529185,
+      "cv_rmse": 3.540298050740943,
+      "cv_rmse_std": 0.3565630239909712,
+      "dataset_anomaly_count": 81,
+      "delta_vs_reference_composite": -0.010639824983131652,
+      "delta_vs_reference_mae": 0.46039855494491455,
+      "delta_vs_reference_r2": -0.008493417224508581,
+      "delta_vs_reference_rmse": 0.38880278409002234,
+      "display_name": "GradientBoosting",
+      "durability_caution_count": 188,
+      "final_rank": 5,
+      "fold_metrics": {
+        "composite_score": [
+          0.9298579479408016,
+          0.9165140112884979,
+          0.9106263253621306,
+          0.9283555142737663,
+          0.9239989396257456
+        ],
+        "mae": [
+          2.256880090402734,
+          2.4089298397490375,
+          2.45645118010633,
+          2.217405904376531,
+          2.345039876736881
+        ],
+        "r2": [
+          0.9597291857642994,
+          0.9419642808048436,
+          0.9397861483885347,
+          0.9559075548353501,
+          0.9537943386709762
+        ],
+        "rmse": [
+          3.2084036120188584,
+          3.715070025045219,
+          4.066686729142638,
+          3.249396910669899,
+          3.4619329768280993
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.934765432155342,
+      "holdout_mae": 2.1070165491212802,
+      "holdout_r2": 0.9646791881840129,
+      "holdout_rmse": 3.0260106446714214,
+      "hyperparameters": {
+        "learning_rate": 0.08000951013931565,
+        "max_depth": 4,
+        "min_samples_leaf": 7,
+        "min_samples_split": 6,
+        "n_estimators": 500,
+        "subsample": 0.6330102652405754
+      },
+      "inference_time_ms_per_sample": 0.005355839693809074,
+      "model_name": "GradientBoostingRegressor",
+      "prediction_time_seconds": 0.0017733999993652105,
+      "range_high_rmse": 3.342240508086322,
+      "range_low_rmse": 2.4361314782704913,
+      "range_metrics": {
+        "high": 3.342240508086322,
+        "low": 2.4361314782704913,
+        "mid": 3.0947409961746555
+      },
+      "range_mid_rmse": 3.0947409961746555,
+      "suspicious_count": 65,
+      "training_time_seconds": 1.2497408999988693,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 81,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 65,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.8933165493530087,
+      "cv_composite_std": 0.01506309580117974,
+      "cv_mae": 2.8144202352826446,
+      "cv_mae_std": 0.24530243224527817,
+      "cv_r2": 0.9146704024540888,
+      "cv_r2_std": 0.020616153075993498,
+      "cv_rmse": 4.615648643262405,
+      "cv_rmse_std": 0.5397602410999502,
+      "dataset_anomaly_count": 80,
+      "delta_vs_reference_composite": -0.013366931693691186,
+      "delta_vs_reference_mae": 0.318186816837007,
+      "delta_vs_reference_r2": -0.012465377334540007,
+      "delta_vs_reference_rmse": 0.5544141148132269,
+      "display_name": "SVR",
+      "durability_caution_count": 188,
+      "final_rank": 6,
+      "fold_metrics": {
+        "composite_score": [
+          0.9135147292891683,
+          0.880353577345881,
+          0.8982114007250241,
+          0.8980694114840073,
+          0.8764336279209634
+        ],
+        "mae": [
+          2.51071151035839,
+          2.9779698341803993,
+          2.7020316920696663,
+          2.744245189907636,
+          3.1371429498971324
+        ],
+        "r2": [
+          0.9413177704648865,
+          0.8938168079702979,
+          0.9251005171998672,
+          0.9191034548673154,
+          0.8940134617680775
+        ],
+        "rmse": [
+          3.872996407489958,
+          5.025128909480019,
+          4.5355705207624295,
+          4.401347499337896,
+          5.243199879241723
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9320383254447825,
+      "holdout_mae": 1.9648048110133727,
+      "holdout_r2": 0.9607072280739815,
+      "holdout_rmse": 3.191621975394626,
+      "hyperparameters": {
+        "C": 155.9864319752156,
+        "epsilon": 0.08969676969593814,
+        "gamma": 0.10538222234931285
+      },
+      "inference_time_ms_per_sample": 0.26104083969397734,
+      "model_name": "SVR",
+      "prediction_time_seconds": 0.06577660000039032,
+      "range_high_rmse": 2.5184310286515377,
+      "range_low_rmse": 3.167801744043914,
+      "range_metrics": {
+        "high": 2.5184310286515377,
+        "low": 3.167801744043914,
+        "mid": 3.3927490012476973
+      },
+      "range_mid_rmse": 3.3927490012476973,
+      "suspicious_count": 64,
+      "training_time_seconds": 1.1710359999997308,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 80,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 64,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.9098333443156401,
+      "cv_composite_std": 0.008994488481206462,
+      "cv_mae": 2.5924600059522533,
+      "cv_mae_std": 0.12356915437648083,
+      "cv_r2": 0.9365901370986304,
+      "cv_r2_std": 0.009776076390221477,
+      "cv_rmse": 4.000541690588506,
+      "cv_rmse_std": 0.3879904211154267,
+      "dataset_anomaly_count": 80,
+      "delta_vs_reference_composite": -0.018177447149247294,
+      "delta_vs_reference_mae": 0.5346204124020524,
+      "delta_vs_reference_r2": -0.016641723132373554,
+      "delta_vs_reference_rmse": 0.7197471873335388,
+      "display_name": "ExtraTrees",
+      "durability_caution_count": 188,
+      "final_rank": 7,
+      "fold_metrics": {
+        "composite_score": [
+          0.9205819196343206,
+          0.9101717512132232,
+          0.8972061126384541,
+          0.915467815739866,
+          0.9057391223523368
+        ],
+        "mae": [
+          2.5029363882558475,
+          2.544809587478155,
+          2.7592735606977503,
+          2.471512280111266,
+          2.683768213218247
+        ],
+        "r2": [
+          0.9502611758129308,
+          0.9344126277073346,
+          0.9241615818526087,
+          0.94128504343141,
+          0.9328302566888682
+        ],
+        "rmse": [
+          3.565673295519234,
+          3.9493846565032573,
+          4.563910797073257,
+          3.749687227764539,
+          4.174052476082241
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9272278099892264,
+      "holdout_mae": 2.181238406578418,
+      "holdout_r2": 0.9565308822761479,
+      "holdout_rmse": 3.356955047914938,
+      "hyperparameters": {
+        "max_depth": null,
+        "max_features": "sqrt",
+        "min_samples_leaf": 1,
+        "min_samples_split": 4,
+        "n_estimators": 700
+      },
+      "inference_time_ms_per_sample": 0.39102078244190724,
+      "model_name": "ExtraTreesRegressor",
+      "prediction_time_seconds": 0.10917109999718377,
+      "range_high_rmse": 4.583395517016139,
+      "range_low_rmse": 2.583100130302402,
+      "range_metrics": {
+        "high": 4.583395517016139,
+        "low": 2.583100130302402,
+        "mid": 3.0976550403009004
+      },
+      "range_mid_rmse": 3.0976550403009004,
+      "suspicious_count": 64,
+      "training_time_seconds": 0.40463769999769283,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 80,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 64,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.8967431462068145,
+      "cv_composite_std": 0.010550028331346708,
+      "cv_mae": 2.6775478874534238,
+      "cv_mae_std": 0.1670577104711381,
+      "cv_r2": 0.9186532099842445,
+      "cv_r2_std": 0.016351866331548653,
+      "cv_rmse": 4.512372042325494,
+      "cv_rmse_std": 0.34232291123438213,
+      "dataset_anomaly_count": 81,
+      "delta_vs_reference_composite": -0.02445876837339822,
+      "delta_vs_reference_mae": 0.3745386025867501,
+      "delta_vs_reference_r2": -0.02540135744111416,
+      "delta_vs_reference_rmse": 1.0424711658509858,
+      "display_name": "KNN",
+      "durability_caution_count": 188,
+      "final_rank": 8,
+      "fold_metrics": {
+        "composite_score": [
+          0.9077751328938656,
+          0.8802018257294654,
+          0.9035818497289263,
+          0.8950199482408575,
+          0.8971369744409576
+        ],
+        "mae": [
+          2.5529898205461237,
+          2.9510681152961924,
+          2.557493452346516,
+          2.6061985425328253,
+          2.719989506545461
+        ],
+        "r2": [
+          0.9340065262756172,
+          0.8933376028573627,
+          0.9312811334394773,
+          0.9134530563907407,
+          0.9211877309580249
+        ],
+        "rmse": [
+          4.1071851945044555,
+          5.036455356867132,
+          4.344407035655308,
+          4.552464199748842,
+          4.521348424851734
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9209464887650755,
+      "holdout_mae": 2.0211565967631158,
+      "holdout_r2": 0.9477712479674073,
+      "holdout_rmse": 3.679679026432385,
+      "hyperparameters": {
+        "n_neighbors": 5,
+        "p": 2,
+        "weights": "distance"
+      },
+      "inference_time_ms_per_sample": 0.1706170038177271,
+      "model_name": "KNeighborsRegressor",
+      "prediction_time_seconds": 0.04170529999828432,
+      "range_high_rmse": 4.942110880093302,
+      "range_low_rmse": 2.7708589767390195,
+      "range_metrics": {
+        "high": 4.942110880093302,
+        "low": 2.7708589767390195,
+        "mid": 3.4516699714624464
+      },
+      "range_mid_rmse": 3.4516699714624464,
+      "suspicious_count": 65,
+      "training_time_seconds": 0.006196900001668837,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 81,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 65,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.899806529096872,
+      "cv_composite_std": 0.008680859308569648,
+      "cv_mae": 3.0275280030874683,
+      "cv_mae_std": 0.1381361383893535,
+      "cv_r2": 0.9262360351967382,
+      "cv_r2_std": 0.009775945739520049,
+      "cv_rmse": 4.316545577226792,
+      "cv_rmse_std": 0.3647411014670687,
+      "dataset_anomaly_count": 82,
+      "delta_vs_reference_composite": -0.03002102220847991,
+      "delta_vs_reference_mae": 1.0316442993306119,
+      "delta_vs_reference_r2": -0.027737307526367383,
+      "delta_vs_reference_rmse": 1.1238585959005016,
+      "display_name": "RandomForest",
+      "durability_caution_count": 188,
+      "final_rank": 9,
+      "fold_metrics": {
+        "composite_score": [
+          0.9103640682378183,
+          0.9001067167194293,
+          0.8867610680121513,
+          0.9038415169942314,
+          0.8979592755207297
+        ],
+        "mae": [
+          2.942564795500019,
+          2.9342183198571257,
+          3.255201396605552,
+          2.942224334594249,
+          3.063431168880396
+        ],
+        "r2": [
+          0.9403872990134676,
+          0.9233128504010987,
+          0.9134092435873338,
+          0.9289935359552958,
+          0.9250772470264957
+        ],
+        "rmse": [
+          3.9035809605289224,
+          4.270518589080692,
+          4.876725167774243,
+          4.123534330813293,
+          4.40836883793681
+        ]
+      },
+      "hard_failed_count": 0,
+      "holdout_composite": 0.9153842349299938,
+      "holdout_mae": 2.6782622935069775,
+      "holdout_r2": 0.9454352978821541,
+      "holdout_rmse": 3.7610664564819007,
+      "hyperparameters": {
+        "max_depth": null,
+        "max_features": "sqrt",
+        "min_samples_leaf": 1,
+        "min_samples_split": 5,
+        "n_estimators": 800
+      },
+      "inference_time_ms_per_sample": 0.37612627862569636,
+      "model_name": "RandomForestRegressor",
+      "prediction_time_seconds": 0.11334410000563366,
+      "range_high_rmse": 5.074925859636663,
+      "range_low_rmse": 2.8289238103670726,
+      "range_metrics": {
+        "high": 5.074925859636663,
+        "low": 2.8289238103670726,
+        "mid": 3.517698996566151
+      },
+      "range_mid_rmse": 3.517698996566151,
+      "suspicious_count": 66,
+      "training_time_seconds": 0.6985046000045259,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 82,
+        "durability_caution_count": 188,
+        "failed_count": 0,
+        "hard_fail_reasons": [],
+        "hard_failed_count": 0,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 66,
+        "verdict": "WARN",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "WARN",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.8282834243232159,
+      "cv_composite_std": 0.009072222581508003,
+      "cv_mae": 4.925952871704854,
+      "cv_mae_std": 0.2263413888297564,
+      "cv_r2": 0.829504785657553,
+      "cv_r2_std": 0.01324368441514363,
+      "cv_rmse": 6.566769466858183,
+      "cv_rmse_std": 0.33467434754774816,
+      "dataset_anomaly_count": 84,
+      "delta_vs_reference_composite": -0.0968004848513202,
+      "delta_vs_reference_mae": 2.8218692900894164,
+      "delta_vs_reference_r2": -0.1116349703293773,
+      "delta_vs_reference_rmse": 3.3540910234807324,
+      "display_name": "LinearRegression",
+      "durability_caution_count": 188,
+      "final_rank": 10,
+      "fold_metrics": {
+        "composite_score": [
+          0.8387470865891735,
+          0.8259390341761047,
+          0.820542158964064,
+          0.8368761594722652,
+          0.8193126824144725
+        ],
+        "mae": [
+          4.854474668818974,
+          4.722112267992407,
+          5.256117591718479,
+          4.744016497248087,
+          5.053043332746325
+        ],
+        "r2": [
+          0.8476629036888739,
+          0.8182290798793173,
+          0.8261122301919384,
+          0.8384163795278863,
+          0.8171033349997501
+        ],
+        "rmse": [
+          6.240172968865019,
+          6.574784484354351,
+          6.910779451526863,
+          6.220414698156605,
+          6.887695731388078
+        ]
+      },
+      "hard_failed_count": 1,
+      "holdout_composite": 0.8486047722871535,
+      "holdout_mae": 4.468487284265782,
+      "holdout_r2": 0.8615376350791442,
+      "holdout_rmse": 5.9912988840621315,
+      "hyperparameters": {},
+      "inference_time_ms_per_sample": 0.0019712213751524937,
+      "model_name": "LinearRegression",
+      "prediction_time_seconds": 0.0006468999999924563,
+      "range_high_rmse": 9.630847501129141,
+      "range_low_rmse": 4.427574279003105,
+      "range_metrics": {
+        "high": 9.630847501129141,
+        "low": 4.427574279003105,
+        "mid": 4.750135739854635
+      },
+      "range_mid_rmse": 4.750135739854635,
+      "suspicious_count": 69,
+      "training_time_seconds": 0.002419699994788971,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 84,
+        "durability_caution_count": 188,
+        "failed_count": 1,
+        "hard_fail_reasons": [
+          "Negative predicted strength is physically impossible.",
+          "Prediction falls below configured minimum strength bound."
+        ],
+        "hard_failed_count": 1,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 69,
+        "verdict": "FAIL",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "FAIL",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.8283561436137747,
+      "cv_composite_std": 0.009136544281390125,
+      "cv_mae": 4.921850515336333,
+      "cv_mae_std": 0.23239594087304374,
+      "cv_r2": 0.8295923736848053,
+      "cv_r2_std": 0.013265409682676432,
+      "cv_rmse": 6.565121893012187,
+      "cv_rmse_std": 0.3368184267682014,
+      "dataset_anomaly_count": 84,
+      "delta_vs_reference_composite": -0.0972884053492189,
+      "delta_vs_reference_mae": 2.8409371775823,
+      "delta_vs_reference_r2": -0.11226319769467241,
+      "delta_vs_reference_rmse": 3.3676674137551403,
+      "display_name": "Ridge",
+      "durability_caution_count": 188,
+      "final_rank": 11,
+      "fold_metrics": {
+        "composite_score": [
+          0.8389816151521001,
+          0.8261068207521072,
+          0.8202578731979187,
+          0.8368868375489418,
+          0.8195475714178055
+        ],
+        "mae": [
+          4.846690821505598,
+          4.711952248329261,
+          5.266862204286375,
+          4.741051005436946,
+          5.042696297123485
+        ],
+        "r2": [
+          0.8479862057178481,
+          0.8184278101219247,
+          0.8257270538569095,
+          0.8384057570798664,
+          0.8174150416474777
+        ],
+        "rmse": [
+          6.233547753561365,
+          6.571189393788978,
+          6.918429202477412,
+          6.220619158688193,
+          6.881823956544983
+        ]
+      },
+      "hard_failed_count": 1,
+      "holdout_composite": 0.8481168517892548,
+      "holdout_mae": 4.4875551717586655,
+      "holdout_r2": 0.860909407713849,
+      "holdout_rmse": 6.0048752743365394,
+      "hyperparameters": {
+        "alpha": 0.6317057120118519,
+        "fit_intercept": true,
+        "solver": "cholesky"
+      },
+      "inference_time_ms_per_sample": 0.0024647709928214807,
+      "model_name": "Ridge",
+      "prediction_time_seconds": 0.0008400999940931797,
+      "range_high_rmse": 9.678354157790277,
+      "range_low_rmse": 4.443828343092562,
+      "range_metrics": {
+        "high": 9.678354157790277,
+        "low": 4.443828343092562,
+        "mid": 4.7416320546526105
+      },
+      "range_mid_rmse": 4.7416320546526105,
+      "suspicious_count": 69,
+      "training_time_seconds": 0.0024657999965711497,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 84,
+        "durability_caution_count": 188,
+        "failed_count": 1,
+        "hard_fail_reasons": [
+          "Negative predicted strength is physically impossible.",
+          "Prediction falls below configured minimum strength bound."
+        ],
+        "hard_failed_count": 1,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 69,
+        "verdict": "FAIL",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "FAIL",
+      "warning_count": 188
+    },
+    {
+      "beats_reference_all_primary_metrics": false,
+      "beats_reference_rmse": false,
+      "cv_composite": 0.8283751302767339,
+      "cv_composite_std": 0.009129028686863973,
+      "cv_mae": 4.921009097832029,
+      "cv_mae_std": 0.23054856927935471,
+      "cv_r2": 0.8296161399833364,
+      "cv_r2_std": 0.013286400940739395,
+      "cv_rmse": 6.564618908468063,
+      "cv_rmse_std": 0.3363040603733384,
+      "dataset_anomaly_count": 84,
+      "delta_vs_reference_composite": -0.09737333670421144,
+      "delta_vs_reference_mae": 2.843408446250469,
+      "delta_vs_reference_r2": -0.11238054530130492,
+      "delta_vs_reference_rmse": 3.3701999688571016,
+      "display_name": "ElasticNet",
+      "durability_caution_count": 188,
+      "final_rank": 12,
+      "fold_metrics": {
+        "composite_score": [
+          0.8390216011738271,
+          0.8260961857192761,
+          0.8204069976616225,
+          0.8368715484424061,
+          0.8194793183865376
+        ],
+        "mae": [
+          4.844325472859501,
+          4.713306043012101,
+          5.261485516615742,
+          4.741154458050137,
+          5.044773998622666
+        ],
+        "r2": [
+          0.8480313629135353,
+          0.8184224329309566,
+          0.8259316522124063,
+          0.8383800414325275,
+          0.8173152104272567
+        ],
+        "rmse": [
+          6.232621816395667,
+          6.5712866946991015,
+          6.914366853829057,
+          6.221114104801207,
+          6.883705072615279
+        ]
+      },
+      "hard_failed_count": 1,
+      "holdout_composite": 0.8480319204342622,
+      "holdout_mae": 4.490026440426835,
+      "holdout_r2": 0.8607920601072165,
+      "holdout_rmse": 6.007407829438501,
+      "hyperparameters": {
+        "alpha": 0.0018790525994969909,
+        "fit_intercept": true,
+        "l1_ratio": 0.7850241593015734
+      },
+      "inference_time_ms_per_sample": 0.009081793892855369,
+      "model_name": "ElasticNet",
+      "prediction_time_seconds": 0.003068500001973007,
+      "range_high_rmse": 9.687068995131325,
+      "range_low_rmse": 4.444840051865626,
+      "range_metrics": {
+        "high": 9.687068995131325,
+        "low": 4.444840051865626,
+        "mid": 4.7407709419017685
+      },
+      "range_mid_rmse": 4.7407709419017685,
+      "suspicious_count": 69,
+      "training_time_seconds": 0.14197730000159936,
+      "validation_pass_rate": 0.2824427480916031,
+      "validation_summary": {
+        "dataset_anomaly_count": 84,
+        "durability_caution_count": 188,
+        "failed_count": 1,
+        "hard_fail_reasons": [
+          "Negative predicted strength is physically impossible.",
+          "Prediction falls below configured minimum strength bound."
+        ],
+        "hard_failed_count": 1,
+        "pass_rate": 0.2824427480916031,
+        "suspicious_count": 69,
+        "verdict": "FAIL",
+        "warn_reasons": [
+          "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
+          "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
+          "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
+          "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
+          "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
+          "Total binder content is high; shrinkage risk increases.",
+          "Total binder content is low; durability may be at risk.",
+          "Water/binder ratio is very low; workability may be compromised.",
+          "Water/cement ratio exceeds the typical durability limit for general concrete."
+        ],
+        "warning_count": 188
+      },
+      "validation_verdict": "FAIL",
+      "warning_count": 188
+    }
+  ],
+  "uncertainty_summary": {
+    "delta_coverage_vs_reference": -0.003816793893129833,
+    "delta_width_vs_reference": -0.5813007440881854,
+    "reference_uncertainty": {
+      "coverage": 0.9045801526717557,
+      "global_status": "PASS",
+      "mean_interval_width": 13.924052328446123,
+      "method": "conformal"
+    },
+    "winner_display_name": "CatBoost",
+    "winner_model_name": "CatBoostRegressor",
+    "winner_uncertainty": {
+      "coverage": 0.9007633587786259,
+      "global_status": "PASS",
+      "mean_interval_width": 13.342751584357938,
+      "method": "conformal"
+    }
+  }
+}

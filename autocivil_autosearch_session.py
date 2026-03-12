@@ -44,6 +44,19 @@ def _clear_outputs(outputs_dir: Path) -> None:
             child.unlink()
 
 
+def _archive_existing_outputs(outputs_dir: Path) -> Path | None:
+    """Archive the current outputs folder before starting a fresh session."""
+    if not outputs_dir.exists():
+        return None
+    if not any(outputs_dir.iterdir()):
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = REPO_ROOT / f"outputs_archive_{timestamp}"
+    shutil.copytree(outputs_dir, archive_dir)
+    return archive_dir
+
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -106,6 +119,10 @@ def _apply_runtime_overrides(
     config["search"]["llm_proposals"]["enabled"] = True
     config["search"]["llm_proposals"]["fast_model"] = "qwen3:4b"
     config["search"]["llm_proposals"]["smart_model"] = "qwen3:8b"
+    config["search"]["llm_proposals"]["interaction_interval_minutes"] = 5
+    config["search"]["llm_proposals"]["smart_model_after_progress"] = 0.67
+    config["search"]["llm_proposals"]["include_no_think_directive"] = False
+    config["search"]["llm_proposals"]["log_interactions"] = True
     config["search"]["min_runtime_minutes"] = max(0.0, float(min_runtime_minutes))
     config["experiment"]["optuna_trials"] = int(target_trials)
     return config
@@ -183,6 +200,31 @@ def _write_overrides(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, handle, indent=2)
 
 
+def _finalize_partial_search(overrides_path: Path, outputs_dir: Path) -> dict[str, Any] | None:
+    """Finalize artifacts from the latest recorded search state when the child stops early."""
+    if FINAL_SUMMARY_PATH.exists() and _final_metrics_exists(outputs_dir):
+        return json.loads(FINAL_SUMMARY_PATH.read_text(encoding="utf-8"))
+
+    if not overrides_path.exists():
+        return None
+
+    baseline_metrics_path = outputs_dir / "baseline_metrics.json"
+    if not baseline_metrics_path.exists():
+        return None
+
+    import search
+
+    baseline_metrics = json.loads(baseline_metrics_path.read_text(encoding="utf-8"))
+    finalized = search.finalize_search_artifacts(outputs_dir, baseline_metrics)
+    FINAL_SUMMARY_PATH.write_text(json.dumps(finalized, indent=2, default=str), encoding="utf-8")
+    return finalized
+
+
+def _final_metrics_exists(outputs_dir: Path) -> bool:
+    """Return whether the canonical final artifact already exists."""
+    return (outputs_dir / "final_metrics.json").exists()
+
+
 def _run_search_child(overrides_path: Path) -> int:
     import search
 
@@ -202,6 +244,9 @@ def _run_parent(input_path: Path, end_time: datetime, target_trials: int, report
     if not input_path.exists():
         raise FileNotFoundError(f"Input dataset not found: {input_path}")
 
+    archived_outputs = _archive_existing_outputs(OUTPUTS_DIR)
+    if archived_outputs is not None:
+        _log(f"Archived previous outputs to {archived_outputs}")
     _clear_outputs(OUTPUTS_DIR)
     _log(f"Cleared outputs directory at {OUTPUTS_DIR}")
 
@@ -281,6 +326,11 @@ def _run_parent(input_path: Path, end_time: datetime, target_trials: int, report
 
         time.sleep(15)
 
+    try:
+        _finalize_partial_search(OVERRIDES_PATH, OUTPUTS_DIR)
+    except Exception as exc:
+        _log(f"WARNING partial_finalization_failed | {exc}")
+
     _append_report("search_complete", OUTPUTS_DIR)
     _log("Search session finished")
     return 0
@@ -290,7 +340,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run an AutoCivil-Lab session until a deadline.")
     parser.add_argument("--input-path", type=Path)
     parser.add_argument("--end-time", type=str)
-    parser.add_argument("--target-trials", type=int, default=100)
+    parser.add_argument("--duration-minutes", type=float)
+    parser.add_argument("--target-trials", type=int, default=50)
     parser.add_argument("--report-minutes", type=int, default=5)
     parser.add_argument("--child-search", type=Path)
     args = parser.parse_args()
@@ -298,10 +349,17 @@ def main() -> int:
     if args.child_search is not None:
         return _run_search_child(args.child_search)
 
-    if args.input_path is None or args.end_time is None:
-        raise ValueError("--input-path and --end-time are required for parent mode.")
+    if args.input_path is None:
+        raise ValueError("--input-path is required for parent mode.")
+    if args.end_time is None and args.duration_minutes is None:
+        raise ValueError("Provide either --end-time or --duration-minutes for parent mode.")
+    if args.end_time is not None and args.duration_minutes is not None:
+        raise ValueError("Use only one of --end-time or --duration-minutes.")
 
-    end_time = datetime.fromisoformat(args.end_time)
+    if args.end_time is not None:
+        end_time = datetime.fromisoformat(args.end_time)
+    else:
+        end_time = datetime.now().astimezone() + timedelta(minutes=float(args.duration_minutes))
     _acquire_session_lock()
     try:
         return _run_parent(args.input_path.resolve(), end_time, args.target_trials, args.report_minutes)

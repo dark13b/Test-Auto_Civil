@@ -10,3 +10,5 @@ data/concrete_data.csv
 .venv/
 dist/
 build/
+.csv
+Outputs/

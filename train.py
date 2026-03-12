@@ -18,13 +18,22 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
-from sklearn.linear_model import Ridge
+from sklearn.base import clone
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+    StackingRegressor,
+)
+from sklearn.linear_model import ElasticNet, LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold, cross_validate, train_test_split
+from sklearn.model_selection import KFold, RepeatedKFold, cross_validate, train_test_split
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
 
 from feature_engineering import ENGINEERED_FEATURE_COLUMNS, build_engineering_features
 from validator import EngineeringValidator
@@ -39,11 +48,17 @@ try:
 except ImportError:
     XGBRegressor = None
 
+try:
+    from catboost import CatBoostRegressor
+except ImportError:
+    CatBoostRegressor = None
+
 
 ARTIFACT_VERSION_MODULES = {
     "scikit-learn": "sklearn",
     "lightgbm": "lightgbm",
     "xgboost": "xgboost",
+    "catboost": "catboost",
     "optuna": "optuna",
     "numpy": "numpy",
     "pandas": "pandas",
@@ -219,12 +234,27 @@ def compute_regression_metrics(
     }
 
 
-def build_cv_splitter(config: dict[str, Any]) -> KFold:
+def build_cv_splitter(
+    config: dict[str, Any],
+    *,
+    n_splits: int | None = None,
+    repeats: int | None = None,
+    random_state: int | None = None,
+) -> KFold | RepeatedKFold:
     """Create the cross-validation splitter defined in config."""
+    split_count = int(n_splits or config["experiment"]["cv_folds"])
+    repeat_count = int(repeats or config.get("experiment", {}).get("cv_repeats", 1))
+    seed = int(random_state or config["experiment"]["random_seed"])
+    if repeat_count > 1:
+        return RepeatedKFold(
+            n_splits=split_count,
+            n_repeats=repeat_count,
+            random_state=seed,
+        )
     return KFold(
-        n_splits=int(config["experiment"]["cv_folds"]),
+        n_splits=split_count,
         shuffle=True,
-        random_state=int(config["experiment"]["random_seed"]),
+        random_state=seed,
     )
 
 
@@ -233,26 +263,74 @@ def cross_validate_model(
     x_train: pd.DataFrame,
     y_train: pd.Series,
     config: dict[str, Any],
-) -> dict[str, float]:
+    *,
+    cv: Any | None = None,
+    return_fold_metrics: bool = False,
+) -> dict[str, Any]:
     """Run configured cross-validation and return averaged metrics."""
     scoring = {
         "rmse": "neg_root_mean_squared_error",
         "mae": "neg_mean_absolute_error",
         "r2": "r2",
     }
-    scores = cross_validate(
-        model,
-        x_train,
-        y_train,
-        cv=build_cv_splitter(config),
-        scoring=scoring,
-        n_jobs=None,
-        return_train_score=False,
-        error_score="raise",
-    )
-    rmse = float(-np.mean(scores["test_rmse"]))
-    mae = float(-np.mean(scores["test_mae"]))
-    r2 = float(np.mean(scores["test_r2"]))
+    splitter = cv or build_cv_splitter(config)
+    def _slice_frame(frame: Any, indices: np.ndarray) -> Any:
+        return frame.iloc[indices] if hasattr(frame, "iloc") else frame[indices]
+
+    def _manual_cross_validate_scores() -> dict[str, np.ndarray]:
+        rmse_scores: list[float] = []
+        mae_scores: list[float] = []
+        r2_scores: list[float] = []
+        for train_indices, test_indices in splitter.split(x_train, y_train):
+            x_fold_train = _slice_frame(x_train, train_indices)
+            x_fold_test = _slice_frame(x_train, test_indices)
+            y_fold_train = _slice_frame(y_train, train_indices)
+            y_fold_test = _slice_frame(y_train, test_indices)
+            try:
+                fold_model = clone(model)
+            except Exception:
+                if hasattr(model, "get_params"):
+                    fold_model = type(model)(**model.get_params())
+                else:
+                    raise
+            fold_model.fit(x_fold_train, y_fold_train)
+            fold_predictions = np.asarray(fold_model.predict(x_fold_test), dtype=float)
+            fold_metrics = compute_regression_metrics(
+                y_fold_test,
+                fold_predictions,
+                config,
+                float(np.asarray(y_fold_train, dtype=float).mean()),
+            )
+            rmse_scores.append(-float(fold_metrics["rmse"]))
+            mae_scores.append(-float(fold_metrics["mae"]))
+            r2_scores.append(float(fold_metrics["r2"]))
+        return {
+            "test_rmse": np.asarray(rmse_scores, dtype=float),
+            "test_mae": np.asarray(mae_scores, dtype=float),
+            "test_r2": np.asarray(r2_scores, dtype=float),
+        }
+
+    try:
+        scores = cross_validate(
+            model,
+            x_train,
+            y_train,
+            cv=splitter,
+            scoring=scoring,
+            n_jobs=None,
+            return_train_score=False,
+            error_score="raise",
+        )
+    except Exception as exc:
+        if "__sklearn_tags__" not in str(exc):
+            raise
+        scores = _manual_cross_validate_scores()
+    rmse_scores = -scores["test_rmse"]
+    mae_scores = -scores["test_mae"]
+    r2_scores = scores["test_r2"]
+    rmse = float(np.mean(rmse_scores))
+    mae = float(np.mean(mae_scores))
+    r2 = float(np.mean(r2_scores))
     composite = float(
         calculate_composite_score(
             rmse,
@@ -262,12 +340,40 @@ def cross_validate_model(
             config["metrics"]["composite_weights"],
         )
     )
-    return {
+    result: dict[str, Any] = {
         "rmse": rmse,
         "mae": mae,
         "r2": r2,
         "composite_score": composite,
     }
+    if return_fold_metrics:
+        safe_mean = float(y_train.mean())
+        composite_scores = [
+            calculate_composite_score(
+                float(fold_rmse),
+                float(fold_mae),
+                float(fold_r2),
+                safe_mean,
+                config["metrics"]["composite_weights"],
+            )
+            for fold_rmse, fold_mae, fold_r2 in zip(rmse_scores, mae_scores, r2_scores, strict=False)
+        ]
+        std_kwargs = {"ddof": 1} if len(rmse_scores) > 1 else {}
+        result.update(
+            {
+                "rmse_std": float(np.std(rmse_scores, **std_kwargs)),
+                "mae_std": float(np.std(mae_scores, **std_kwargs)),
+                "r2_std": float(np.std(r2_scores, **std_kwargs)),
+                "composite_std": float(np.std(composite_scores, **std_kwargs)),
+                "fold_metrics": {
+                    "rmse": [float(value) for value in rmse_scores],
+                    "mae": [float(value) for value in mae_scores],
+                    "r2": [float(value) for value in r2_scores],
+                    "composite_score": [float(value) for value in composite_scores],
+                },
+            }
+        )
+    return result
 
 
 def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str, Any]) -> Any:
@@ -275,15 +381,38 @@ def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str,
     seed = int(config["experiment"]["random_seed"])
     clean_params = dict(params)
 
+    if model_name == "LinearRegression":
+        return Pipeline(
+            steps=[
+                ("scaler", StandardScaler()),
+                ("model", LinearRegression(**clean_params)),
+            ]
+        )
+
     if model_name == "RandomForestRegressor":
-        default_params = {"random_state": seed}
+        default_params = {"random_state": seed, "n_jobs": -1}
         default_params.update(clean_params)
         return RandomForestRegressor(**default_params)
+
+    if model_name == "ExtraTreesRegressor":
+        default_params = {"random_state": seed, "n_jobs": -1}
+        default_params.update(clean_params)
+        return ExtraTreesRegressor(**default_params)
+
+    if model_name == "DecisionTreeRegressor":
+        default_params = {"random_state": seed}
+        default_params.update(clean_params)
+        return DecisionTreeRegressor(**default_params)
 
     if model_name == "GradientBoostingRegressor":
         default_params = {"random_state": seed}
         default_params.update(clean_params)
         return GradientBoostingRegressor(**default_params)
+
+    if model_name == "HistGradientBoostingRegressor":
+        default_params = {"random_state": seed}
+        default_params.update(clean_params)
+        return HistGradientBoostingRegressor(**default_params)
 
     if model_name == "XGBRegressor":
         if XGBRegressor is None:
@@ -308,6 +437,18 @@ def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str,
         default_params.update(clean_params)
         return LGBMRegressor(**default_params)
 
+    if model_name == "CatBoostRegressor":
+        if CatBoostRegressor is None:
+            raise ImportError("catboost is not installed. Install requirements.txt before running benchmark.")
+        default_params = {
+            "loss_function": "RMSE",
+            "random_state": seed,
+            "verbose": False,
+            "allow_writing_files": False,
+        }
+        default_params.update(clean_params)
+        return CatBoostRegressor(**default_params)
+
     if model_name == "SVR":
         return Pipeline(
             steps=[
@@ -323,6 +464,27 @@ def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str,
             steps=[
                 ("scaler", StandardScaler()),
                 ("model", Ridge(**ridge_params)),
+            ]
+        )
+
+    if model_name == "ElasticNet":
+        elastic_net_params = {
+            "random_state": seed,
+            "max_iter": 20000,
+        }
+        elastic_net_params.update(clean_params)
+        return Pipeline(
+            steps=[
+                ("scaler", StandardScaler()),
+                ("model", ElasticNet(**elastic_net_params)),
+            ]
+        )
+
+    if model_name == "KNeighborsRegressor":
+        return Pipeline(
+            steps=[
+                ("scaler", StandardScaler()),
+                ("model", KNeighborsRegressor(**clean_params)),
             ]
         )
 
