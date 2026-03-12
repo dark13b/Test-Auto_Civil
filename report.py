@@ -255,7 +255,14 @@ def main() -> int:
 
         baseline_metrics = load_json_artifact(outputs_dir / "baseline_metrics.json")
         baseline_model = load_pickle_artifact(outputs_dir / "baseline_model.pkl")
-        best_search_result = load_json_artifact(outputs_dir / "best_search_result.json")
+        canonical_final_metrics = (
+            load_json_artifact(outputs_dir / "final_metrics.json")
+            if (outputs_dir / "final_metrics.json").exists()
+            else {}
+        )
+        best_search_result = canonical_final_metrics.get("best_search_metrics")
+        if not isinstance(best_search_result, dict) or not best_search_result:
+            best_search_result = load_json_artifact(outputs_dir / "best_search_result.json")
         best_model = load_pickle_artifact(outputs_dir / "best_search_model.pkl")
         optuna_results = pd.read_csv(outputs_dir / "optuna_results.csv")
 
@@ -322,21 +329,24 @@ def main() -> int:
                 validation_report.get("dataset_anomalies", validation_report.get("dataset_anomaly_count", 0))
             ),
         }
-        final_metrics = {
-            "baseline_metrics": baseline_metrics,
-            "best_search_metrics": validation_result,
-            "improvement_percentage": improvement_percentage,
-            "composite_improvement_pct": improvement_percentage,
-            "validation_verdict": validation_result["validation_verdict"],
-            "best_model_name": validation_result["model_name"],
-            "best_model_hyperparameters": validation_result["hyperparameters"],
-            "validation_summary": validation_summary,
-            "holdout_metrics": holdout_metrics,
-            "rmse_by_range": rmse_by_range,
-            "baseline_rmse_by_range": baseline_rmse_by_range,
-            "uncertainty_summary": uncertainty_summary,
-            "uncertainty_audit": uncertainty_audit.get("coverage_audit", {}),
-        }
+        final_metrics = dict(canonical_final_metrics) if isinstance(canonical_final_metrics, dict) else {}
+        final_metrics.update(
+            {
+                "baseline_metrics": baseline_metrics,
+                "best_search_metrics": validation_result,
+                "improvement_percentage": improvement_percentage,
+                "composite_improvement_pct": improvement_percentage,
+                "validation_verdict": validation_result["validation_verdict"],
+                "best_model_name": validation_result["model_name"],
+                "best_model_hyperparameters": validation_result["hyperparameters"],
+                "validation_summary": validation_summary,
+                "holdout_metrics": holdout_metrics,
+                "rmse_by_range": rmse_by_range,
+                "baseline_rmse_by_range": baseline_rmse_by_range,
+                "uncertainty_summary": uncertainty_summary,
+                "uncertainty_audit": uncertainty_audit.get("coverage_audit", {}),
+            }
+        )
         save_json_artifact(outputs_dir / "final_metrics.json", final_metrics)
 
         log_status(

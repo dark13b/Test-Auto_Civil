@@ -246,8 +246,15 @@ def health():
 def api_overview():
     try:
         baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
-        best = normalize_result_payload(load_required_output_json("best_search_result.json") or {})
-        final = normalize_final_payload(load_required_output_json("final_metrics.json") or {})
+        final_raw = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
+        best_source = (
+            final_raw.get("best_search_metrics")
+            or safe_read_json(OUTPUTS_DIR / "search_state_best_result.json")
+            or safe_read_json(OUTPUTS_DIR / "best_search_result.json")
+            or {}
+        )
+        best = normalize_result_payload(best_source)
+        final = normalize_final_payload(final_raw)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
     # dataset info
@@ -272,7 +279,14 @@ def api_optuna_results():
 @app.route("/api/validation_details")
 def api_validation_details():
     try:
-        best = normalize_result_payload(load_required_output_json("best_search_result.json") or {})
+        final_raw = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
+        best_source = (
+            final_raw.get("best_search_metrics")
+            or safe_read_json(OUTPUTS_DIR / "search_state_best_result.json")
+            or load_required_output_json("best_search_result.json")
+            or {}
+        )
+        best = normalize_result_payload(best_source)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
     return jsonify(best)
@@ -314,7 +328,7 @@ def api_plots():
 @app.route("/api/status")
 def api_status():
     required = [
-        "baseline_metrics.json", "best_search_result.json",
+        "baseline_metrics.json", "search_state_best_result.json", "best_search_result.json",
         "final_metrics.json", "research_log.txt", "optuna_results.csv",
     ]
     status = {}

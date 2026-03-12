@@ -56,6 +56,12 @@ OPTUNA_RESULTS_COLUMNS = [
     "dataset_anomaly_count",
 ]
 
+SEARCH_STATE_BEST_RESULT_FILENAME = "search_state_best_result.json"
+SEARCH_STATE_BEST_MODEL_FILENAME = "search_state_best_model.pkl"
+FINAL_BEST_RESULT_FILENAME = "best_search_result.json"
+FINAL_BEST_MODEL_FILENAME = "best_search_model.pkl"
+FINAL_METRICS_FILENAME = "final_metrics.json"
+
 
 def load_json_artifact(path: Path) -> dict[str, Any]:
     """Load a JSON artifact from disk."""
@@ -155,20 +161,36 @@ def append_research_log(log_path: Path, line: str) -> None:
         handle.write(line + "\n")
 
 
-def seed_best_result_from_baseline(
-    outputs_dir: Path,
+def _build_baseline_best_result(
     baseline_metrics: dict[str, Any],
 ) -> dict[str, Any]:
-    """Seed the current best search artifact from the saved baseline."""
-    baseline_model_path = outputs_dir / "baseline_model.pkl"
-    best_model_path = outputs_dir / "best_search_model.pkl"
-    shutil.copy2(baseline_model_path, best_model_path)
+    """Normalize the baseline into the same result shape used by the search loop."""
     baseline_result = copy.deepcopy(baseline_metrics)
     baseline_result["source"] = "baseline"
     baseline_result["beats_baseline"] = False
     baseline_result["trial_number"] = None
     baseline_result["best_trial"] = None
-    save_json_artifact(outputs_dir / "best_search_result.json", baseline_result)
+    return baseline_result
+
+
+def initialize_search_state(
+    outputs_dir: Path,
+    baseline_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Seed the live search-state artifacts from the saved baseline."""
+    baseline_model_path = outputs_dir / "baseline_model.pkl"
+    state_model_path = outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME
+    final_json_artifacts = (
+        outputs_dir / FINAL_BEST_RESULT_FILENAME,
+        outputs_dir / FINAL_METRICS_FILENAME,
+        outputs_dir / "ensemble_metrics.json",
+    )
+    for artifact_path in final_json_artifacts:
+        artifact_path.unlink(missing_ok=True)
+    (outputs_dir / FINAL_BEST_MODEL_FILENAME).unlink(missing_ok=True)
+    shutil.copy2(baseline_model_path, state_model_path)
+    baseline_result = _build_baseline_best_result(baseline_metrics)
+    save_json_artifact(outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME, baseline_result)
     return baseline_result
 
 
@@ -292,42 +314,224 @@ def _csv_best_trial(csv_path: Path) -> dict[str, Any] | None:
 
 
 def sync_check(outputs_dir: Path, *, emit_warning: bool = True) -> bool:
-    """Compare the best trial recorded in JSON and CSV artifacts."""
-    json_path = outputs_dir / "best_search_result.json"
+    """Compare the live search-state winner against the Optuna CSV."""
+    state_path = outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME
     csv_path = outputs_dir / "optuna_results.csv"
-    if not json_path.exists():
+    if not state_path.exists():
         return True
 
-    json_best = load_json_artifact(json_path)
-    json_trial_number = _safe_int(json_best.get("trial_number", json_best.get("best_trial")))
+    state_best = load_json_artifact(state_path)
+    state_trial_number = _safe_int(state_best.get("trial_number", state_best.get("best_trial")))
     csv_best = _csv_best_trial(csv_path)
 
-    if json_trial_number is None and csv_best is None:
+    if state_trial_number is None and csv_best is None:
         return True
-    if json_trial_number is None or csv_best is None:
+
+    if state_trial_number is None:
+        if csv_best is None:
+            return True
+        state_score = float(state_best["composite_score"])
+        in_sync = state_score >= float(csv_best["composite_score"]) - 1e-12
+        if not in_sync and emit_warning:
+            log_status(
+                "WARNING search_artifact_desync "
+                f"| state_best_trial=None "
+                f"| state_best_model={state_best['model_name']} "
+                f"| csv_best_trial={csv_best['trial_number']} "
+                f"| csv_best_model={csv_best['model_name']}"
+            )
+        return in_sync
+
+    if csv_best is None:
         if emit_warning:
             log_status(
                 "WARNING search_artifact_desync "
-                f"| json_best_trial={json_trial_number} "
-                f"| csv_best_trial={None if csv_best is None else csv_best['trial_number']}"
+                f"| state_best_trial={state_trial_number} "
+                "| csv_best_trial=None"
             )
         return False
 
-    score_matches = abs(float(json_best["composite_score"]) - float(csv_best["composite_score"])) < 1e-12
+    score_matches = abs(float(state_best["composite_score"]) - float(csv_best["composite_score"])) < 1e-12
     in_sync = (
-        json_trial_number == csv_best["trial_number"]
-        and str(json_best["model_name"]) == str(csv_best["model_name"])
+        state_trial_number == csv_best["trial_number"]
+        and str(state_best["model_name"]) == str(csv_best["model_name"])
         and score_matches
     )
     if not in_sync and emit_warning:
         log_status(
             "WARNING search_artifact_desync "
-            f"| json_best_trial={json_trial_number} "
-            f"| json_best_model={json_best['model_name']} "
+            f"| state_best_trial={state_trial_number} "
+            f"| state_best_model={state_best['model_name']} "
             f"| csv_best_trial={csv_best['trial_number']} "
             f"| csv_best_model={csv_best['model_name']}"
         )
     return in_sync
+
+
+def calculate_improvement_percentage(baseline_score: float, best_score: float) -> float:
+    """Calculate percentage improvement in composite score relative to baseline."""
+    denominator = max(abs(baseline_score), 1e-8)
+    return ((best_score - baseline_score) / denominator) * 100.0
+
+
+def build_validation_summary(validation_report: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the validator report into the stable final-metrics summary shape."""
+    return {
+        "context_type": validation_report.get("context_type", "general"),
+        "pass_rate": float(validation_report.get("pass_rate", 0.0)),
+        "hard_failed_count": int(
+            validation_report.get("hard_failed_count", validation_report.get("failed_count", 0))
+        ),
+        "warning_count": int(validation_report.get("warning_count", 0)),
+        "statistical_errors": int(
+            validation_report.get(
+                "statistical_errors",
+                validation_report.get("statistical_error_count", validation_report.get("suspicious_count", 0)),
+            )
+        ),
+        "durability_warnings": int(
+            validation_report.get(
+                "durability_warnings",
+                validation_report.get(
+                    "durability_warning_count",
+                    validation_report.get("durability_caution_count", 0),
+                ),
+            )
+        ),
+        "dataset_anomalies": int(
+            validation_report.get("dataset_anomalies", validation_report.get("dataset_anomaly_count", 0))
+        ),
+    }
+
+
+def build_final_metrics_payload(
+    baseline_metrics: dict[str, Any],
+    final_best_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the canonical final-metrics artifact from the finalized winning result."""
+    improvement_percentage = calculate_improvement_percentage(
+        float(baseline_metrics["composite_score"]),
+        float(final_best_result["composite_score"]),
+    )
+    validation_report = dict(final_best_result.get("validation_report", {}))
+    return {
+        "baseline_metrics": copy.deepcopy(baseline_metrics),
+        "best_search_metrics": copy.deepcopy(final_best_result),
+        "improvement_percentage": improvement_percentage,
+        "composite_improvement_pct": improvement_percentage,
+        "validation_verdict": final_best_result["validation_verdict"],
+        "best_model_name": final_best_result["model_name"],
+        "best_model_hyperparameters": copy.deepcopy(final_best_result["hyperparameters"]),
+        "validation_summary": build_validation_summary(validation_report),
+        "holdout_metrics": copy.deepcopy(final_best_result.get("test_metrics", {})),
+    }
+
+
+def _best_trial_id(payload: dict[str, Any]) -> int | None:
+    """Extract the canonical trial identifier from a result payload."""
+    return _safe_int(payload.get("trial_number", payload.get("best_trial")))
+
+
+def _load_best_result_for_repair(outputs_dir: Path) -> dict[str, Any] | None:
+    """Load the most relevant best-result payload for CSV repair or backfill."""
+    search_state_path = outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME
+    if search_state_path.exists():
+        return load_json_artifact(search_state_path)
+
+    final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME
+    if final_metrics_path.exists():
+        final_metrics = load_json_artifact(final_metrics_path)
+        best_search_metrics = final_metrics.get("best_search_metrics")
+        if isinstance(best_search_metrics, dict):
+            return best_search_metrics
+
+    final_best_path = outputs_dir / FINAL_BEST_RESULT_FILENAME
+    if final_best_path.exists():
+        return load_json_artifact(final_best_path)
+
+    return None
+
+
+def resolve_final_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any]) -> dict[str, Any]:
+    """Recompute the winning result from the final study outputs and validate artifact alignment."""
+    baseline_result = _build_baseline_best_result(baseline_metrics)
+    csv_best = _csv_best_trial(outputs_dir / "optuna_results.csv")
+    search_state_path = outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME
+    search_state_result = load_json_artifact(search_state_path) if search_state_path.exists() else baseline_result
+
+    if csv_best is None or float(csv_best["composite_score"]) <= float(baseline_result["composite_score"]) + 1e-12:
+        state_trial_id = _best_trial_id(search_state_result)
+        state_score = float(search_state_result["composite_score"])
+        baseline_score = float(baseline_result["composite_score"])
+        if state_trial_id is not None and state_score > baseline_score + 1e-12:
+            raise RuntimeError(
+                "Final artifact desync | "
+                f"state_trial={state_trial_id} | baseline_composite={baseline_score:.12f} | "
+                f"state_composite={state_score:.12f}"
+            )
+        return baseline_result
+
+    state_trial_id = _best_trial_id(search_state_result)
+    csv_trial_id = csv_best["trial_number"]
+    if state_trial_id != csv_trial_id:
+        raise RuntimeError(
+            "Final artifact desync | "
+            f"state_trial={state_trial_id} | csv_best_trial={csv_trial_id}"
+        )
+    if str(search_state_result["model_name"]) != str(csv_best["model_name"]):
+        raise RuntimeError(
+            "Final artifact desync | "
+            f"state_model={search_state_result['model_name']} | csv_best_model={csv_best['model_name']}"
+        )
+    if abs(float(search_state_result["composite_score"]) - float(csv_best["composite_score"])) >= 1e-12:
+        raise RuntimeError(
+            "Final artifact desync | "
+            f"state_composite={float(search_state_result['composite_score']):.12f} | "
+            f"csv_composite={float(csv_best['composite_score']):.12f}"
+        )
+    return search_state_result
+
+
+def finalize_search_artifacts(outputs_dir: Path, baseline_metrics: dict[str, Any]) -> dict[str, Any]:
+    """Write the final JSON artifacts from one canonical finalized winner object."""
+    final_best_result = resolve_final_best_result(outputs_dir, baseline_metrics)
+    final_trial_id = _best_trial_id(final_best_result)
+
+    if final_trial_id is None:
+        shutil.copy2(outputs_dir / "baseline_model.pkl", outputs_dir / FINAL_BEST_MODEL_FILENAME)
+    else:
+        state_model_path = outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME
+        if not state_model_path.exists():
+            raise FileNotFoundError(f"Missing search-state model artifact: {state_model_path}")
+        shutil.copy2(state_model_path, outputs_dir / FINAL_BEST_MODEL_FILENAME)
+
+    final_metrics = build_final_metrics_payload(baseline_metrics, final_best_result)
+    save_json_artifact(outputs_dir / FINAL_METRICS_FILENAME, final_metrics)
+    save_json_artifact(outputs_dir / FINAL_BEST_RESULT_FILENAME, final_best_result)
+
+    written_final_metrics = load_json_artifact(outputs_dir / FINAL_METRICS_FILENAME)
+    written_best_result = load_json_artifact(outputs_dir / FINAL_BEST_RESULT_FILENAME)
+    metrics_best_result = written_final_metrics.get("best_search_metrics", {})
+    metrics_trial_id = None if not isinstance(metrics_best_result, dict) else _best_trial_id(metrics_best_result)
+    best_result_trial_id = _best_trial_id(written_best_result)
+    if metrics_trial_id != best_result_trial_id:
+        raise RuntimeError(
+            "Final artifact desync | "
+            f"final_metrics_trial={metrics_trial_id} | best_search_result_trial={best_result_trial_id}"
+        )
+
+    ensemble_metrics_path = outputs_dir / "ensemble_metrics.json"
+    if ensemble_metrics_path.exists():
+        ensemble_payload = load_json_artifact(ensemble_metrics_path)
+        if str(ensemble_payload.get("status")) == "new_best":
+            ensemble_trial_id = _best_trial_id(ensemble_payload)
+            if ensemble_trial_id != best_result_trial_id:
+                raise RuntimeError(
+                    "Final artifact desync | "
+                    f"ensemble_trial={ensemble_trial_id} | best_search_result_trial={best_result_trial_id}"
+                )
+
+    return final_best_result
 
 
 def _parse_param_value(raw_value: str) -> Any:
@@ -502,8 +706,7 @@ def repair_optuna_results_csv(outputs_dir: Path, config: dict[str, Any]) -> Path
     available_models = get_available_model_configs(config)
     csv_path = outputs_dir / "optuna_results.csv"
     log_path = outputs_dir / "research_log.txt"
-    best_result_path = outputs_dir / "best_search_result.json"
-    best_result = load_json_artifact(best_result_path) if best_result_path.exists() else None
+    best_result = _load_best_result_for_repair(outputs_dir)
     parsed_trials = parse_research_log_trials(log_path, available_models)
     if not parsed_trials:
         raise RuntimeError(f"No trial entries were found in {log_path}.")
@@ -539,8 +742,8 @@ def build_post_search_ensemble(
     """Build and evaluate a stacking ensemble from the best unique model families in the Optuna CSV."""
     ensemble_metrics_path = outputs_dir / "ensemble_metrics.json"
     optuna_results_path = outputs_dir / "optuna_results.csv"
-    best_result_path = outputs_dir / "best_search_result.json"
-    current_best_result = load_json_artifact(best_result_path)
+    search_state_best_result_path = outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME
+    current_best_result = load_json_artifact(search_state_best_result_path)
 
     if not optuna_results_path.exists() or optuna_results_path.stat().st_size == 0:
         ensemble_summary = {
@@ -697,13 +900,13 @@ def build_post_search_ensemble(
         ensemble_result["status"] = "new_best"
 
         save_pickle_artifact(
-            outputs_dir / "best_search_model.pkl",
+            outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
             ensemble_model,
             config=config,
             model_id="StackingRegressor",
         )
         save_json_artifact(ensemble_metrics_path, ensemble_result)
-        save_json_artifact(best_result_path, ensemble_result)
+        save_json_artifact(search_state_best_result_path, ensemble_result)
 
         ensemble_record = build_trial_record(
             next_trial_number,
@@ -734,7 +937,7 @@ def build_post_search_ensemble(
             from uncertainty import recalibrate_uncertainty_artifacts
 
             recalibrate_uncertainty_artifacts(
-                model_path=outputs_dir / "best_search_model.pkl",
+                model_path=outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
                 method=str(config["engineering"]["uncertainty_method"]),
             )
         except Exception as recalibration_exc:
@@ -764,7 +967,7 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     validator = EngineeringValidator.from_config(config)
     available_models = get_available_model_configs(config)
 
-    best_result = seed_best_result_from_baseline(outputs_dir, baseline_metrics)
+    best_result = initialize_search_state(outputs_dir, baseline_metrics)
     current_best_composite = float(best_result["composite_score"])
     current_best_name = str(best_result["model_name"])
 
@@ -868,17 +1071,17 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     best_result["trial_number"] = trial_number
                     best_result["best_trial"] = trial_number
                     save_pickle_artifact(
-                        outputs_dir / "best_search_model.pkl",
+                        outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
                         model,
                         config=config,
                         model_id=model_name,
                     )
-                    save_json_artifact(outputs_dir / "best_search_result.json", best_result)
+                    save_json_artifact(outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME, best_result)
                     try:
                         from uncertainty import recalibrate_uncertainty_artifacts
 
                         recalibrate_uncertainty_artifacts(
-                            model_path=outputs_dir / "best_search_model.pkl",
+                            model_path=outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
                             method=str(config["engineering"]["uncertainty_method"]),
                         )
                     except Exception as recalibration_exc:
@@ -953,8 +1156,6 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
         if trials_floor_reached and runtime_floor_reached:
             break
 
-    save_json_artifact(outputs_dir / "best_search_result.json", best_result)
-    sync_check(outputs_dir)
     if bool(config["search"].get("build_ensemble_after_search", True)):
         best_result = build_post_search_ensemble(
             outputs_dir,
@@ -965,7 +1166,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
             y_test,
             validator,
         )
-    return best_result
+    final_best_result = finalize_search_artifacts(outputs_dir, baseline_metrics)
+    return final_best_result
 
 
 def main() -> int:

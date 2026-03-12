@@ -8,6 +8,7 @@ import pickle
 import random
 import re
 import sys
+import tempfile
 import warnings
 from hashlib import sha256
 from importlib import import_module
@@ -683,8 +684,26 @@ def to_serializable(value: Any) -> Any:
 
 def save_json_artifact(path: Path, payload: dict[str, Any]) -> None:
     """Serialize a dictionary to JSON with stable formatting."""
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(to_serializable(payload), handle, indent=2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized_payload = to_serializable(payload)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(serialized_payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 def format_metrics_summary(metrics: dict[str, Any]) -> str:
