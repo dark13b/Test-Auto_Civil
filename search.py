@@ -578,27 +578,88 @@ def build_post_search_ensemble(
 
     filtered["composite_score"] = filtered["composite_score"].astype(float)
     ranked = filtered.sort_values(["composite_score", "trial_number"], ascending=[False, True])
-    top_family_rows = ranked.drop_duplicates(subset=["model_name"], keep="first").head(3)
-
     selected_base_models: list[dict[str, Any]] = []
     ensemble_configs: list[tuple[str, dict[str, Any]]] = []
-    for row in top_family_rows.to_dict(orient="records"):
+    # LLM PROPOSAL
+    llm_top_trials: list[dict[str, Any]] = []
+    for row in ranked.head(12).to_dict(orient="records"):
         raw_hyperparameters = row.get("hyperparameters", "{}")
         parsed_hyperparameters = (
             json.loads(raw_hyperparameters)
             if isinstance(raw_hyperparameters, str) and raw_hyperparameters.strip()
             else {}
         )
-        model_name = str(row["model_name"])
-        ensemble_configs.append((model_name, parsed_hyperparameters))
-        selected_base_models.append(
+        llm_top_trials.append(
             {
                 "trial_number": _safe_int(row.get("trial_number")),
-                "model_name": model_name,
+                "model_name": str(row["model_name"]),
+                "rmse": row.get("rmse"),
+                "r2": row.get("r2"),
                 "composite_score": float(row["composite_score"]),
-                "hyperparameters": parsed_hyperparameters,
+                "validation_verdict": row.get("validation_verdict"),
+                "params": parsed_hyperparameters,
             }
         )
+
+    llm_ensemble_selection = None
+    llm_config = config["search"].get("llm_proposals", {})
+    if llm_config.get("enabled", False) and llm_top_trials:
+        from llm_proposer import LLMProposer
+
+        llm_proposer = LLMProposer(config)
+        if llm_proposer.is_available():
+            llm_ensemble_selection = llm_proposer.propose_ensemble(
+                top_trials=llm_top_trials,
+                available_models=get_available_model_configs(config),
+            )
+            if llm_ensemble_selection:
+                log_status(
+                    f"INFO llm_ensemble_selection | model_used={llm_proposer.smart_model} | "
+                    f"selected={len(llm_ensemble_selection)}"
+                )
+
+    if llm_ensemble_selection:
+        llm_top_trial_lookup = {
+            (
+                trial["model_name"],
+                json.dumps(trial["params"], sort_keys=True, separators=(",", ":")),
+            ): trial
+            for trial in llm_top_trials
+        }
+        for suggestion in llm_ensemble_selection:
+            ensemble_configs.append((suggestion["model_name"], suggestion["params"]))
+            lookup_key = (
+                suggestion["model_name"],
+                json.dumps(suggestion["params"], sort_keys=True, separators=(",", ":")),
+            )
+            matched_trial = llm_top_trial_lookup.get(lookup_key)
+            selected_base_models.append(
+                {
+                    "trial_number": None if matched_trial is None else matched_trial["trial_number"],
+                    "model_name": suggestion["model_name"],
+                    "composite_score": None if matched_trial is None else matched_trial["composite_score"],
+                    "hyperparameters": suggestion["params"],
+                }
+            )
+    else:
+        top_family_rows = ranked.drop_duplicates(subset=["model_name"], keep="first").head(3)
+        for row in top_family_rows.to_dict(orient="records"):
+            raw_hyperparameters = row.get("hyperparameters", "{}")
+            parsed_hyperparameters = (
+                json.loads(raw_hyperparameters)
+                if isinstance(raw_hyperparameters, str) and raw_hyperparameters.strip()
+                else {}
+            )
+            model_name = str(row["model_name"])
+            ensemble_configs.append((model_name, parsed_hyperparameters))
+            selected_base_models.append(
+                {
+                    "trial_number": _safe_int(row.get("trial_number")),
+                    "model_name": model_name,
+                    "composite_score": float(row["composite_score"]),
+                    "hyperparameters": parsed_hyperparameters,
+                }
+            )
 
     ensemble_model, ensemble_result = build_stacking_ensemble(
         ensemble_configs,
@@ -715,10 +776,47 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize", study_name="autocivil_search")
     trial_records: list[dict[str, Any]] = []
+    # LLM PROPOSAL
+    llm_config = config["search"].get("llm_proposals", {})
+    llm_proposer = None
+    if llm_config.get("enabled", False):
+        from llm_proposer import LLMProposer
+
+        llm_proposer = LLMProposer(config)
+        if llm_proposer.is_available():
+            log_status(
+                f"INFO llm_proposer_ready | fast={llm_proposer.fast_model} | smart={llm_proposer.smart_model}"
+            )
+        else:
+            llm_proposer = None
+            log_status("INFO llm_proposer_unavailable | falling back to Optuna only")
 
     trial_number = 0
     while True:
         trial_number += 1
+        # LLM PROPOSAL
+        proposal_interval = int(llm_config.get("interval_trials", 15))
+        if (
+            llm_proposer is not None
+            and proposal_interval > 0
+            and trial_number % proposal_interval == 0
+            and trial_number > 0
+        ):
+            suggestion = llm_proposer.propose(
+                trial_history=trial_records[-proposal_interval:],
+                available_models=available_models,
+                current_best=best_result,
+            )
+            if suggestion:
+                namespaced = {
+                    f"{suggestion['model_name']}__{key}": value
+                    for key, value in suggestion["params"].items()
+                }
+                namespaced["model_family"] = suggestion["model_name"]
+                study.enqueue_trial(namespaced)
+            if llm_proposer is not None and llm_proposer.consecutive_invalid_responses >= 3:
+                llm_proposer = None
+                log_status("WARNING llm_proposer_disabled | 3_consecutive_failures")
         trial = study.ask()
         model_name, display_name, params = sample_model_configuration(trial, available_models)
         try:

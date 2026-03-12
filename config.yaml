@@ -155,6 +155,12 @@ baseline_model:
 search:
   progress_interval: 10
   build_ensemble_after_search: true
+  llm_proposals:
+    enabled: false
+    interval_trials: 15
+    fast_model: "qwen3:4b"
+    smart_model: "qwen3:8b"
+    ollama_base_url: "http://localhost:11434"
   # Search keeps running until it satisfies both this runtime floor and
   # experiment.optuna_trials.
   min_runtime_minutes: 50
