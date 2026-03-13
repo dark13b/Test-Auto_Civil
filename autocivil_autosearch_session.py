@@ -116,15 +116,8 @@ def _apply_runtime_overrides(
     config = copy.deepcopy(base_config)
     config["data"]["mode"] = "local_file"
     config["data"]["local_file"]["path"] = str(input_path)
-    config["search"]["llm_proposals"]["enabled"] = True
-    config["search"]["llm_proposals"]["fast_model"] = "qwen3:4b"
-    config["search"]["llm_proposals"]["smart_model"] = "qwen3:8b"
-    config["search"]["llm_proposals"]["interaction_interval_minutes"] = 5
-    config["search"]["llm_proposals"]["smart_model_after_progress"] = 0.67
-    config["search"]["llm_proposals"]["include_no_think_directive"] = False
-    config["search"]["llm_proposals"]["log_interactions"] = True
-    config["search"]["min_runtime_minutes"] = max(0.0, float(min_runtime_minutes))
-    config["experiment"]["optuna_trials"] = int(target_trials)
+    config["research"]["max_runtime_minutes"] = max(0.0, float(min_runtime_minutes))
+    config["research"]["max_cycles"] = int(target_trials)
     return config
 
 
@@ -180,10 +173,12 @@ def _read_last_research_log(outputs_dir: Path) -> str | None:
 
 def _append_report(status: str, outputs_dir: Path) -> None:
     best = _read_best_summary(outputs_dir)
+    research_results_path = outputs_dir / "research_results.csv"
+    trial_count_path = research_results_path if research_results_path.exists() else outputs_dir / "optuna_results.csv"
     summary = {
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": status,
-        "trial_count": _count_trials(outputs_dir / "optuna_results.csv"),
+        "trial_count": _count_trials(trial_count_path),
         "best_model": best.get("model_name"),
         "best_composite_score": best.get("composite_score"),
         "best_trial_number": best.get("trial_number"),
@@ -212,12 +207,15 @@ def _finalize_partial_search(overrides_path: Path, outputs_dir: Path) -> dict[st
     if not baseline_metrics_path.exists():
         return None
 
-    import search
-
-    baseline_metrics = json.loads(baseline_metrics_path.read_text(encoding="utf-8"))
-    finalized = search.finalize_search_artifacts(outputs_dir, baseline_metrics)
-    FINAL_SUMMARY_PATH.write_text(json.dumps(finalized, indent=2, default=str), encoding="utf-8")
-    return finalized
+    final_metrics_path = outputs_dir / "final_metrics.json"
+    if not final_metrics_path.exists():
+        return None
+    final_metrics = json.loads(final_metrics_path.read_text(encoding="utf-8"))
+    best_search_metrics = final_metrics.get("best_search_metrics")
+    if not isinstance(best_search_metrics, dict):
+        return None
+    FINAL_SUMMARY_PATH.write_text(json.dumps(best_search_metrics, indent=2, default=str), encoding="utf-8")
+    return best_search_metrics
 
 
 def _final_metrics_exists(outputs_dir: Path) -> bool:
@@ -226,14 +224,14 @@ def _final_metrics_exists(outputs_dir: Path) -> bool:
 
 
 def _run_search_child(overrides_path: Path) -> int:
-    import search
+    import research_loop
 
     payload = json.loads(overrides_path.read_text(encoding="utf-8"))
     config = payload["config"]
     target_trials = int(payload["target_trials"])
 
-    search.load_config = lambda: config
-    result = search.run_autocivil_loop(n_trials=target_trials)
+    research_loop.load_config = lambda: config
+    result = research_loop.run_engineering_research_loop(cycles_override=target_trials, with_report=True)
     FINAL_SUMMARY_PATH.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
     return 0
 
@@ -281,8 +279,8 @@ def _run_parent(input_path: Path, end_time: datetime, target_trials: int, report
     )
 
     _log(
-        "Starting LLM-enabled search with "
-        f"target_trials={target_trials} and min_runtime_minutes={remaining_minutes:.2f}"
+        "Starting governed engineering research loop with "
+        f"target_cycles={target_trials} and max_runtime_minutes={remaining_minutes:.2f}"
     )
     child_env = os.environ.copy()
     child_env["PYTHONUNBUFFERED"] = "1"

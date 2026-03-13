@@ -1,0 +1,10 @@
+{
+  "historic_family_counts": {
+    "LGBMRegressor-balanced": 4,
+    "LGBMRegressor-exploit": 2,
+    "RandomForestRegressor-balanced": 3,
+    "XGBRegressor-balanced": 3
+  },
+  "run_id": "20260313T090000",
+  "unique_signatures_this_run": 9
+}

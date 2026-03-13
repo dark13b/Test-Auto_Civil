@@ -5,7 +5,7 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 
 ## Current State
 
-- Task: concrete compressive strength regression with autonomous search, uncertainty estimation, validation, and inverse design.
+- Task: concrete compressive strength regression with governed research, uncertainty estimation, validation, and inverse design.
 - Active data mode: `local_file` from `concrete_combined.xlsx`, sheet `Combined`.
 - Current saved best model: `LGBMRegressor`, trial `62`, holdout `R2 = 0.9822873303967959`.
 - Current uncertainty audit: global coverage `0.9004854368932039`, audit `PASS`.
@@ -18,8 +18,8 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
    Normalizes the workbook or downloaded dataset and writes `data/concrete_data.csv`.
 2. `train.py`
    Builds the baseline model, saves baseline metrics, and provides shared training, split, scoring, and artifact I/O helpers.
-3. `search.py`
-   Runs the Optuna search loop, appends trial rows to `outputs/optuna_results.csv`, updates `outputs/best_search_result.json`, and recalibrates uncertainty when a new best model is retained.
+3. `research_loop.py`
+   Runs the governed scout-confirm-keep loop, appends research rows to `outputs/research_results.csv`, updates `outputs/best_search_result.json`, ratchets accepted state into `research_lab.py`, and validates final artifacts.
 4. `uncertainty.py`
    Builds conformal and optional quantile intervals, then writes `outputs/uncertainty_calibration.json`.
 5. `report.py`
@@ -37,7 +37,9 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 | `feature_engineering.py` | 138 lines | Derived mix and binder features | `build_engineering_features`, `validate_features` | in-memory engineered columns |
 | `train.py` | 641 lines | Core ML utilities, baseline training, persistence | `split_dataset`, `cross_validate_model`, `instantiate_model`, `evaluate_candidate`, `save_pickle_artifact`, `load_pickle_artifact`, `main` | `outputs/baseline_model.pkl`, `outputs/baseline_metrics.json` |
 | `validator.py` | 434 lines | Engineering rule engine over predictions and mixes | `EngineeringValidator.from_config`, `_evaluate_single_sample`, `validate_predictions` | embedded validation reports in JSON artifacts |
-| `search.py` | 739 lines | Optuna-driven research loop and artifact synchronization | `sample_model_configuration`, `build_trial_record`, `sync_check`, `repair_optuna_results_csv`, `run_autocivil_loop`, `main` | `outputs/best_search_model.pkl`, `outputs/best_search_result.json`, `outputs/optuna_results.csv`, `outputs/research_log.txt` |
+| `research_lab.py` | controlled surface | Research-editable experiment generation and kept-state ratchet | `scout_experiments`, `confirm_experiments`, `LAB_STATE` | accepted surface state in file |
+| `research_protocol.py` | governance helpers | Brief parsing, memory, surface ratcheting, artifact validation | `load_human_research_brief`, `record_experiment_memory`, `validate_final_artifact_consistency` | governance JSON artifacts |
+| `research_loop.py` | governed research loop | Scout/confirm execution and keep/revert orchestration | `run_engineering_research_loop`, `main` | `outputs/research_results.csv`, `outputs/experiment_memory.json`, `outputs/final_artifact_validation.json` |
 | `uncertainty.py` | 447 lines | Conformal and quantile uncertainty estimation | `UncertaintyEstimator._fit_estimators`, `predict_with_interval`, `calibration_report`, `recalibrate_uncertainty_artifacts`, `main` | `outputs/uncertainty_calibration.json` |
 | `report.py` | 358 lines | Plot and summary artifact generation | `create_search_progress_plot`, `create_uncertainty_plot`, `compute_feature_importance`, `main` | `outputs/final_metrics.json`, plot PNGs |
 | `design_tool.py` | 533 lines | Inverse mix design optimization | `MixDesignOptimizer.optimize`, `_sample_trial_mix`, `_evaluate_mix`, `_warm_start_mixes`, `batch_optimize`, `main` | `outputs/design_*MPa.json`, `outputs/batch_design_results.csv` |
@@ -47,7 +49,9 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 
 - `generate_data.py` -> `feature_engineering.py`
 - `train.py` -> `feature_engineering.py`, `validator.py`
-- `search.py` -> `train.py`, `validator.py`, `uncertainty.py`
+- `research_lab.py` -> controlled by infrastructure, no domain-side dependencies
+- `research_protocol.py` -> governance helpers only
+- `research_loop.py` -> `research_lab.py`, `research_protocol.py`, `train.py`, `validator.py`, `uncertainty.py`, `report.py`
 - `uncertainty.py` -> `train.py`, `feature_engineering.py`
 - `report.py` -> `train.py`, `uncertainty.py`
 - `design_tool.py` -> `train.py`, `validator.py`, `feature_engineering.py`, `optuna`
@@ -69,14 +73,19 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 - `concrete_data.csv`
 - `Concrete_DataUCI.xls`
 
-### Model and search artifacts
+### Model and research artifacts
 
 - `outputs/baseline_model.pkl`
 - `outputs/baseline_metrics.json`
 - `outputs/best_search_model.pkl`
 - `outputs/best_search_result.json`
+- `outputs/research_results.csv`
 - `outputs/optuna_results.csv`
 - `outputs/research_log.txt`
+- `outputs/experiment_memory.json`
+- `outputs/proposal_diversity.json`
+- `outputs/final_artifact_validation.json`
+- `outputs/final_acceptance.json`
 
 ### Reporting and uncertainty
 
@@ -98,8 +107,9 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 
 - `python generate_data.py`
 - `python train.py`
-- `python search.py`
-- `python search.py --repair`
+- `python research_loop.py`
+- `python research_loop.py --with-report`
+- `python research_loop.py --validate-only`
 - `python uncertainty.py`
 - `python report.py`
 - `python design_tool.py --target 35`
@@ -108,7 +118,8 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 
 ## Operational Notes
 
-- Search writes trial rows incrementally and includes a repair path for stale CSV state.
+- The governed loop writes scout and confirm rows incrementally and mirrors them to `optuna_results.csv` for backward-compatible reporting.
+- `research_lab.py` is now the intended editable research surface; the core pipeline remains infrastructure-owned.
 - Pickled model artifacts now embed metadata with package versions, save timestamp, model id, and config hash.
 - Validator output is now categorized into `statistical_errors`, `durability_warnings`, and `dataset_anomalies`.
 - Uncertainty calibration now uses per-bin conformal quantiles and writes an explicit coverage audit.
@@ -116,7 +127,6 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 
 ## Risks Still Present
 
-- `search.py` still resets `research_log.txt`, `optuna_results.csv`, and the retained best artifact at the start of a new search run. The project is therefore resilient within a run, but not append-only across runs.
 - The repo tracks generated artifacts in `outputs/` and Python bytecode in `__pycache__/`, which creates noisy diffs and makes the Git history look like a trash fire.
-- There is no project test suite. All verification is script-level and artifact-based.
+- There is still no full end-to-end ML regression suite; verification remains helper-level plus import/compile checks unless the full loop is run.
 - Model persistence still uses Python pickle, so artifacts must be treated as trusted-only and environment-coupled.

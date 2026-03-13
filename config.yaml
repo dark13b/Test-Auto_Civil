@@ -438,9 +438,55 @@ baseline_model:
     max_features: sqrt
     n_jobs: -1
 
+research:
+  brief_path: research_brief.md
+  editable_surface_path: research_lab.py
+  memory_filename: experiment_memory.json
+  max_cycles: 6
+  max_runtime_minutes: 0
+  max_trial_seconds: 0
+  scout_candidates_per_cycle: 8
+  confirm_top_k: 2
+  scout_cv_repeats: 1
+  confirm_cv_repeats: 3
+  max_family_repeats_per_cycle: 1
+  rebuild_reports_on_keep: true
+
+llm:
+  enabled: false
+  backend_mode: hybrid
+  allow_deterministic_fallback: true
+  interval_trials: 15
+  interaction_interval_minutes: 5
+  smart_model_after_progress: 0.67
+  include_no_think_directive: false
+  log_interactions: true
+  interaction_log_filename: llm_interactions.jsonl
+  ollama:
+    base_url: http://localhost:11434
+    model: qwen3:8b
+    fast_model: qwen3:4b
+    smart_model: qwen3:8b
+    timeout_seconds: 30
+    use_cli_fallback: true
+  openai:
+    base_url: https://api.openai.com/v1/responses
+    model: gpt-5.1-mini
+    api_key_env: OPENAI_API_KEY
+    timeout_seconds: 30
+  hybrid:
+    primary: ollama
+    fallback: openai
+  tasks:
+    proposal_count: 8
+    summary_enabled: true
+
 search:
   progress_interval: 10
   build_ensemble_after_search: true
+  research_brief_path: research_brief.md
+  # Soft per-trial runtime budget. 0 disables budget checks.
+  max_trial_seconds: 0
   llm_proposals:
     enabled: false
     interval_trials: 15

@@ -1,136 +1,37 @@
-"""Ollama-backed LLM trial proposals for AutoCivil-Lab."""
+"""Backend-agnostic proposal adapter for the legacy search loop."""
 
 from __future__ import annotations
 
-import json
-import logging
-import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import requests
-
-
-JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
-JSON_ARRAY_PATTERN = re.compile(r"\[\s*\{.*\}\s*\]", re.DOTALL)
-JSON_ONLY_INSTRUCTION = (
-    'Return ONLY a JSON object on a single line. No explanation. No markdown.\n'
-    'Format: {"model_name": "XGBRegressor", "params": {"n_estimators": 300,\n'
-    '"learning_rate": 0.05, "max_depth": 5, "subsample": 0.8,\n'
-    '"colsample_bytree": 0.8, "reg_alpha": 0.01}}'
-)
-INVALID_PARAM = object()
+from llm_backend import get_llm_config, resolve_backend
+from proposal_engine import ProposalEngine
 
 
 class LLMProposer:
-    """Request trial suggestions from a local Ollama-hosted Qwen model."""
+    """Compatibility adapter that preserves the legacy search.py interface."""
 
     def __init__(self, config: dict[str, Any]):
-        llm_config = config.get("search", {}).get("llm_proposals", {})
-        self.base_url = str(llm_config.get("ollama_base_url", "http://localhost:11434")).rstrip("/")
-        self.fast_model = str(llm_config.get("fast_model", "qwen3:4b"))
-        self.smart_model = str(llm_config.get("smart_model", "qwen3:8b"))
-        self.timeout_seconds = 30
-        self.consecutive_invalid_responses = 0
-        self.include_no_think_directive = bool(llm_config.get("include_no_think_directive", False))
-        self.log_interactions = bool(llm_config.get("log_interactions", True))
+        self.config = config
+        self.llm_config = get_llm_config(config)
         outputs_dir = Path(__file__).resolve().parent / str(config.get("paths", {}).get("outputs_dir", "outputs"))
         outputs_dir.mkdir(parents=True, exist_ok=True)
         self.interaction_log_path = outputs_dir / str(
-            llm_config.get("interaction_log_filename", "llm_interactions.jsonl")
+            self.llm_config.get("interaction_log_filename", "llm_interactions.jsonl")
         )
+        self.backend = resolve_backend(config)
+        self.engine = ProposalEngine(
+            backend=self.backend,
+            interaction_log_path=self.interaction_log_path,
+            log_interactions=bool(self.llm_config.get("log_interactions", True)),
+            include_no_think_directive=bool(self.llm_config.get("include_no_think_directive", False)),
+        )
+        self.fast_model, self.smart_model = self._resolve_model_hints()
+        self.consecutive_invalid_responses = 0
 
     def is_available(self) -> bool:
-        """Return True when Ollama is reachable and responding."""
-        try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=self.timeout_seconds)
-            response.raise_for_status()
-            return True
-        except Exception:
-            return False
-
-    def _build_prompt(
-        self,
-        trial_history: list[dict[str, Any]],
-        available_models: dict[str, dict[str, Any]],
-        current_best: dict[str, Any] | None,
-        search_progress: dict[str, Any] | None = None,
-    ) -> str:
-        """Build a compact JSON-only prompt for trial suggestions."""
-        recent_trials = trial_history[-min(15, len(trial_history)) :] if trial_history else []
-        best_name = "unknown" if current_best is None else str(current_best.get("model_name", "unknown"))
-        best_composite = self._format_metric(None if current_best is None else current_best.get("composite_score"))
-        best_rmse = self._format_metric(None if current_best is None else current_best.get("rmse"))
-
-        lines: list[str] = []
-        if self.include_no_think_directive:
-            lines.append("/no_think")
-        lines.extend(
-            [
-                "You are guiding Optuna trial proposals for concrete compressive strength regression.",
-                f"Current best: {best_name} | composite={best_composite} | RMSE={best_rmse}",
-                "Do not repeat any recent model-plus-parameter configuration.",
-                "If one family appears saturated, diversify to another strong family instead of repeating it.",
-            ]
-        )
-        if search_progress:
-            lines.extend(
-                [
-                    "Run progress:",
-                    (
-                        f"stage={search_progress.get('stage', 'unknown')} | "
-                        f"interaction_index={search_progress.get('interaction_index', 'n/a')} | "
-                        f"elapsed_minutes={self._format_metric(search_progress.get('elapsed_minutes'))} | "
-                        f"remaining_minutes={self._format_metric(search_progress.get('remaining_minutes'))} | "
-                        f"progress_percent={self._format_metric(search_progress.get('progress_percent'))}"
-                    ),
-                    "Guidance by stage: early=diversify across strong families, mid=compare contenders, late=refine the strongest families without duplicating configs.",
-                ]
-            )
-            family_counts = search_progress.get("family_counts", {})
-            if isinstance(family_counts, dict) and family_counts:
-                lines.append(f"Family trial counts so far: {json.dumps(family_counts, sort_keys=True)}")
-            underexplored = search_progress.get("underexplored_families", [])
-            if isinstance(underexplored, list) and underexplored:
-                lines.append(f"Underexplored families: {', '.join(str(item) for item in underexplored)}")
-        lines.append("Recent trials:")
-        if recent_trials:
-            for index, trial in enumerate(recent_trials, start=1):
-                trial_number = trial.get("trial_number", index)
-                model_name = str(trial.get("model_name", "unknown"))
-                rmse = self._format_metric(trial.get("rmse"))
-                r2 = self._format_metric(trial.get("r2"))
-                composite = self._format_metric(trial.get("composite_score"))
-                verdict = str(trial.get("validation_verdict", "UNKNOWN"))
-                params = self._extract_params(trial)
-                lines.append(
-                    f"Trial {trial_number}: {model_name} | RMSE={rmse} | "
-                    f"R2={r2} | composite={composite} | {verdict} | "
-                    f"params={json.dumps(params, sort_keys=True)}"
-                )
-        else:
-            lines.append("No completed trials yet.")
-
-        lines.append("Available models and parameter ranges:")
-        for model_name, model_config in available_models.items():
-            search_space = model_config.get("search_space", {})
-            lines.append(f"{model_name}: {self._format_search_space(search_space)}")
-
-        lines.append(JSON_ONLY_INSTRUCTION)
-        return "\n".join(lines)
-
-    def _parse_response(self, raw_text: str, available_models: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-        """Extract and validate the first JSON object returned by the LLM."""
-        try:
-            cleaned = raw_text.strip()
-            match = JSON_OBJECT_PATTERN.search(cleaned)
-            if match is None:
-                return None
-            payload = json.loads(match.group(0))
-        except Exception:
-            return None
-        return self._validate_suggestion(payload, available_models)
+        return self.engine.is_available()
 
     def propose(
         self,
@@ -139,461 +40,111 @@ class LLMProposer:
         current_best: dict[str, Any] | None,
         use_smart_model: bool = False,
         search_progress: dict[str, Any] | None = None,
+        research_brief: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Request a single trial proposal from Ollama."""
-        model_to_use = self.smart_model if use_smart_model else self.fast_model
-        prompt = self._build_prompt(trial_history, available_models, current_best, search_progress=search_progress)
-        response_format = self._build_proposal_schema(available_models)
-
-        generation = self._generate(model_to_use, prompt, response_format=response_format, num_predict=256)
-        if generation is None:
-            self._write_interaction_log(
-                interaction_kind="proposal",
-                model_used=model_to_use,
-                prompt=prompt,
-                response_text=None,
-                thinking_text=None,
-                parsed=None,
-                valid=False,
-            )
-            self._emit_log(
-                f"INFO llm_proposal | model_used={model_to_use} | suggested=None | params={{}} | valid=False"
-            )
-            return None
-
-        raw_text = generation["response_text"] or generation["thinking_text"] or ""
-        parsed = self._parse_response(raw_text, available_models)
-        if parsed is None:
+        proposals = self.engine.generate_experiment_proposals(
+            available_models=available_models,
+            research_brief=research_brief or {},
+            current_best=current_best or {},
+            experiment_memory={"runs": [], "accepted_experiments": []},
+            diversity_state={"historic_family_counts": {}},
+            proposal_count=1,
+            trial_history=trial_history,
+            search_progress=search_progress or {},
+            model_hint=self.smart_model if use_smart_model else self.fast_model,
+        )
+        if not proposals:
             self.consecutive_invalid_responses += 1
-        else:
-            self.consecutive_invalid_responses = 0
-
-        suggested_model = None if parsed is None else parsed["model_name"]
-        suggested_params = {} if parsed is None else parsed["params"]
-        self._write_interaction_log(
-            interaction_kind="proposal",
-            model_used=model_to_use,
-            prompt=prompt,
-            response_text=generation["response_text"],
-            thinking_text=generation["thinking_text"],
-            parsed=parsed,
-            valid=parsed is not None,
-        )
-        self._emit_log(
-            f"INFO llm_proposal | model_used={model_to_use} | suggested={suggested_model} | "
-            f"params={json.dumps(suggested_params, sort_keys=True)} | valid={parsed is not None}"
-        )
-        return parsed
+            return None
+        self.consecutive_invalid_responses = 0
+        return proposals[0]
 
     def propose_ensemble(
         self,
         top_trials: list[dict[str, Any]],
         available_models: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]] | None:
-        """Request up to three stacking candidates from the smart model."""
-        prompt_lines: list[str] = []
-        if self.include_no_think_directive:
-            prompt_lines.append("/no_think")
-        prompt_lines.extend(
-            [
-                "Pick the best 3 model configs for a stacking ensemble.",
-                "Choose only from the provided top trials.",
-                "Top trials:",
-            ]
+        proposals = self.engine.generate_ensemble_selection(
+            top_trials=top_trials,
+            available_models=available_models,
+            max_items=3,
+            model_hint=self.smart_model,
         )
-        if top_trials:
-            for trial in top_trials:
-                prompt_lines.append(
-                    f"Trial {trial.get('trial_number', 'n/a')}: {trial.get('model_name', 'unknown')} | "
-                    f"RMSE={self._format_metric(trial.get('rmse'))} | "
-                    f"R2={self._format_metric(trial.get('r2'))} | "
-                    f"composite={self._format_metric(trial.get('composite_score'))} | "
-                    f"{trial.get('validation_verdict', 'UNKNOWN')} | "
-                    f"params={json.dumps(trial.get('params', {}), sort_keys=True)}"
-                )
-        else:
-            prompt_lines.append("No top trials available.")
-
-        prompt_lines.append("Available models and parameter ranges:")
-        for model_name, model_config in available_models.items():
-            prompt_lines.append(f"{model_name}: {self._format_search_space(model_config.get('search_space', {}))}")
-        prompt_lines.append(
-            'Return ONLY a compact JSON array on a single line with no extra spaces. No explanation. No markdown. '
-            'Format: [{"model_name": "XGBRegressor", "params": {"n_estimators": 300}}]'
-        )
-
-        generation = self._generate(
-            self.smart_model,
-            "\n".join(prompt_lines),
-            response_format=self._build_ensemble_schema(available_models),
-            num_predict=512,
-        )
-        if generation is None:
-            self._write_interaction_log(
-                interaction_kind="ensemble",
-                model_used=self.smart_model,
-                prompt="\n".join(prompt_lines),
-                response_text=None,
-                thinking_text=None,
-                parsed=None,
-                valid=False,
-            )
-            return None
-
-        try:
-            raw_text = generation["response_text"] or generation["thinking_text"] or ""
-            match = JSON_ARRAY_PATTERN.search(raw_text.strip())
-            if match is None:
-                self.consecutive_invalid_responses += 1
-                self._write_interaction_log(
-                    interaction_kind="ensemble",
-                    model_used=self.smart_model,
-                    prompt="\n".join(prompt_lines),
-                    response_text=generation["response_text"],
-                    thinking_text=generation["thinking_text"],
-                    parsed=None,
-                    valid=False,
-                )
-                return None
-            payload = json.loads(match.group(0))
-        except Exception:
+        if not proposals:
             self.consecutive_invalid_responses += 1
-            self._write_interaction_log(
-                interaction_kind="ensemble",
-                model_used=self.smart_model,
-                prompt="\n".join(prompt_lines),
-                response_text=generation["response_text"],
-                thinking_text=generation["thinking_text"],
-                parsed=None,
-                valid=False,
-            )
             return None
-
-        if not isinstance(payload, list):
-            self.consecutive_invalid_responses += 1
-            self._write_interaction_log(
-                interaction_kind="ensemble",
-                model_used=self.smart_model,
-                prompt="\n".join(prompt_lines),
-                response_text=generation["response_text"],
-                thinking_text=generation["thinking_text"],
-                parsed=None,
-                valid=False,
-            )
-            return None
-
-        validated: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
-        for item in payload:
-            suggestion = self._validate_suggestion(item, available_models)
-            if suggestion is None:
-                continue
-            signature = (
-                suggestion["model_name"],
-                json.dumps(suggestion["params"], sort_keys=True, separators=(",", ":")),
-            )
-            if signature in seen:
-                continue
-            seen.add(signature)
-            validated.append(suggestion)
-            if len(validated) == 3:
-                break
-
-        if not validated:
-            self.consecutive_invalid_responses += 1
-            self._write_interaction_log(
-                interaction_kind="ensemble",
-                model_used=self.smart_model,
-                prompt="\n".join(prompt_lines),
-                response_text=generation["response_text"],
-                thinking_text=generation["thinking_text"],
-                parsed=None,
-                valid=False,
-            )
-            return None
-
         self.consecutive_invalid_responses = 0
-        self._write_interaction_log(
-            interaction_kind="ensemble",
-            model_used=self.smart_model,
-            prompt="\n".join(prompt_lines),
-            response_text=generation["response_text"],
-            thinking_text=generation["thinking_text"],
-            parsed=validated,
-            valid=True,
-        )
-        return validated
+        return proposals
 
-    def _generate(
-        self,
-        model_name: str,
-        prompt: str,
-        response_format: Any | None = None,
-        num_predict: int = 256,
-    ) -> dict[str, Any] | None:
-        """Call the Ollama generate endpoint and return the raw response payload."""
-        try:
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.2,
-                    "num_predict": num_predict,
-                },
-            }
-            if response_format is not None:
-                payload["format"] = response_format
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json=payload,
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
-            response_payload = response.json()
-            response_text = response_payload.get("response", "")
-            thinking_text = response_payload.get("thinking", "")
-            return {
-                "response_text": response_text if isinstance(response_text, str) else str(response_text),
-                "thinking_text": thinking_text if isinstance(thinking_text, str) else str(thinking_text),
-                "payload": response_payload,
-            }
-        except Exception:
-            return None
-
-    def _extract_params(self, trial: dict[str, Any]) -> dict[str, Any]:
-        """Normalize trial parameters from either an in-memory dict or CSV-shaped record."""
-        raw_params = trial.get("params", trial.get("hyperparameters", {}))
-        if isinstance(raw_params, dict):
-            return raw_params
-        if isinstance(raw_params, str):
-            try:
-                parsed = json.loads(raw_params)
-                return parsed if isinstance(parsed, dict) else {}
-            except Exception:
-                return {}
-        return {}
-
-    def _write_interaction_log(
+    def generate_hypotheses(
         self,
         *,
-        interaction_kind: str,
-        model_used: str,
-        prompt: str,
-        response_text: str | None,
-        thinking_text: str | None,
-        parsed: Any,
-        valid: bool,
-    ) -> None:
-        """Persist one LLM prompt/response exchange as JSONL."""
-        if not self.log_interactions:
-            return
-        record = {
-            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "interaction_kind": interaction_kind,
-            "model_used": model_used,
-            "valid": bool(valid),
-            "prompt": prompt,
-            "response_text": response_text,
-            "thinking_text": thinking_text,
-            "parsed": parsed,
-        }
-        with self.interaction_log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+        research_brief: dict[str, Any],
+        current_best: dict[str, Any],
+        experiment_memory: dict[str, Any],
+        limit: int = 5,
+    ) -> list[str]:
+        return self.engine.generate_hypotheses(
+            research_brief=research_brief,
+            current_best=current_best,
+            experiment_memory=experiment_memory,
+            limit=limit,
+            model_hint=self.smart_model,
+        )
 
-    def _validate_suggestion(
+    def generate_feature_ideas(
         self,
-        payload: Any,
+        *,
+        research_brief: dict[str, Any],
+        current_best: dict[str, Any],
+        limit: int = 5,
+    ) -> list[str]:
+        return self.engine.generate_feature_ideas(
+            research_brief=research_brief,
+            current_best=current_best,
+            limit=limit,
+            model_hint=self.smart_model,
+        )
+
+    def generate_search_space_suggestions(
+        self,
+        *,
         available_models: dict[str, dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        """Validate a single {model_name, params} object against the search space."""
-        if not isinstance(payload, dict):
-            return None
+        research_brief: dict[str, Any],
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        return self.engine.generate_search_space_suggestions(
+            available_models=available_models,
+            research_brief=research_brief,
+            limit=limit,
+            model_hint=self.smart_model,
+        )
 
-        model_name = payload.get("model_name")
-        params = payload.get("params")
-        if not isinstance(model_name, str) or model_name not in available_models:
-            return None
-        if not isinstance(params, dict):
-            return None
+    def summarize_run(
+        self,
+        *,
+        research_brief: dict[str, Any],
+        final_metrics: dict[str, Any],
+        acceptance: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.engine.summarize_run(
+            research_brief=research_brief,
+            final_metrics=final_metrics,
+            acceptance=acceptance,
+            model_hint=self.smart_model,
+        )
 
-        search_space = available_models[model_name].get("search_space", {})
-        normalized_params: dict[str, Any] = {}
-        for param_name, param_value in params.items():
-            if not isinstance(param_name, str) or param_name not in search_space:
-                return None
-            normalized_value = self._validate_param_value(param_value, search_space[param_name])
-            if normalized_value is INVALID_PARAM:
-                return None
-            normalized_params[param_name] = normalized_value
-
-        return {
-            "model_name": model_name,
-            "params": normalized_params,
-        }
-
-    def _validate_param_value(self, value: Any, spec: dict[str, Any]) -> Any:
-        """Validate and normalize one parameter value for the configured search space."""
-        parameter_type = spec.get("type")
-        if parameter_type == "int":
-            coerced = self._coerce_number(value)
-            if coerced is None or coerced != int(coerced):
-                return INVALID_PARAM
-            normalized = int(coerced)
-            low = int(spec["low"])
-            high = int(spec["high"])
-            step = int(spec.get("step", 1))
-            if normalized < low or normalized > high:
-                return INVALID_PARAM
-            if step > 0 and (normalized - low) % step != 0:
-                return INVALID_PARAM
-            return normalized
-
-        if parameter_type == "float":
-            coerced = self._coerce_number(value)
-            if coerced is None:
-                return INVALID_PARAM
-            normalized = float(coerced)
-            low = float(spec["low"])
-            high = float(spec["high"])
-            if normalized < (low - 1e-12) or normalized > (high + 1e-12):
-                return INVALID_PARAM
-            return normalized
-
-        if parameter_type == "categorical":
-            choices = list(spec.get("choices", []))
-            return value if value in choices else INVALID_PARAM
-
-        return INVALID_PARAM
-
-    @staticmethod
-    def _coerce_number(value: Any) -> float | None:
-        """Convert numeric-like values into Python numbers."""
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return None
-            try:
-                return float(stripped)
-            except ValueError:
-                return None
-        return None
-
-    @staticmethod
-    def _format_metric(value: Any) -> str:
-        """Render metric values consistently for prompts."""
-        if value is None:
-            return "n/a"
-        try:
-            return f"{float(value):.4f}"
-        except (TypeError, ValueError):
-            return "n/a"
-
-    def _format_search_space(self, search_space: dict[str, dict[str, Any]]) -> str:
-        """Render a model search space in a compact single-line format."""
-        parts: list[str] = []
-        for name, spec in search_space.items():
-            parameter_type = spec.get("type")
-            if parameter_type == "int":
-                step = int(spec.get("step", 1))
-                parts.append(f"{name}=int[{spec['low']},{spec['high']},step={step}]")
-            elif parameter_type == "float":
-                suffix = ",log" if spec.get("log", False) else ""
-                parts.append(f"{name}=float[{spec['low']},{spec['high']}{suffix}]")
-            elif parameter_type == "categorical":
-                choices = ",".join(self._format_choice(choice) for choice in spec.get("choices", []))
-                parts.append(f"{name}=categorical[{choices}]")
-            else:
-                parts.append(f"{name}=unknown")
-        return "; ".join(parts)
-
-    @staticmethod
-    def _format_choice(value: Any) -> str:
-        """Render categorical values without Python-specific formatting."""
-        if value is None:
-            return "null"
-        if isinstance(value, str):
-            return value
-        return json.dumps(value)
-
-    def _build_proposal_schema(self, available_models: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """Build a JSON schema constraining single-model proposals."""
-        variants = [self._build_model_variant_schema(model_name, model_config) for model_name, model_config in available_models.items()]
-        if len(variants) == 1:
-            return variants[0]
-        return {"oneOf": variants}
-
-    def _build_ensemble_schema(self, available_models: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """Build a JSON schema constraining ensemble proposal arrays."""
-        return {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 3,
-            "items": self._build_proposal_schema(available_models),
-        }
-
-    def _build_model_variant_schema(self, model_name: str, model_config: dict[str, Any]) -> dict[str, Any]:
-        """Build a schema variant for a single model family."""
-        search_space = model_config.get("search_space", {})
-        property_schema = {
-            param_name: self._build_param_schema(param_spec)
-            for param_name, param_spec in search_space.items()
-        }
-        return {
-            "type": "object",
-            "properties": {
-                "model_name": {
-                    "type": "string",
-                    "const": model_name,
-                },
-                "params": {
-                    "type": "object",
-                    "properties": property_schema,
-                    "additionalProperties": False,
-                },
-            },
-            "required": ["model_name", "params"],
-            "additionalProperties": False,
-        }
-
-    def _build_param_schema(self, spec: dict[str, Any]) -> dict[str, Any]:
-        """Build a JSON schema fragment for one search-space parameter."""
-        parameter_type = spec.get("type")
-        if parameter_type == "int":
-            schema = {
-                "type": "integer",
-                "minimum": int(spec["low"]),
-                "maximum": int(spec["high"]),
-            }
-            step = int(spec.get("step", 1))
-            if step > 0:
-                schema["multipleOf"] = step
-            return schema
-
-        if parameter_type == "float":
-            return {
-                "type": "number",
-                "minimum": float(spec["low"]),
-                "maximum": float(spec["high"]),
-            }
-
-        if parameter_type == "categorical":
-            enum_values = []
-            for choice in spec.get("choices", []):
-                enum_values.append(choice)
-            return {"enum": enum_values}
-
-        return {}
-
-    @staticmethod
-    def _emit_log(message: str) -> None:
-        """Log visibly even when the stdlib logging system is not configured."""
-        root_logger = logging.getLogger()
-        if root_logger.handlers:
-            root_logger.info(message)
-            return
-        print(message)
+    def _resolve_model_hints(self) -> tuple[str | None, str | None]:
+        backend_mode = str(self.llm_config.get("backend_mode", "ollama")).lower()
+        if backend_mode == "openai":
+            model_name = str(self.llm_config.get("openai", {}).get("model", "gpt-5.1-mini"))
+            return model_name, model_name
+        if backend_mode == "hybrid":
+            primary = str(self.llm_config.get("hybrid", {}).get("primary", "ollama")).lower()
+            if primary == "openai":
+                model_name = str(self.llm_config.get("openai", {}).get("model", "gpt-5.1-mini"))
+                return model_name, model_name
+        ollama_config = self.llm_config.get("ollama", {})
+        fast_model = str(ollama_config.get("fast_model", ollama_config.get("model", "qwen3:4b")))
+        smart_model = str(ollama_config.get("smart_model", ollama_config.get("model", fast_model)))
+        return fast_model, smart_model

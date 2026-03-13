@@ -16,6 +16,16 @@ from typing import Any
 import optuna
 import pandas as pd
 
+from llm_backend import get_llm_config
+from research_protocol import (
+    build_acceptance_decision,
+    build_config_signature,
+    load_human_research_brief,
+    load_or_initialize_experiment_memory,
+    record_experiment_memory,
+    should_skip_duplicate_proposal,
+    trial_budget_status,
+)
 from train import (
     EngineeringValidator,
     build_stacking_ensemble,
@@ -55,6 +65,8 @@ OPTUNA_RESULTS_COLUMNS = [
     "suspicious_count",
     "durability_caution_count",
     "dataset_anomaly_count",
+    "trial_runtime_seconds",
+    "budget_status",
 ]
 
 SEARCH_STATE_BEST_RESULT_FILENAME = "search_state_best_result.json"
@@ -62,6 +74,8 @@ SEARCH_STATE_BEST_MODEL_FILENAME = "search_state_best_model.pkl"
 FINAL_BEST_RESULT_FILENAME = "best_search_result.json"
 FINAL_BEST_MODEL_FILENAME = "best_search_model.pkl"
 FINAL_METRICS_FILENAME = "final_metrics.json"
+FINAL_ACCEPTANCE_FILENAME = "final_acceptance.json"
+EXPERIMENT_MEMORY_FILENAME = "experiment_memory.json"
 
 
 def load_json_artifact(path: Path) -> dict[str, Any]:
@@ -277,6 +291,8 @@ def build_trial_record(
     result: dict[str, Any] | None,
     selection_status: str,
     error_message: str | None = None,
+    trial_runtime_seconds: float | None = None,
+    budget_status: str | None = None,
 ) -> dict[str, Any]:
     """Build a flat record suitable for CSV export."""
     base_record = {
@@ -287,6 +303,8 @@ def build_trial_record(
         "selection_status": selection_status,
         "validation_verdict": None if result is None else result["validation_verdict"],
         "error_message": error_message,
+        "trial_runtime_seconds": trial_runtime_seconds,
+        "budget_status": budget_status,
     }
     if result is None:
         base_record.update(
@@ -331,6 +349,14 @@ def build_trial_record(
         }
     )
     return base_record
+
+
+def write_final_acceptance_artifact(outputs_dir: Path, brief: dict[str, Any]) -> dict[str, Any]:
+    """Write final acceptance status derived from final_metrics.json as source of truth."""
+    final_metrics = load_json_artifact(outputs_dir / FINAL_METRICS_FILENAME)
+    decision = build_acceptance_decision(final_metrics=final_metrics, brief=brief)
+    save_json_artifact(outputs_dir / FINAL_ACCEPTANCE_FILENAME, decision)
+    return decision
 
 
 def initialize_optuna_results_csv(csv_path: Path) -> None:
@@ -1029,10 +1055,26 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     config = load_config()
     set_global_seed(int(config["experiment"]["random_seed"]))
     outputs_dir = get_outputs_dir(config)
+    project_root = Path(__file__).resolve().parent
+    brief_relative_path = str(config.get("search", {}).get("research_brief_path", "program.md"))
+    brief_path = project_root / brief_relative_path
+    if not brief_path.exists():
+        fallback_brief = project_root / "research_brief.md"
+        if fallback_brief.exists():
+            brief_path = fallback_brief
+    brief = load_human_research_brief(brief_path)
+    log_status(
+        "INFO research_brief_loaded | "
+        f"path={brief_path} | acceptance_metric={brief['acceptance_metric']} | "
+        f"min_improvement_pct={brief['min_improvement_pct']:.4f}"
+    )
     min_runtime_minutes = float(config["search"].get("min_runtime_minutes", 0.0))
     if min_runtime_minutes < 0.0:
         raise ValueError("search.min_runtime_minutes must be non-negative.")
     min_runtime_seconds = min_runtime_minutes * 60.0
+    max_trial_seconds = float(config["search"].get("max_trial_seconds", 0.0))
+    if max_trial_seconds < 0.0:
+        raise ValueError("search.max_trial_seconds must be non-negative.")
     search_start_time = time.perf_counter()
     baseline_metrics_path = outputs_dir / "baseline_metrics.json"
     baseline_metrics = load_json_artifact(baseline_metrics_path)
@@ -1041,6 +1083,20 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     x_train, x_test, y_train, y_test = split_dataset(data, config)
     validator = EngineeringValidator.from_config(config)
     available_models = get_available_model_configs(config)
+    required_families = [family for family in brief.get("required_model_families", []) if family in available_models]
+    if required_families:
+        available_models = {family: available_models[family] for family in required_families}
+        log_status(
+            "INFO research_surface_constrained | "
+            f"required_model_families={','.join(required_families)}"
+        )
+    elif brief.get("required_model_families"):
+        log_status("WARNING research_brief_required_families_not_available | falling back to enabled config models")
+
+    memory_path = outputs_dir / EXPERIMENT_MEMORY_FILENAME
+    historical_memory = load_or_initialize_experiment_memory(memory_path)
+    run_id = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    current_run_signatures: set[tuple[str, str]] = set()
 
     best_result = initialize_search_state(outputs_dir, baseline_metrics)
     current_best_composite = float(best_result["composite_score"])
@@ -1055,7 +1111,7 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     study = optuna.create_study(direction="maximize", study_name="autocivil_search")
     trial_records: list[dict[str, Any]] = []
     # LLM PROPOSAL
-    llm_config = config["search"].get("llm_proposals", {})
+    llm_config = get_llm_config(config)
     llm_proposer = None
     if llm_config.get("enabled", False):
         from llm_proposer import LLMProposer
@@ -1109,6 +1165,7 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     current_best=best_result,
                     use_smart_model=use_smart_model,
                     search_progress=progress_context,
+                    research_brief=brief,
                 )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records) and not use_smart_model:
                     log_status(
@@ -1121,10 +1178,22 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                         current_best=best_result,
                         use_smart_model=True,
                         search_progress=progress_context,
+                        research_brief=brief,
                     )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
                     log_status(
                         "INFO llm_proposal_skipped_duplicate | "
+                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
+                    )
+                    suggestion = None
+                if suggestion and should_skip_duplicate_proposal(
+                    model_name=str(suggestion["model_name"]),
+                    params=dict(suggestion["params"]),
+                    current_run_signatures=current_run_signatures,
+                    memory_payload=historical_memory,
+                ):
+                    log_status(
+                        "INFO llm_proposal_skipped_historical_duplicate | "
                         f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
                     )
                     suggestion = None
@@ -1147,6 +1216,7 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     trial_history=trial_records[-proposal_interval:],
                     available_models=available_models,
                     current_best=best_result,
+                    research_brief=brief,
                 )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
                     log_status(
@@ -1158,10 +1228,22 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                         available_models=available_models,
                         current_best=best_result,
                         use_smart_model=True,
+                        research_brief=brief,
                     )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
                     log_status(
                         "INFO llm_proposal_skipped_duplicate | "
+                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
+                    )
+                    suggestion = None
+                if suggestion and should_skip_duplicate_proposal(
+                    model_name=str(suggestion["model_name"]),
+                    params=dict(suggestion["params"]),
+                    current_run_signatures=current_run_signatures,
+                    memory_payload=historical_memory,
+                ):
+                    log_status(
+                        "INFO llm_proposal_skipped_historical_duplicate | "
                         f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
                     )
                     suggestion = None
@@ -1177,6 +1259,38 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     log_status("WARNING llm_proposer_disabled | 3_consecutive_failures")
         trial = study.ask()
         model_name, display_name, params = sample_model_configuration(trial, available_models)
+        trial_signature = build_config_signature(model_name, params)
+        if should_skip_duplicate_proposal(
+            model_name=model_name,
+            params=params,
+            current_run_signatures=current_run_signatures,
+            memory_payload=historical_memory,
+        ):
+            study.tell(trial, -1e9)
+            trial_record = build_trial_record(
+                trial_number,
+                model_name,
+                display_name,
+                params,
+                None,
+                "duplicate_skipped",
+                error_message="Duplicate model/parameter signature from prior memory or current run.",
+            )
+            trial_records.append(trial_record)
+            append_optuna_trial_record(optuna_results_path, trial_record)
+            record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
+            timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+            append_research_log(
+                research_log_path,
+                (
+                    f"[{timestamp}] Trial {trial_number:03d} | Model: {display_name} | "
+                    f"{format_hyperparameters(params)} | Validation: SKIPPED | Duplicate signature"
+                ),
+            )
+            continue
+
+        current_run_signatures.add(trial_signature)
+        trial_started_at = time.perf_counter()
         try:
             model, result = evaluate_candidate(
                 model_name,
@@ -1188,8 +1302,43 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                 validator,
                 config,
             )
+            trial_elapsed_seconds = time.perf_counter() - trial_started_at
+            budget_state = trial_budget_status(
+                elapsed_seconds=trial_elapsed_seconds,
+                max_trial_seconds=max_trial_seconds,
+            )
             verdict = result["validation_verdict"]
-            if verdict == "FAIL":
+            if budget_state == "budget_exceeded":
+                selection_status = "budget_exceeded"
+                study.tell(trial, -1e9)
+                trial_record = build_trial_record(
+                    trial_number,
+                    model_name,
+                    display_name,
+                    params,
+                    result,
+                    selection_status,
+                    error_message=(
+                        f"Trial runtime {trial_elapsed_seconds:.2f}s exceeded max_trial_seconds="
+                        f"{max_trial_seconds:.2f}s."
+                    ),
+                    trial_runtime_seconds=trial_elapsed_seconds,
+                    budget_status=budget_state,
+                )
+                trial_records.append(trial_record)
+                append_optuna_trial_record(optuna_results_path, trial_record)
+                record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
+                timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+                append_research_log(
+                    research_log_path,
+                    (
+                        f"[{timestamp}] Trial {trial_number:03d} | Model: {display_name} | "
+                        f"{format_hyperparameters(params)} | RMSE: {result['rmse']:.2f} | "
+                        f"R2: {result['r2']:.2f} | Composite: {result['composite_score']:.3f} | "
+                        f"Validation: {verdict} | Budget exceeded ({trial_elapsed_seconds:.2f}s)"
+                    ),
+                )
+            elif verdict == "FAIL":
                 selection_status = "rejected_validation_fail"
                 study.tell(trial, -1e9)
                 trial_record = build_trial_record(
@@ -1199,9 +1348,12 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     params,
                     result,
                     selection_status,
+                    trial_runtime_seconds=trial_elapsed_seconds,
+                    budget_status=budget_state,
                 )
                 trial_records.append(trial_record)
                 append_optuna_trial_record(optuna_results_path, trial_record)
+                record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
                 timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                 append_research_log(
                     research_log_path,
@@ -1252,9 +1404,12 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     params,
                     result,
                     selection_status,
+                    trial_runtime_seconds=trial_elapsed_seconds,
+                    budget_status=budget_state,
                 )
                 trial_records.append(trial_record)
                 append_optuna_trial_record(optuna_results_path, trial_record)
+                record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
                 timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                 status_label = "New best" if improved else "No improvement"
                 append_research_log(
@@ -1268,6 +1423,11 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                 )
             sync_check(outputs_dir)
         except Exception as exc:
+            trial_elapsed_seconds = time.perf_counter() - trial_started_at
+            budget_state = trial_budget_status(
+                elapsed_seconds=trial_elapsed_seconds,
+                max_trial_seconds=max_trial_seconds,
+            )
             error_text = str(exc)
             study.tell(trial, -1e9)
             trial_record = build_trial_record(
@@ -1278,9 +1438,12 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                 None,
                 "error",
                 error_message=error_text,
+                trial_runtime_seconds=trial_elapsed_seconds,
+                budget_status=budget_state,
             )
             trial_records.append(trial_record)
             append_optuna_trial_record(optuna_results_path, trial_record)
+            record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
             timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
             append_research_log(
                 research_log_path,
@@ -1322,6 +1485,12 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
             validator,
         )
     final_best_result = finalize_search_artifacts(outputs_dir, baseline_metrics)
+    acceptance = write_final_acceptance_artifact(outputs_dir, brief)
+    log_status(
+        "INFO final_acceptance | "
+        f"accepted={acceptance['accepted']} | measured_improvement_pct={acceptance['measured_improvement_pct']:.4f} | "
+        f"required_min_improvement_pct={acceptance['required_min_improvement_pct']:.4f}"
+    )
     return final_best_result
 
 

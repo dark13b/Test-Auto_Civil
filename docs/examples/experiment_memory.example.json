@@ -1,0 +1,61 @@
+{
+  "accepted_experiments": [
+    {
+      "composite_score": 0.9312,
+      "experiment_id": "confirm-scout-004-lgbmregressor-balanced",
+      "model_name": "LGBMRegressor",
+      "proposal_family": "LGBMRegressor-balanced"
+    }
+  ],
+  "runs": [
+    {
+      "run_id": "20260313T090000",
+      "started_at": "2026-03-13T09:00:00+03:00",
+      "trials": [
+        {
+          "composite_score": 0.9244,
+          "confirm_improvement_pct": null,
+          "experiment_id": "scout-001-lgbmregressor-balanced",
+          "model_name": "LGBMRegressor",
+          "params": {
+            "learning_rate": 0.05,
+            "n_estimators": 500,
+            "num_leaves": 39
+          },
+          "proposal_family": "LGBMRegressor-balanced",
+          "scout_improvement_pct": 1.84,
+          "selection_status": "scout_promising",
+          "signature": [
+            "LGBMRegressor",
+            "{\"learning_rate\":0.05,\"n_estimators\":500,\"num_leaves\":39}"
+          ],
+          "stage": "scout",
+          "trial_number": 1,
+          "validation_verdict": "WARN"
+        },
+        {
+          "composite_score": 0.9312,
+          "confirm_improvement_pct": 2.61,
+          "experiment_id": "confirm-scout-001-lgbmregressor-balanced",
+          "model_name": "LGBMRegressor",
+          "params": {
+            "learning_rate": 0.05,
+            "n_estimators": 500,
+            "num_leaves": 39
+          },
+          "proposal_family": "LGBMRegressor-balanced",
+          "scout_improvement_pct": null,
+          "selection_status": "kept",
+          "signature": [
+            "LGBMRegressor",
+            "{\"learning_rate\":0.05,\"n_estimators\":500,\"num_leaves\":39}"
+          ],
+          "stage": "confirm",
+          "trial_number": 2,
+          "validation_verdict": "WARN"
+        }
+      ]
+    }
+  ],
+  "schema_version": 2
+}

@@ -1,0 +1,12 @@
+{
+  "backend_mode": "hybrid",
+  "proposal_backend": "ollama",
+  "transport": "http",
+  "model": "qwen3:8b",
+  "allow_deterministic_fallback": true,
+  "summary_enabled": true,
+  "notes": [
+    "If Ollama is unavailable, the hybrid backend falls back to OpenAI when configured.",
+    "If neither backend is available and deterministic fallback is allowed, research_loop.py falls back to research_lab.py."
+  ]
+}
