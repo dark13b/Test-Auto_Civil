@@ -19,7 +19,9 @@ import pandas as pd
 from llm_backend import get_llm_config
 from research_protocol import (
     build_acceptance_decision,
+    build_family_state_summary,
     build_config_signature,
+    gate_proposal,
     load_human_research_brief,
     load_or_initialize_experiment_memory,
     record_experiment_memory,
@@ -228,6 +230,45 @@ def build_llm_progress_context(
         "family_counts": family_counts,
         "underexplored_families": underexplored_families,
     }
+
+
+def build_search_family_state(
+    *,
+    available_models: dict[str, dict[str, Any]],
+    best_result: dict[str, Any],
+    trial_records: list[dict[str, Any]],
+    historical_memory: dict[str, Any],
+    llm_config: dict[str, Any],
+) -> dict[str, Any]:
+    return build_family_state_summary(
+        available_models=available_models,
+        current_best=best_result,
+        trial_history=trial_records,
+        memory_payload=historical_memory,
+        diversity_settings=llm_config.get("diversity", {}),
+    )
+
+
+def gate_search_candidate(
+    *,
+    model_name: str,
+    params: dict[str, Any],
+    available_models: dict[str, dict[str, Any]],
+    current_run_signatures: set[tuple[str, str]],
+    historical_memory: dict[str, Any],
+    trial_records: list[dict[str, Any]],
+    family_state: dict[str, Any],
+    llm_config: dict[str, Any],
+) -> dict[str, Any]:
+    return gate_proposal(
+        proposal={"model_name": model_name, "params": params},
+        available_models=available_models,
+        current_run_signatures=current_run_signatures,
+        memory_payload=historical_memory,
+        trial_history=trial_records,
+        family_state=family_state,
+        duplicate_settings=llm_config.get("duplicate_similarity_thresholds", {}),
+    )
 
 
 def initialize_research_log(log_path: Path, baseline_metrics: dict[str, Any]) -> None:
@@ -1120,7 +1161,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
         if llm_proposer.is_available():
             log_status(
                 "INFO llm_proposer_ready | "
-                f"fast={llm_proposer.fast_model} | smart={llm_proposer.smart_model} | "
+                f"default={llm_proposer.fast_model} | smart={llm_proposer.smart_model} | "
+                f"compact_fallback={llm_proposer.compact_model} | "
                 f"log_path={llm_proposer.interaction_log_path}"
             )
         else:
@@ -1159,6 +1201,13 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     f"remaining_min={progress_context['remaining_minutes']:.1f} | "
                     f"model_used={'smart' if use_smart_model else 'fast'}"
                 )
+                family_state = build_search_family_state(
+                    available_models=available_models,
+                    best_result=best_result,
+                    trial_records=trial_records,
+                    historical_memory=historical_memory,
+                    llm_config=llm_config,
+                )
                 suggestion = llm_proposer.propose(
                     trial_history=trial_records[-50:],
                     available_models=available_models,
@@ -1166,6 +1215,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                     use_smart_model=use_smart_model,
                     search_progress=progress_context,
                     research_brief=brief,
+                    experiment_memory=historical_memory,
+                    diversity_state={"historic_family_counts": progress_context.get("family_counts", {})},
                 )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records) and not use_smart_model:
                     log_status(
@@ -1179,6 +1230,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                         use_smart_model=True,
                         search_progress=progress_context,
                         research_brief=brief,
+                        experiment_memory=historical_memory,
+                        diversity_state={"historic_family_counts": progress_context.get("family_counts", {})},
                     )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
                     log_status(
@@ -1186,6 +1239,23 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                         f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
                     )
                     suggestion = None
+                if suggestion:
+                    gate_result = gate_search_candidate(
+                        model_name=str(suggestion["model_name"]),
+                        params=dict(suggestion["params"]),
+                        available_models=available_models,
+                        current_run_signatures=current_run_signatures,
+                        historical_memory=historical_memory,
+                        trial_records=trial_records,
+                        family_state=family_state,
+                        llm_config=llm_config,
+                    )
+                    if not gate_result["accepted"]:
+                        log_status(
+                            "INFO llm_proposal_rejected | "
+                            f"model={suggestion['model_name']} | reason={gate_result['reason']['code']}"
+                        )
+                        suggestion = None
                 if suggestion and should_skip_duplicate_proposal(
                     model_name=str(suggestion["model_name"]),
                     params=dict(suggestion["params"]),
@@ -1212,11 +1282,26 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
         elif llm_proposer is not None:
             proposal_interval = int(llm_config.get("interval_trials", 15))
             if proposal_interval > 0 and trial_number % proposal_interval == 0 and trial_number > 0:
+                family_state = build_search_family_state(
+                    available_models=available_models,
+                    best_result=best_result,
+                    trial_records=trial_records,
+                    historical_memory=historical_memory,
+                    llm_config=llm_config,
+                )
                 suggestion = llm_proposer.propose(
                     trial_history=trial_records[-proposal_interval:],
                     available_models=available_models,
                     current_best=best_result,
                     research_brief=brief,
+                    experiment_memory=historical_memory,
+                    diversity_state={"historic_family_counts": build_llm_progress_context(
+                        elapsed_seconds=elapsed_seconds,
+                        runtime_target_seconds=min_runtime_seconds,
+                        interaction_index=llm_interaction_count,
+                        trial_records=trial_records,
+                        available_models=available_models,
+                    )["family_counts"]},
                 )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
                     log_status(
@@ -1229,6 +1314,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                         current_best=best_result,
                         use_smart_model=True,
                         research_brief=brief,
+                        experiment_memory=historical_memory,
+                        diversity_state={"historic_family_counts": {}},
                     )
                 if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
                     log_status(
@@ -1236,6 +1323,23 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                         f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
                     )
                     suggestion = None
+                if suggestion:
+                    gate_result = gate_search_candidate(
+                        model_name=str(suggestion["model_name"]),
+                        params=dict(suggestion["params"]),
+                        available_models=available_models,
+                        current_run_signatures=current_run_signatures,
+                        historical_memory=historical_memory,
+                        trial_records=trial_records,
+                        family_state=family_state,
+                        llm_config=llm_config,
+                    )
+                    if not gate_result["accepted"]:
+                        log_status(
+                            "INFO llm_proposal_rejected | "
+                            f"model={suggestion['model_name']} | reason={gate_result['reason']['code']}"
+                        )
+                        suggestion = None
                 if suggestion and should_skip_duplicate_proposal(
                     model_name=str(suggestion["model_name"]),
                     params=dict(suggestion["params"]),
@@ -1260,32 +1364,38 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
         trial = study.ask()
         model_name, display_name, params = sample_model_configuration(trial, available_models)
         trial_signature = build_config_signature(model_name, params)
+        family_state = build_search_family_state(
+            available_models=available_models,
+            best_result=best_result,
+            trial_records=trial_records,
+            historical_memory=historical_memory,
+            llm_config=llm_config,
+        )
+        gate_result = gate_search_candidate(
+            model_name=model_name,
+            params=params,
+            available_models=available_models,
+            current_run_signatures=current_run_signatures,
+            historical_memory=historical_memory,
+            trial_records=trial_records,
+            family_state=family_state,
+            llm_config=llm_config,
+        )
+        if not gate_result["accepted"]:
+            log_status(
+                "INFO optuna_candidate_rejected_pre_execution | "
+                f"model={model_name} | reason={gate_result['reason']['code']}"
+            )
+            continue
         if should_skip_duplicate_proposal(
             model_name=model_name,
             params=params,
             current_run_signatures=current_run_signatures,
             memory_payload=historical_memory,
         ):
-            study.tell(trial, -1e9)
-            trial_record = build_trial_record(
-                trial_number,
-                model_name,
-                display_name,
-                params,
-                None,
-                "duplicate_skipped",
-                error_message="Duplicate model/parameter signature from prior memory or current run.",
-            )
-            trial_records.append(trial_record)
-            append_optuna_trial_record(optuna_results_path, trial_record)
-            record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
-            timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-            append_research_log(
-                research_log_path,
-                (
-                    f"[{timestamp}] Trial {trial_number:03d} | Model: {display_name} | "
-                    f"{format_hyperparameters(params)} | Validation: SKIPPED | Duplicate signature"
-                ),
+            log_status(
+                "INFO optuna_candidate_duplicate_pre_execution | "
+                f"model={model_name} | params={format_hyperparameters(params)}"
             )
             continue
 

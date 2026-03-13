@@ -1,67 +1,347 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from proposal_engine import ProposalEngine
 
 
-class StubBackend:
-    def __init__(self, response_text: str, *, available: bool = True, backend_name: str = "ollama") -> None:
-        self._response_text = response_text
+class RecordingBackend:
+    def __init__(self, responses: list[dict], *, available: bool = True, backend_name: str = "ollama") -> None:
+        self._responses = list(responses)
         self._available = available
         self.backend_name = backend_name
+        self.prompts: list[str] = []
+        self.models: list[str | None] = []
 
     def is_available(self) -> bool:
         return self._available
 
-    def generate_text(self, prompt: str, **_: object) -> dict:
-        return {
-            "backend": self.backend_name,
-            "model": "stub-model",
-            "text": self._response_text,
-            "prompt": prompt,
-        }
+    def generate_text(self, prompt: str, **kwargs: object) -> dict:
+        self.prompts.append(prompt)
+        self.models.append(kwargs.get("model"))
+        if not self._responses:
+            raise AssertionError("No stub response remaining for generate_text()")
+        payload = dict(self._responses.pop(0))
+        payload.setdefault("backend", self.backend_name)
+        payload.setdefault("model", kwargs.get("model") or "stub-model")
+        payload.setdefault("text", "")
+        return payload
 
 
 class ProposalEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.available_models = {
-            "RandomForestRegressor": {
-                "display_name": "RandomForest",
+            "ModelFamilyA": {
+                "display_name": "Model A",
                 "search_space": {
-                    "n_estimators": {"type": "int", "low": 100, "high": 500, "step": 100},
-                    "max_depth": {"type": "categorical", "choices": [None, 4, 8]},
+                    "depth": {"type": "int", "low": 1, "high": 8},
+                    "learning_rate": {"type": "float", "low": 0.01, "high": 0.3},
                 },
-            }
+            },
+            "ModelFamilyB": {
+                "display_name": "Model B",
+                "search_space": {
+                    "alpha": {"type": "float", "low": 0.01, "high": 1.0},
+                },
+            },
         }
-        self.context = {
-            "research_brief": {"goal": "Improve composite_score"},
-            "current_best": {"model_name": "RandomForestRegressor", "composite_score": 0.90},
-            "experiment_memory": {"runs": []},
-            "diversity_state": {"historic_family_counts": {}},
-            "proposal_count": 2,
+        self.research_brief = {
+            "goal": "Improve composite_score",
+            "acceptance_metric": "composite_score",
+            "min_improvement_pct": 0.5,
         }
+        self.current_best = {"model_name": "ModelFamilyA", "composite_score": 0.90}
+        self.experiment_memory = {"runs": [], "accepted_experiments": []}
+        self.search_progress = {"phase": "scout"}
 
-    def test_generate_experiment_proposals_returns_validated_proposals(self) -> None:
-        backend = StubBackend(
-            '[{"model_name":"RandomForestRegressor","params":{"n_estimators":200,"max_depth":4},"proposal_family":"tree-search","hypothesis":"tune depth"}]'
+    def _make_engine(
+        self,
+        backend: RecordingBackend,
+        *,
+        llm_config: dict | None = None,
+        log_path: Path | None = None,
+    ) -> ProposalEngine:
+        return ProposalEngine(
+            backend=backend,
+            interaction_log_path=log_path,
+            log_interactions=log_path is not None,
+            llm_config=llm_config or {
+                "compact_prompt_models": ["qwen3:4b"],
+                "enable_regeneration_on_reject": True,
+                "max_regeneration_attempts": 1,
+                "duplicate_similarity_thresholds": {
+                    "numeric_tolerance": 0.05,
+                    "float_round_digits": 4,
+                },
+                "temporarily_block_saturated_families": True,
+                "diversity": {"max_family_share": 0.35},
+            },
         )
-        engine = ProposalEngine(backend=backend)
 
-        proposals = engine.generate_experiment_proposals(
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    @staticmethod
+    def _build_trial_history(count: int) -> list[dict]:
+        history: list[dict] = []
+        for index in range(1, count + 1):
+            history.append(
+                {
+                    "trial_number": index,
+                    "experiment_id": f"trial-{index}",
+                    "model_name": "ModelFamilyA" if index % 2 else "ModelFamilyB",
+                    "proposal_family": "family-a" if index % 2 else "family-b",
+                    "hyperparameters": json.dumps(
+                        {
+                            "depth": min(index, 8),
+                            "learning_rate": round(0.02 * index, 4),
+                        }
+                    ),
+                    "composite_score": 0.80 + (index / 100.0),
+                    "validation_verdict": "WARN",
+                }
+            )
+        return history
+
+    def test_prompt_builder_uses_schema_only_example_and_no_anchored_real_model_example(self) -> None:
+        backend = RecordingBackend([{"response_text": "not-json"}])
+        engine = self._make_engine(backend)
+
+        engine.generate_experiment_proposals(
             available_models=self.available_models,
-            **self.context,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=1,
+            trial_history=self._build_trial_history(2),
+            search_progress=self.search_progress,
+            model_hint="qwen3:4b",
         )
+
+        prompt = backend.prompts[0]
+        self.assertIn('{"model_name":"MODEL","params":{}}', prompt)
+        self.assertNotIn('{"model_name":"XGBRegressor"', prompt)
+        self.assertNotIn('{"model_name":"LGBMRegressor"', prompt)
+
+    def test_qwen4b_uses_compact_prompt_mode_and_only_last_five_trials(self) -> None:
+        backend = RecordingBackend([{"response_text": "not-json"}])
+        engine = self._make_engine(backend)
+
+        engine.generate_experiment_proposals(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=1,
+            trial_history=self._build_trial_history(7),
+            search_progress=self.search_progress,
+            model_hint="qwen3:4b",
+        )
+
+        prompt = backend.prompts[0]
+        self.assertEqual(engine.last_interaction_summary["prompt_variant"], "compact")
+        self.assertIn("trial-7", prompt)
+        self.assertIn("trial-3", prompt)
+        self.assertNotIn("trial-2", prompt)
+        self.assertNotIn("trial-1", prompt)
+        self.assertIn("Think step by step internally, then output ONLY the final JSON object.", prompt)
+
+    def test_qwen8b_uses_rich_prompt_mode(self) -> None:
+        backend = RecordingBackend([{"response_text": "not-json"}])
+        engine = self._make_engine(backend)
+
+        engine.generate_experiment_proposals(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=1,
+            trial_history=self._build_trial_history(7),
+            search_progress=self.search_progress,
+            model_hint="qwen3:8b",
+        )
+
+        prompt = backend.prompts[0]
+        self.assertEqual(engine.last_interaction_summary["prompt_variant"], "rich")
+        self.assertIn("trial-1", prompt)
+        self.assertIn("Family state", prompt)
+
+    def test_response_extraction_prefers_response_text_when_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "llm_interactions.jsonl"
+            backend = RecordingBackend(
+                [
+                    {
+                        "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"try depth"}',
+                        "thinking_text": '{"model_name":"ModelFamilyB","params":{"alpha":0.2},"proposal_family":"family-b","hypothesis":"ignored"}',
+                    }
+                ]
+            )
+            engine = self._make_engine(backend, log_path=log_path)
+
+            proposals = engine.generate_experiment_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory=self.experiment_memory,
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:8b",
+            )
+            record = self._read_jsonl(log_path)[0]
 
         self.assertEqual(len(proposals), 1)
-        self.assertEqual(proposals[0]["model_name"], "RandomForestRegressor")
-        self.assertEqual(proposals[0]["params"]["n_estimators"], 200)
+        self.assertEqual(proposals[0]["model_name"], "ModelFamilyA")
+        self.assertEqual(record["extracted_from_channel"], "response")
 
-    def test_generate_experiment_proposals_returns_empty_list_for_invalid_json(self) -> None:
-        backend = StubBackend("not-json")
-        engine = ProposalEngine(backend=backend)
+    def test_response_extraction_falls_back_to_thinking_text_and_logs_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "llm_interactions.jsonl"
+            backend = RecordingBackend(
+                [
+                    {
+                        "model": "qwen3:4b",
+                        "response_text": "",
+                        "thinking_text": '{"model_name":"ModelFamilyA","params":{"depth":4,"learning_rate":0.12},"proposal_family":"family-a","hypothesis":"use thinking"}',
+                    }
+                ]
+            )
+            engine = self._make_engine(backend, log_path=log_path)
+
+            with self.assertLogs("proposal_engine", level="WARNING") as captured:
+                proposals = engine.generate_experiment_proposals(
+                    available_models=self.available_models,
+                    research_brief=self.research_brief,
+                    current_best=self.current_best,
+                    experiment_memory=self.experiment_memory,
+                    diversity_state={},
+                    proposal_count=1,
+                    model_hint="qwen3:4b",
+                )
+                record = self._read_jsonl(log_path)[0]
+
+        self.assertEqual(len(proposals), 1)
+        self.assertIn("qwen3 response was empty; extracted from thinking_text", "\n".join(captured.output))
+        self.assertEqual(record["extracted_from_channel"], "thinking")
+
+    def test_json_repair_success_marks_repair_used(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "llm_interactions.jsonl"
+            backend = RecordingBackend(
+                [
+                    {
+                        "response_text": '{"model_name":"ModelFamilyA","params":{"depth":5,"learning_rate":0.14},"proposal_family":"family-a","hypothesis":"repair me"',
+                    }
+                ]
+            )
+            engine = self._make_engine(backend, log_path=log_path)
+
+            proposals = engine.generate_experiment_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory=self.experiment_memory,
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:8b",
+            )
+            record = self._read_jsonl(log_path)[0]
+
+        self.assertEqual(len(proposals), 1)
+        self.assertTrue(record["repair_used"])
+        self.assertEqual(record["extracted_from_channel"], "repaired_json")
+
+    def test_duplicate_rejection_logs_reason_and_triggers_single_regeneration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "llm_interactions.jsonl"
+            backend = RecordingBackend(
+                [
+                    {
+                        "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"duplicate"}',
+                    },
+                    {
+                        "response_text": '{"model_name":"ModelFamilyB","params":{"alpha":0.4},"proposal_family":"family-b","hypothesis":"novel"}',
+                    },
+                ]
+            )
+            engine = self._make_engine(backend, log_path=log_path)
+
+            proposals = engine.generate_experiment_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory={
+                    "runs": [
+                        {
+                            "run_id": "old-run",
+                            "trials": [
+                                {
+                                    "model_name": "ModelFamilyA",
+                                    "params": {"depth": 3, "learning_rate": 0.1},
+                                    "proposal_family": "family-a",
+                                    "composite_score": 0.88,
+                                    "validation_verdict": "WARN",
+                                    "signature": [
+                                        "ModelFamilyA",
+                                        '{"depth":3,"learning_rate":0.1}',
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                    "accepted_experiments": [],
+                },
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:8b",
+            )
+            records = self._read_jsonl(log_path)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["model_name"], "ModelFamilyB")
+        self.assertEqual(len(records), 2)
+        self.assertTrue(records[0]["duplicate_rejected"])
+        self.assertEqual(records[0]["rejection_reason"]["code"], "exact_duplicate")
+        self.assertTrue(records[0]["regeneration_attempted"])
+
+    def test_ambiguous_json_is_not_silently_accepted(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3}} {"model_name":"ModelFamilyB","params":{"alpha":0.2}}',
+                }
+            ]
+        )
+        engine = self._make_engine(
+            backend,
+            llm_config={
+                "compact_prompt_models": ["qwen3:4b"],
+                "enable_regeneration_on_reject": False,
+                "max_regeneration_attempts": 0,
+                "duplicate_similarity_thresholds": {
+                    "numeric_tolerance": 0.05,
+                    "float_round_digits": 4,
+                },
+                "temporarily_block_saturated_families": True,
+                "diversity": {"max_family_share": 0.35},
+            },
+        )
 
         proposals = engine.generate_experiment_proposals(
             available_models=self.available_models,
-            **self.context,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=1,
+            model_hint="qwen3:8b",
         )
 
         self.assertEqual(proposals, [])

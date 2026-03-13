@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import math
 import pprint
 import re
 from pathlib import Path
@@ -289,6 +290,319 @@ def should_skip_duplicate_proposal(
             ):
                 return True
     return False
+
+
+def _normalize_trial_for_family_state(trial_record: dict[str, Any]) -> dict[str, Any] | None:
+    model_name = str(trial_record.get("model_name", "")).strip()
+    if not model_name:
+        return None
+    params = _extract_trial_params(trial_record)
+    try:
+        composite_score = float(trial_record.get("composite_score"))
+    except (TypeError, ValueError):
+        composite_score = None
+    return {
+        "model_name": model_name,
+        "params": params,
+        "proposal_family": str(trial_record.get("proposal_family", model_name)),
+        "composite_score": composite_score,
+        "validation_verdict": str(trial_record.get("validation_verdict", "")),
+        "trial_number": trial_record.get("trial_number"),
+    }
+
+
+def _iter_normalized_trials(
+    trial_history: list[dict[str, Any]],
+    memory_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for run in memory_payload.get("runs", []):
+        for trial in run.get("trials", []):
+            normalized_trial = _normalize_trial_for_family_state(trial)
+            if normalized_trial is not None:
+                normalized.append(normalized_trial)
+    for trial in trial_history:
+        normalized_trial = _normalize_trial_for_family_state(trial)
+        if normalized_trial is not None:
+            normalized.append(normalized_trial)
+    return normalized
+
+
+def build_family_state_summary(
+    *,
+    available_models: dict[str, dict[str, Any]],
+    current_best: dict[str, Any],
+    trial_history: list[dict[str, Any]],
+    memory_payload: dict[str, Any],
+    diversity_settings: dict[str, Any] | None = None,
+    recent_window: int = 12,
+) -> dict[str, Any]:
+    diversity_settings = diversity_settings or {}
+    max_family_share = float(diversity_settings.get("max_family_share", 0.35))
+    normalized_trials = [
+        trial
+        for trial in _iter_normalized_trials(trial_history, memory_payload)
+        if trial["model_name"] in available_models
+    ]
+    recent_trials = normalized_trials[-max(1, int(recent_window)) :]
+    current_best_name = str(current_best.get("model_name", "")).strip()
+    try:
+        current_best_score = float(current_best.get("composite_score"))
+    except (TypeError, ValueError):
+        current_best_score = None
+
+    family_stats: dict[str, dict[str, Any]] = {}
+    for family_name in available_models:
+        family_trials = [trial for trial in recent_trials if trial["model_name"] == family_name]
+        scores = [trial["composite_score"] for trial in family_trials if trial["composite_score"] is not None]
+        family_stats[family_name] = {
+            "recent_count": len(family_trials),
+            "best_score": max(scores) if scores else None,
+            "avg_score": (sum(scores) / len(scores)) if scores else None,
+            "recent_trials": family_trials,
+        }
+
+    strongest_active_family = current_best_name if current_best_name in available_models else None
+    best_recent_family = None
+    best_recent_score = None
+    for family_name, stats in family_stats.items():
+        score = stats["best_score"]
+        if score is None:
+            continue
+        if best_recent_score is None or score > best_recent_score:
+            best_recent_family = family_name
+            best_recent_score = score
+    if strongest_active_family is None:
+        strongest_active_family = best_recent_family
+
+    strongest_score = current_best_score
+    if strongest_score is None:
+        strongest_score = best_recent_score
+
+    total_recent = max(1, len(recent_trials))
+    saturation_threshold = max(3, int(math.ceil(total_recent * max_family_share)))
+    saturated_families: list[str] = []
+    underexplored_promising_families: list[str] = []
+    underexplored_weak_families: list[str] = []
+
+    for family_name, stats in family_stats.items():
+        recent_count = int(stats["recent_count"])
+        best_score = stats["best_score"]
+        if recent_count >= saturation_threshold:
+            saturated_families.append(family_name)
+            continue
+
+        if recent_count <= 2:
+            if recent_count == 0:
+                underexplored_promising_families.append(family_name)
+                continue
+            if (
+                strongest_score is not None
+                and best_score is not None
+                and best_score < strongest_score * 0.95
+                and recent_count >= 1
+            ):
+                underexplored_weak_families.append(family_name)
+            else:
+                underexplored_promising_families.append(family_name)
+
+    temporarily_blocked_families = list(dict.fromkeys(underexplored_weak_families + saturated_families))
+    return {
+        "strongest_active_family": strongest_active_family,
+        "saturated_families": saturated_families,
+        "underexplored_promising_families": underexplored_promising_families,
+        "underexplored_weak_families": underexplored_weak_families,
+        "temporarily_blocked_families": temporarily_blocked_families,
+        "family_stats": family_stats,
+        "recent_trials_considered": recent_trials,
+    }
+
+
+def _round_numeric(value: Any, digits: int) -> float | None:
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _numeric_params_are_similar(candidate: Any, reference: Any, *, tolerance: float, digits: int) -> bool:
+    rounded_candidate = _round_numeric(candidate, digits)
+    rounded_reference = _round_numeric(reference, digits)
+    if rounded_candidate is None or rounded_reference is None:
+        return False
+    baseline = max(abs(rounded_reference), 1e-12)
+    return abs(rounded_candidate - rounded_reference) / baseline <= tolerance
+
+
+def proposals_are_near_duplicates(
+    *,
+    model_name: str,
+    candidate_params: dict[str, Any],
+    reference_params: dict[str, Any],
+    available_models: dict[str, dict[str, Any]],
+    duplicate_settings: dict[str, Any],
+) -> bool:
+    if model_name not in available_models:
+        return False
+    if set(candidate_params.keys()) != set(reference_params.keys()):
+        return False
+
+    search_space = available_models[model_name].get("search_space", {})
+    tolerance = float(duplicate_settings.get("numeric_tolerance", 0.05))
+    digits = int(duplicate_settings.get("float_round_digits", 4))
+
+    for param_name, candidate_value in candidate_params.items():
+        spec = search_space.get(param_name, {})
+        reference_value = reference_params.get(param_name)
+        parameter_type = str(spec.get("type", "categorical"))
+        if parameter_type in {"int", "float"}:
+            if not _numeric_params_are_similar(
+                candidate_value,
+                reference_value,
+                tolerance=tolerance,
+                digits=digits,
+            ):
+                return False
+        else:
+            if candidate_value != reference_value:
+                return False
+    return True
+
+
+def gate_proposal(
+    *,
+    proposal: dict[str, Any],
+    available_models: dict[str, dict[str, Any]],
+    current_run_signatures: set[tuple[str, str]],
+    memory_payload: dict[str, Any],
+    trial_history: list[dict[str, Any]],
+    family_state: dict[str, Any],
+    duplicate_settings: dict[str, Any],
+) -> dict[str, Any]:
+    model_name = str(proposal.get("model_name", "")).strip()
+    params = proposal.get("params", {})
+    if not model_name or model_name not in available_models or not isinstance(params, dict):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "reason": {
+                "code": "malformed_or_incomplete",
+                "message": "Proposal is missing a valid model_name or params payload.",
+            },
+        }
+
+    search_space = available_models[model_name].get("search_space", {})
+    if search_space and not params:
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "reason": {
+                "code": "malformed_or_incomplete",
+                "message": "Proposal params are incomplete for the selected model family.",
+            },
+        }
+    if any(param_name not in search_space for param_name in params):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "reason": {
+                "code": "malformed_or_incomplete",
+                "message": "Proposal contains parameters outside the allowed search space.",
+            },
+        }
+
+    signature = build_config_signature(model_name, params)
+    if should_skip_duplicate_proposal(
+        model_name=model_name,
+        params=params,
+        current_run_signatures=current_run_signatures,
+        memory_payload=memory_payload,
+    ):
+        return {
+            "accepted": False,
+            "duplicate_rejected": True,
+            "reason": {
+                "code": "exact_duplicate",
+                "message": "Proposal exactly matches a recent or historic configuration.",
+                "model_name": model_name,
+            },
+            "signature": signature,
+        }
+
+    recent_trials = _iter_normalized_trials(trial_history, memory_payload)
+    similar_reference = None
+    for trial in recent_trials:
+        if trial["model_name"] != model_name:
+            continue
+        if proposals_are_near_duplicates(
+            model_name=model_name,
+            candidate_params=params,
+            reference_params=trial["params"],
+            available_models=available_models,
+            duplicate_settings=duplicate_settings,
+        ):
+            similar_reference = trial
+            break
+
+    meaningful_novelty = similar_reference is None
+    saturated_families = set(family_state.get("saturated_families", []))
+    weak_families = set(family_state.get("underexplored_weak_families", []))
+    blocked_families = set(family_state.get("temporarily_blocked_families", []))
+
+    if model_name in saturated_families and similar_reference is not None:
+        return {
+            "accepted": False,
+            "duplicate_rejected": True,
+            "reason": {
+                "code": "saturated_family_similarity",
+                "message": "Proposal stays too close to recent runs from a saturated family.",
+                "model_name": model_name,
+            },
+            "signature": signature,
+        }
+
+    if similar_reference is not None:
+        return {
+            "accepted": False,
+            "duplicate_rejected": True,
+            "reason": {
+                "code": "near_duplicate",
+                "message": "Proposal is too similar to a recent configuration.",
+                "model_name": model_name,
+            },
+            "signature": signature,
+        }
+
+    if model_name in weak_families and not meaningful_novelty:
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "reason": {
+                "code": "weak_family_no_novelty",
+                "message": "Weak recent evidence does not justify another similar run for this family.",
+                "model_name": model_name,
+            },
+            "signature": signature,
+        }
+
+    if model_name in blocked_families and not meaningful_novelty:
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "reason": {
+                "code": "temporarily_blocked_family",
+                "message": "This family is temporarily blocked unless the proposal is materially different.",
+                "model_name": model_name,
+            },
+            "signature": signature,
+        }
+
+    return {
+        "accepted": True,
+        "duplicate_rejected": False,
+        "reason": None,
+        "signature": signature,
+    }
 
 
 def filter_diverse_candidates(

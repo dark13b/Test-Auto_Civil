@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from llm_backend import get_llm_config, resolve_backend
+from llm_backend import get_llm_config, resolve_backend, resolve_default_local_proposal_model
 from proposal_engine import ProposalEngine
 
 
@@ -26,8 +26,9 @@ class LLMProposer:
             interaction_log_path=self.interaction_log_path,
             log_interactions=bool(self.llm_config.get("log_interactions", True)),
             include_no_think_directive=bool(self.llm_config.get("include_no_think_directive", False)),
+            llm_config=self.llm_config,
         )
-        self.fast_model, self.smart_model = self._resolve_model_hints()
+        self.fast_model, self.smart_model, self.compact_model = self._resolve_model_hints()
         self.consecutive_invalid_responses = 0
 
     def is_available(self) -> bool:
@@ -41,13 +42,15 @@ class LLMProposer:
         use_smart_model: bool = False,
         search_progress: dict[str, Any] | None = None,
         research_brief: dict[str, Any] | None = None,
+        experiment_memory: dict[str, Any] | None = None,
+        diversity_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         proposals = self.engine.generate_experiment_proposals(
             available_models=available_models,
             research_brief=research_brief or {},
             current_best=current_best or {},
-            experiment_memory={"runs": [], "accepted_experiments": []},
-            diversity_state={"historic_family_counts": {}},
+            experiment_memory=experiment_memory or {"runs": [], "accepted_experiments": []},
+            diversity_state=diversity_state or {"historic_family_counts": {}},
             proposal_count=1,
             trial_history=trial_history,
             search_progress=search_progress or {},
@@ -134,17 +137,19 @@ class LLMProposer:
             model_hint=self.smart_model,
         )
 
-    def _resolve_model_hints(self) -> tuple[str | None, str | None]:
+    def _resolve_model_hints(self) -> tuple[str | None, str | None, str | None]:
         backend_mode = str(self.llm_config.get("backend_mode", "ollama")).lower()
         if backend_mode == "openai":
             model_name = str(self.llm_config.get("openai", {}).get("model", "gpt-5.1-mini"))
-            return model_name, model_name
+            return model_name, model_name, model_name
         if backend_mode == "hybrid":
             primary = str(self.llm_config.get("hybrid", {}).get("primary", "ollama")).lower()
             if primary == "openai":
                 model_name = str(self.llm_config.get("openai", {}).get("model", "gpt-5.1-mini"))
-                return model_name, model_name
+                return model_name, model_name, model_name
         ollama_config = self.llm_config.get("ollama", {})
-        fast_model = str(ollama_config.get("fast_model", ollama_config.get("model", "qwen3:4b")))
-        smart_model = str(ollama_config.get("smart_model", ollama_config.get("model", fast_model)))
-        return fast_model, smart_model
+        default_local_model = resolve_default_local_proposal_model(self.llm_config)
+        compact_models = [str(item) for item in self.llm_config.get("compact_prompt_models", []) if str(item).strip()]
+        compact_model = compact_models[0] if compact_models else str(ollama_config.get("fast_model", default_local_model))
+        smart_model = str(ollama_config.get("smart_model", default_local_model))
+        return default_local_model, smart_model, compact_model

@@ -2,7 +2,15 @@ import os
 import unittest
 from unittest.mock import patch
 
-from llm_backend import HybridBackend, NullBackend, OpenAIBackend, OllamaBackend, resolve_backend
+from llm_backend import (
+    HybridBackend,
+    NullBackend,
+    OpenAIBackend,
+    OllamaBackend,
+    get_llm_config,
+    resolve_backend,
+    resolve_prompt_variant,
+)
 
 
 class StubBackend:
@@ -24,6 +32,22 @@ class StubBackend:
 
 
 class LLMBackendTests(unittest.TestCase):
+    def test_get_llm_config_includes_safe_prompt_and_gate_defaults(self) -> None:
+        llm_config = get_llm_config({})
+
+        self.assertEqual(llm_config["default_local_proposal_model"], "qwen3:8b")
+        self.assertEqual(llm_config["compact_prompt_models"], ["qwen3:4b"])
+        self.assertTrue(llm_config["enable_regeneration_on_reject"])
+        self.assertEqual(llm_config["max_regeneration_attempts"], 1)
+        self.assertEqual(llm_config["duplicate_similarity_thresholds"]["numeric_tolerance"], 0.05)
+        self.assertEqual(llm_config["duplicate_similarity_thresholds"]["float_round_digits"], 4)
+
+    def test_resolve_prompt_variant_uses_configured_compact_models(self) -> None:
+        llm_config = get_llm_config({"llm": {"compact_prompt_models": ["tiny-local"]}})
+
+        self.assertEqual(resolve_prompt_variant(llm_config, "tiny-local"), "compact")
+        self.assertEqual(resolve_prompt_variant(llm_config, "larger-local"), "rich")
+
     def test_resolve_backend_builds_ollama_backend_for_ollama_mode(self) -> None:
         config = {
             "llm": {

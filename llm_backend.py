@@ -16,6 +16,18 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
     "enabled": False,
     "backend_mode": "ollama",
     "allow_deterministic_fallback": True,
+    "default_local_proposal_model": "qwen3:8b",
+    "compact_prompt_models": ["qwen3:4b"],
+    "enable_regeneration_on_reject": True,
+    "max_regeneration_attempts": 1,
+    "duplicate_similarity_thresholds": {
+        "numeric_tolerance": 0.05,
+        "float_round_digits": 4,
+    },
+    "temporarily_block_saturated_families": True,
+    "diversity": {
+        "max_family_share": 0.35,
+    },
     "interval_trials": 15,
     "interaction_interval_minutes": 5.0,
     "smart_model_after_progress": 0.67,
@@ -75,6 +87,9 @@ def get_llm_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized.update(
         {
             "enabled": bool(legacy.get("enabled", False)),
+            "default_local_proposal_model": str(
+                legacy.get("smart_model", normalized["default_local_proposal_model"])
+            ),
             "interval_trials": int(legacy.get("interval_trials", normalized["interval_trials"])),
             "interaction_interval_minutes": float(
                 legacy.get("interaction_interval_minutes", normalized["interaction_interval_minutes"])
@@ -95,13 +110,99 @@ def get_llm_config(config: dict[str, Any]) -> dict[str, Any]:
         normalized["ollama"],
         {
             "base_url": str(legacy.get("ollama_base_url", normalized["ollama"]["base_url"])),
-            "model": str(legacy.get("smart_model", normalized["ollama"]["model"])),
+            "model": str(legacy.get("smart_model", normalized["default_local_proposal_model"])),
             "fast_model": str(legacy.get("fast_model", normalized["ollama"]["fast_model"])),
             "smart_model": str(legacy.get("smart_model", normalized["ollama"]["smart_model"])),
             "timeout_seconds": int(legacy.get("timeout_seconds", normalized["ollama"]["timeout_seconds"])),
         },
     )
     return normalized
+
+
+def _normalize_model_name(model_name: str | None) -> str:
+    return str(model_name or "").strip().lower()
+
+
+def resolve_prompt_variant(llm_config: dict[str, Any], model_name: str | None) -> str:
+    compact_models = {
+        _normalize_model_name(item)
+        for item in llm_config.get("compact_prompt_models", [])
+        if str(item).strip()
+    }
+    return "compact" if _normalize_model_name(model_name) in compact_models else "rich"
+
+
+def resolve_default_local_proposal_model(llm_config: dict[str, Any]) -> str:
+    default_local = str(
+        llm_config.get("default_local_proposal_model")
+        or llm_config.get("ollama", {}).get("model")
+        or DEFAULT_LLM_CONFIG["default_local_proposal_model"]
+    )
+    return default_local
+
+
+def split_response_and_thinking(raw_text: str) -> tuple[str, str]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return "", ""
+
+    lowered = text.lower()
+    start_token = "<think>"
+    end_token = "</think>"
+    if start_token in lowered and end_token in lowered:
+        start_index = lowered.find(start_token)
+        end_index = lowered.rfind(end_token)
+        thinking = text[start_index + len(start_token) : end_index].strip()
+        response = text[end_index + len(end_token) :].strip()
+        return response, thinking
+    return text, ""
+
+
+def extract_text_channels(payload: dict[str, Any]) -> dict[str, str]:
+    raw_payload = payload.get("raw", {})
+    raw_payload = raw_payload if isinstance(raw_payload, dict) else {}
+
+    response_text = str(payload.get("response_text", "") or "")
+    thinking_text = str(payload.get("thinking_text", "") or "")
+    backend_raw_text = str(payload.get("backend_raw_text", "") or "")
+
+    direct_text = str(payload.get("text", "") or "")
+    if direct_text and not response_text:
+        extracted_response, extracted_thinking = split_response_and_thinking(direct_text)
+        response_text = extracted_response or response_text
+        thinking_text = extracted_thinking or thinking_text
+        backend_raw_text = backend_raw_text or direct_text
+
+    for candidate_key in ("response", "output_text", "text"):
+        candidate_value = raw_payload.get(candidate_key)
+        if isinstance(candidate_value, str) and candidate_value.strip():
+            extracted_response, extracted_thinking = split_response_and_thinking(candidate_value)
+            if not response_text:
+                response_text = extracted_response
+            if not thinking_text:
+                thinking_text = extracted_thinking
+            if not backend_raw_text:
+                backend_raw_text = candidate_value
+            break
+
+    for thinking_key in ("thinking", "thought", "reasoning"):
+        candidate_value = raw_payload.get(thinking_key)
+        if isinstance(candidate_value, str) and candidate_value.strip() and not thinking_text:
+            thinking_text = candidate_value.strip()
+            break
+
+    if not backend_raw_text:
+        for backend_key in ("response", "output_text", "text"):
+            candidate_value = raw_payload.get(backend_key)
+            if isinstance(candidate_value, str) and candidate_value.strip():
+                backend_raw_text = candidate_value.strip()
+                break
+
+    return {
+        "response_text": response_text.strip(),
+        "thinking_text": thinking_text.strip(),
+        "backend_raw_text": backend_raw_text.strip(),
+    }
 
 
 class LLMBackend:
@@ -152,9 +253,13 @@ class OllamaBackend(LLMBackend):
     backend_name = "ollama"
 
     def __init__(self, config: dict[str, Any]):
-        ollama_config = get_llm_config(config)["ollama"]
+        llm_config = get_llm_config(config)
+        ollama_config = llm_config["ollama"]
         self.base_url = str(ollama_config.get("base_url", "http://localhost:11434")).rstrip("/")
-        self.default_model = str(ollama_config.get("model", "qwen3:8b"))
+        self.default_model = str(
+            ollama_config.get("model")
+            or resolve_default_local_proposal_model(llm_config)
+        )
         self.fast_model = str(ollama_config.get("fast_model", self.default_model))
         self.smart_model = str(ollama_config.get("smart_model", self.default_model))
         self.timeout_seconds = max(1, int(ollama_config.get("timeout_seconds", 30)))
@@ -246,11 +351,15 @@ class OllamaBackend(LLMBackend):
         response.raise_for_status()
         raw_payload = response.json()
         text = raw_payload.get("response", "")
+        response_text, thinking_text = split_response_and_thinking(text if isinstance(text, str) else str(text))
         return {
             "backend": self.backend_name,
             "transport": "http",
             "model": model,
             "text": text if isinstance(text, str) else str(text),
+            "response_text": response_text,
+            "thinking_text": thinking_text,
+            "backend_raw_text": text if isinstance(text, str) else str(text),
             "raw": raw_payload,
         }
 
@@ -278,11 +387,15 @@ class OllamaBackend(LLMBackend):
         )
         if result.returncode != 0:
             raise BackendUnavailableError(result.stderr.strip() or "ollama CLI request failed")
+        response_text, thinking_text = split_response_and_thinking(result.stdout.strip())
         return {
             "backend": self.backend_name,
             "transport": "cli",
             "model": model,
             "text": result.stdout.strip(),
+            "response_text": response_text,
+            "thinking_text": thinking_text,
+            "backend_raw_text": result.stdout.strip(),
             "raw": {
                 "returncode": result.returncode,
                 "stderr": result.stderr,
@@ -353,6 +466,9 @@ class OpenAIBackend(LLMBackend):
             "transport": "http",
             "model": model_name,
             "text": self._extract_output_text(raw_payload),
+            "response_text": self._extract_output_text(raw_payload),
+            "thinking_text": "",
+            "backend_raw_text": self._extract_output_text(raw_payload),
             "raw": raw_payload,
         }
 

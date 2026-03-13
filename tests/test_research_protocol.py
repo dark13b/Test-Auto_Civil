@@ -7,7 +7,9 @@ from research_protocol import (
     apply_keep_to_research_surface,
     build_acceptance_decision,
     build_config_signature,
+    build_family_state_summary,
     filter_diverse_candidates,
+    gate_proposal,
     load_human_research_brief,
     load_or_initialize_experiment_memory,
     read_research_surface_state,
@@ -19,6 +21,27 @@ from research_protocol import (
 
 
 class ResearchProtocolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.available_models = {
+            "ModelFamilyA": {
+                "display_name": "Model A",
+                "search_space": {
+                    "depth": {"type": "int", "low": 1, "high": 8},
+                    "learning_rate": {"type": "float", "low": 0.01, "high": 0.3},
+                },
+            },
+            "ModelFamilyB": {
+                "display_name": "Model B",
+                "search_space": {
+                    "alpha": {"type": "float", "low": 0.01, "high": 1.0},
+                },
+            },
+        }
+        self.duplicate_settings = {
+            "numeric_tolerance": 0.05,
+            "float_round_digits": 4,
+        }
+
     def test_load_human_research_brief_front_matter(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             brief_path = Path(tmpdir) / "research_brief.md"
@@ -75,6 +98,174 @@ class ResearchProtocolTests(unittest.TestCase):
                     memory_payload=parsed_again,
                 )
             )
+
+    def test_gate_proposal_rejects_exact_duplicate(self) -> None:
+        memory_payload = {
+            "runs": [
+                {
+                    "run_id": "old-run",
+                    "trials": [
+                        {
+                            "model_name": "ModelFamilyA",
+                            "params": {"depth": 3, "learning_rate": 0.1},
+                            "proposal_family": "family-a",
+                            "composite_score": 0.88,
+                            "validation_verdict": "WARN",
+                            "signature": ["ModelFamilyA", '{"depth":3,"learning_rate":0.1}'],
+                        }
+                    ],
+                }
+            ],
+            "accepted_experiments": [],
+        }
+        family_state = build_family_state_summary(
+            available_models=self.available_models,
+            current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+            trial_history=[],
+            memory_payload=memory_payload,
+            diversity_settings={"max_family_share": 0.35},
+        )
+
+        result = gate_proposal(
+            proposal={"model_name": "ModelFamilyA", "params": {"depth": 3, "learning_rate": 0.1}},
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=[],
+            family_state=family_state,
+            duplicate_settings=self.duplicate_settings,
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reason"]["code"], "exact_duplicate")
+
+    def test_gate_proposal_rejects_near_duplicate_with_float_tolerance(self) -> None:
+        trial_history = [
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 4, "learning_rate": 0.1000}),
+                "proposal_family": "family-a",
+                "composite_score": 0.89,
+                "validation_verdict": "WARN",
+            }
+        ]
+        family_state = build_family_state_summary(
+            available_models=self.available_models,
+            current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+            trial_history=trial_history,
+            memory_payload={"runs": [], "accepted_experiments": []},
+            diversity_settings={"max_family_share": 0.35},
+        )
+
+        result = gate_proposal(
+            proposal={"model_name": "ModelFamilyA", "params": {"depth": 4, "learning_rate": 0.104}},
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload={"runs": [], "accepted_experiments": []},
+            trial_history=trial_history,
+            family_state=family_state,
+            duplicate_settings=self.duplicate_settings,
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reason"]["code"], "near_duplicate")
+
+    def test_gate_proposal_rejects_saturated_family_when_recent_run_is_too_similar(self) -> None:
+        trial_history = [
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 3, "learning_rate": 0.09}),
+                "proposal_family": "family-a",
+                "composite_score": 0.91,
+                "validation_verdict": "WARN",
+            },
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 4, "learning_rate": 0.10}),
+                "proposal_family": "family-a",
+                "composite_score": 0.905,
+                "validation_verdict": "WARN",
+            },
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 4, "learning_rate": 0.11}),
+                "proposal_family": "family-a",
+                "composite_score": 0.904,
+                "validation_verdict": "WARN",
+            },
+            {
+                "model_name": "ModelFamilyB",
+                "hyperparameters": json.dumps({"alpha": 0.6}),
+                "proposal_family": "family-b",
+                "composite_score": 0.86,
+                "validation_verdict": "WARN",
+            },
+        ]
+        family_state = build_family_state_summary(
+            available_models=self.available_models,
+            current_best={"model_name": "ModelFamilyA", "composite_score": 0.91},
+            trial_history=trial_history,
+            memory_payload={"runs": [], "accepted_experiments": []},
+            diversity_settings={"max_family_share": 0.35},
+        )
+
+        result = gate_proposal(
+            proposal={"model_name": "ModelFamilyA", "params": {"depth": 4, "learning_rate": 0.109}},
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload={"runs": [], "accepted_experiments": []},
+            trial_history=trial_history,
+            family_state=family_state,
+            duplicate_settings=self.duplicate_settings,
+        )
+
+        self.assertIn("ModelFamilyA", family_state["saturated_families"])
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reason"]["code"], "saturated_family_similarity")
+
+    def test_build_family_state_marks_underexplored_weak_family_from_recent_outcomes(self) -> None:
+        trial_history = [
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 3, "learning_rate": 0.09}),
+                "proposal_family": "family-a",
+                "composite_score": 0.92,
+                "validation_verdict": "WARN",
+            },
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 4, "learning_rate": 0.10}),
+                "proposal_family": "family-a",
+                "composite_score": 0.91,
+                "validation_verdict": "WARN",
+            },
+            {
+                "model_name": "ModelFamilyB",
+                "hyperparameters": json.dumps({"alpha": 0.8}),
+                "proposal_family": "family-b",
+                "composite_score": 0.75,
+                "validation_verdict": "WARN",
+            },
+            {
+                "model_name": "ModelFamilyB",
+                "hyperparameters": json.dumps({"alpha": 0.7}),
+                "proposal_family": "family-b",
+                "composite_score": 0.74,
+                "validation_verdict": "WARN",
+            },
+        ]
+
+        family_state = build_family_state_summary(
+            available_models=self.available_models,
+            current_best={"model_name": "ModelFamilyA", "composite_score": 0.92},
+            trial_history=trial_history,
+            memory_payload={"runs": [], "accepted_experiments": []},
+            diversity_settings={"max_family_share": 0.35},
+        )
+
+        self.assertEqual(family_state["strongest_active_family"], "ModelFamilyA")
+        self.assertIn("ModelFamilyB", family_state["underexplored_weak_families"])
+        self.assertIn("ModelFamilyB", family_state["temporarily_blocked_families"])
 
     def test_filter_diverse_candidates_limits_repeated_proposal_families(self) -> None:
         candidates = [

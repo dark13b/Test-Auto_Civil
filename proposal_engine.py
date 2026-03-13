@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
-from llm_backend import LLMBackend
+from llm_backend import LLMBackend, extract_text_channels, resolve_prompt_variant
+from research_protocol import build_family_state_summary, gate_proposal
 
 
-JSON_OBJECT_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
-JSON_ARRAY_PATTERN = re.compile(r"\[\s*.*\s*\]", re.DOTALL)
+LOGGER = logging.getLogger("proposal_engine")
+JSON_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 INVALID_PARAM = object()
 
 
@@ -25,12 +27,15 @@ class ProposalEngine:
         interaction_log_path: Path | None = None,
         log_interactions: bool = True,
         include_no_think_directive: bool = False,
+        llm_config: dict[str, Any] | None = None,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.backend_name
         self.interaction_log_path = interaction_log_path
         self.log_interactions = bool(log_interactions)
         self.include_no_think_directive = bool(include_no_think_directive)
+        self.llm_config = dict(llm_config or {})
+        self.last_interaction_summary: dict[str, Any] = {}
 
     def is_available(self) -> bool:
         return self.backend.is_available()
@@ -53,7 +58,7 @@ class ProposalEngine:
                 f"Limit: {max(1, int(limit))}",
             ]
         )
-        payload = self._run_interaction(
+        interaction = self._perform_interaction(
             task="hypotheses",
             prompt=prompt,
             response_format={
@@ -63,8 +68,11 @@ class ProposalEngine:
                 "maxItems": max(1, int(limit)),
             },
             model_hint=model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            expect_array=True,
         )
-        parsed = self._extract_json(payload.get("text", ""), expect_array=True)
+        parsed = interaction.get("parsed_json")
+        self._write_interaction_log(interaction)
         if not isinstance(parsed, list):
             return []
         return [str(item) for item in parsed if str(item).strip()][: max(1, int(limit))]
@@ -86,7 +94,7 @@ class ProposalEngine:
                 f"Limit: {max(1, int(limit))}",
             ]
         )
-        payload = self._run_interaction(
+        interaction = self._perform_interaction(
             task="feature_ideas",
             prompt=prompt,
             response_format={
@@ -96,8 +104,11 @@ class ProposalEngine:
                 "maxItems": max(1, int(limit)),
             },
             model_hint=model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            expect_array=True,
         )
-        parsed = self._extract_json(payload.get("text", ""), expect_array=True)
+        parsed = interaction.get("parsed_json")
+        self._write_interaction_log(interaction)
         if not isinstance(parsed, list):
             return []
         return [str(item) for item in parsed if str(item).strip()][: max(1, int(limit))]
@@ -118,7 +129,7 @@ class ProposalEngine:
         ]
         for model_name, model_config in available_models.items():
             prompt_lines.append(f"{model_name}: {self._format_search_space(model_config.get('search_space', {}))}")
-        payload = self._run_interaction(
+        interaction = self._perform_interaction(
             task="search_space_suggestions",
             prompt="\n".join(prompt_lines),
             response_format={
@@ -137,8 +148,11 @@ class ProposalEngine:
                 "maxItems": max(1, int(limit)),
             },
             model_hint=model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            expect_array=True,
         )
-        parsed = self._extract_json(payload.get("text", ""), expect_array=True)
+        parsed = interaction.get("parsed_json")
+        self._write_interaction_log(interaction)
         if not isinstance(parsed, list):
             return []
         return [item for item in parsed if isinstance(item, dict)][: max(1, int(limit))]
@@ -159,44 +173,92 @@ class ProposalEngine:
         if not self.is_available():
             return []
 
-        prompt = self._build_experiment_prompt(
+        trial_history = trial_history or []
+        expected_array = max(1, int(proposal_count)) > 1
+        prompt_variant = resolve_prompt_variant(self.llm_config, model_hint)
+        family_state = build_family_state_summary(
             available_models=available_models,
-            research_brief=research_brief,
             current_best=current_best,
-            experiment_memory=experiment_memory,
-            diversity_state=diversity_state,
-            proposal_count=proposal_count,
-            trial_history=trial_history or [],
-            search_progress=search_progress or {},
+            trial_history=trial_history,
+            memory_payload=experiment_memory,
+            diversity_settings=self.llm_config.get("diversity", {}),
         )
-        schema = self._build_proposals_schema(available_models, proposal_count=max(1, int(proposal_count)))
-        payload = self._run_interaction(
-            task="experiment_proposals",
-            prompt=prompt,
-            response_format=schema,
-            model_hint=model_hint,
-        )
-        parsed = self._extract_json(payload.get("text", ""), expect_array=True)
-        if not isinstance(parsed, list):
-            return []
+        max_attempts = 1
+        if self.llm_config.get("enable_regeneration_on_reject", True):
+            max_attempts += max(0, int(self.llm_config.get("max_regeneration_attempts", 1)))
 
-        validated: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
-        for item in parsed:
-            suggestion = self._validate_proposal(item, available_models)
-            if suggestion is None:
-                continue
-            signature = (
-                suggestion["model_name"],
-                json.dumps(suggestion["params"], sort_keys=True, separators=(",", ":")),
+        seen_signatures: set[tuple[str, str]] = set()
+        for attempt_index in range(1, max_attempts + 1):
+            prompt = self._build_experiment_prompt(
+                available_models=available_models,
+                research_brief=research_brief,
+                current_best=current_best,
+                experiment_memory=experiment_memory,
+                diversity_state=diversity_state,
+                proposal_count=proposal_count,
+                trial_history=trial_history,
+                search_progress=search_progress or {},
+                family_state=family_state,
+                prompt_variant=prompt_variant,
             )
-            if signature in seen:
-                continue
-            seen.add(signature)
-            validated.append(suggestion)
-            if len(validated) >= max(1, int(proposal_count)):
-                break
-        return validated
+            schema = (
+                self._build_proposals_schema(available_models, proposal_count=max(1, int(proposal_count)))
+                if expected_array
+                else self._build_proposal_variant_schema(available_models)
+            )
+            interaction = self._perform_interaction(
+                task="experiment_proposals",
+                prompt=prompt,
+                response_format=schema,
+                model_hint=model_hint,
+                prompt_variant=prompt_variant,
+                expect_array=expected_array,
+            )
+            parsed = interaction.get("parsed_json")
+            candidates = parsed if expected_array and isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+
+            validated: list[dict[str, Any]] = []
+            rejection_reason = interaction.get("rejection_reason")
+            duplicate_rejected = False
+            for item in candidates:
+                suggestion = self._validate_proposal(item, available_models)
+                if suggestion is None:
+                    rejection_reason = {
+                        "code": "malformed_or_incomplete",
+                        "message": "Proposal payload failed schema-aware validation.",
+                    }
+                    continue
+                gate_result = gate_proposal(
+                    proposal=suggestion,
+                    available_models=available_models,
+                    current_run_signatures=seen_signatures,
+                    memory_payload=experiment_memory,
+                    trial_history=trial_history,
+                    family_state=family_state,
+                    duplicate_settings=self.llm_config.get("duplicate_similarity_thresholds", {}),
+                )
+                if not gate_result["accepted"]:
+                    rejection_reason = gate_result["reason"]
+                    duplicate_rejected = bool(gate_result.get("duplicate_rejected", False))
+                    continue
+                seen_signatures.add(gate_result["signature"])
+                validated.append(suggestion)
+                if len(validated) >= max(1, int(proposal_count)):
+                    break
+
+            interaction["duplicate_rejected"] = duplicate_rejected
+            interaction["rejection_reason"] = rejection_reason
+            interaction["final_parsed_candidate"] = (
+                validated[0] if len(validated) == 1 else validated or interaction.get("final_parsed_candidate")
+            )
+            interaction["regeneration_attempted"] = attempt_index < max_attempts and not validated
+            interaction["fallback_used"] = attempt_index == max_attempts and not validated
+            self._write_interaction_log(interaction)
+
+            if validated:
+                return validated
+
+        return []
 
     def generate_ensemble_selection(
         self,
@@ -225,7 +287,7 @@ class ProposalEngine:
         prompt_lines.append("Available models and search spaces:")
         for model_name, model_config in available_models.items():
             prompt_lines.append(f"{model_name}: {self._format_search_space(model_config.get('search_space', {}))}")
-        payload = self._run_interaction(
+        interaction = self._perform_interaction(
             task="ensemble_selection",
             prompt="\n".join(prompt_lines),
             response_format={
@@ -235,8 +297,11 @@ class ProposalEngine:
                 "maxItems": max(1, int(max_items)),
             },
             model_hint=model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            expect_array=True,
         )
-        parsed = self._extract_json(payload.get("text", ""), expect_array=True)
+        parsed = interaction.get("parsed_json")
+        self._write_interaction_log(interaction)
         if not isinstance(parsed, list):
             return []
         validated: list[dict[str, Any]] = []
@@ -270,41 +335,44 @@ class ProposalEngine:
                 f"Validation verdict: {final_metrics.get('validation_verdict', 'n/a')}",
             ]
         )
-        payload = self._run_interaction(
+        interaction = self._perform_interaction(
             task="run_summary",
             prompt=prompt,
             response_format={
                 "type": "object",
-                "properties": {
-                    "summary": {"type": "string"},
-                },
+                "properties": {"summary": {"type": "string"}},
                 "required": ["summary"],
                 "additionalProperties": False,
             },
             model_hint=model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            expect_array=False,
         )
-        parsed = self._extract_json(payload.get("text", ""), expect_array=False)
+        parsed = interaction.get("parsed_json")
+        self._write_interaction_log(interaction)
         if isinstance(parsed, dict) and isinstance(parsed.get("summary"), str):
             return {
-                "backend": payload.get("backend", self.backend_name),
-                "model": payload.get("model"),
+                "backend": interaction.get("backend", self.backend_name),
+                "model": interaction.get("model"),
                 "available": True,
                 "summary": parsed["summary"],
             }
         return {
-            "backend": payload.get("backend", self.backend_name),
-            "model": payload.get("model"),
+            "backend": interaction.get("backend", self.backend_name),
+            "model": interaction.get("model"),
             "available": True,
-            "summary": payload.get("text", ""),
+            "summary": interaction.get("final_extracted_text", ""),
         }
 
-    def _run_interaction(
+    def _perform_interaction(
         self,
         *,
         task: str,
         prompt: str,
         response_format: dict[str, Any] | None,
         model_hint: str | None,
+        prompt_variant: str,
+        expect_array: bool,
     ) -> dict[str, Any]:
         system_prompt = (
             "You are a proposal engine for AutoCivil-Lab. "
@@ -312,6 +380,27 @@ class ProposalEngine:
         )
         if self.include_no_think_directive:
             prompt = f"/no_think\n{prompt}"
+
+        interaction: dict[str, Any] = {
+            "task": task,
+            "backend": self.backend_name,
+            "model": model_hint,
+            "prompt": prompt,
+            "prompt_variant": prompt_variant,
+            "raw_response_text": "",
+            "raw_thinking_text": "",
+            "final_extracted_text": "",
+            "extracted_from_channel": "response",
+            "parse_success": False,
+            "repair_used": False,
+            "duplicate_rejected": False,
+            "rejection_reason": None,
+            "regeneration_attempted": False,
+            "fallback_used": False,
+            "final_parsed_candidate": None,
+            "error": None,
+            "parsed_json": None,
+        }
         try:
             payload = self.backend.generate_text(
                 prompt,
@@ -319,40 +408,67 @@ class ProposalEngine:
                 response_format=response_format,
                 model=model_hint,
             )
-            self._write_interaction_log(task=task, prompt=prompt, payload=payload, valid=True)
-            return payload
         except Exception as exc:
-            payload = {
+            interaction["error"] = str(exc)
+            self.last_interaction_summary = {
                 "backend": self.backend_name,
                 "model": model_hint,
-                "text": "",
-                "error": str(exc),
+                "prompt_variant": prompt_variant,
+                "parse_success": False,
             }
-            self._write_interaction_log(task=task, prompt=prompt, payload=payload, valid=False)
-            return payload
+            return interaction
 
-    def _write_interaction_log(
-        self,
-        *,
-        task: str,
-        prompt: str,
-        payload: dict[str, Any],
-        valid: bool,
-    ) -> None:
+        interaction["backend"] = payload.get("backend", self.backend_name)
+        interaction["model"] = payload.get("model", model_hint)
+        channels = extract_text_channels(payload)
+        interaction["raw_response_text"] = channels["response_text"]
+        interaction["raw_thinking_text"] = channels["thinking_text"]
+        final_text, extracted_from, parsed_json, repair_used = self._extract_structured_output(
+            channels=channels,
+            expect_array=expect_array,
+        )
+        if not channels["response_text"] and extracted_from == "thinking" and "qwen3" in str(interaction["model"]).lower():
+            LOGGER.warning("qwen3 response was empty; extracted from thinking_text")
+
+        interaction["final_extracted_text"] = final_text
+        interaction["extracted_from_channel"] = extracted_from
+        interaction["parsed_json"] = parsed_json
+        interaction["parse_success"] = parsed_json is not None
+        interaction["repair_used"] = repair_used
+        interaction["final_parsed_candidate"] = parsed_json if parsed_json is not None else None
+        self.last_interaction_summary = {
+            "backend": interaction["backend"],
+            "model": interaction["model"],
+            "prompt_variant": prompt_variant,
+            "parse_success": interaction["parse_success"],
+        }
+        return interaction
+
+    def _write_interaction_log(self, interaction: dict[str, Any]) -> None:
         if not self.log_interactions or self.interaction_log_path is None:
             return
         self.interaction_log_path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "task": task,
-            "valid": valid,
-            "backend": payload.get("backend", self.backend_name),
-            "model": payload.get("model"),
-            "prompt": prompt,
-            "text": payload.get("text", ""),
-            "error": payload.get("error"),
+        payload = {
+            "task": interaction.get("task"),
+            "backend": interaction.get("backend", self.backend_name),
+            "model": interaction.get("model"),
+            "prompt_variant": interaction.get("prompt_variant"),
+            "prompt": interaction.get("prompt", ""),
+            "raw_response_text": interaction.get("raw_response_text", ""),
+            "raw_thinking_text": interaction.get("raw_thinking_text", ""),
+            "final_extracted_text": interaction.get("final_extracted_text", ""),
+            "extracted_from_channel": interaction.get("extracted_from_channel", "response"),
+            "parse_success": bool(interaction.get("parse_success", False)),
+            "repair_used": bool(interaction.get("repair_used", False)),
+            "duplicate_rejected": bool(interaction.get("duplicate_rejected", False)),
+            "rejection_reason": interaction.get("rejection_reason"),
+            "regeneration_attempted": bool(interaction.get("regeneration_attempted", False)),
+            "fallback_used": bool(interaction.get("fallback_used", False)),
+            "final_parsed_candidate": interaction.get("final_parsed_candidate"),
+            "error": interaction.get("error"),
         }
         with self.interaction_log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
     def _build_experiment_prompt(
         self,
@@ -365,40 +481,79 @@ class ProposalEngine:
         proposal_count: int,
         trial_history: list[dict[str, Any]],
         search_progress: dict[str, Any],
+        family_state: dict[str, Any],
+        prompt_variant: str,
     ) -> str:
-        recent_trials = trial_history[-min(10, len(trial_history)) :] if trial_history else []
+        max_recent_trials = 5 if prompt_variant == "compact" else 10
+        recent_trials = trial_history[-min(max_recent_trials, len(trial_history)) :] if trial_history else []
+        single_proposal_mode = max(1, int(proposal_count)) == 1
+
         lines = [
-            "Generate ML experiment proposals for concrete compressive strength regression.",
+            "Generate experiment proposals for concrete compressive strength regression.",
             f"Goal: {research_brief.get('goal', 'Improve composite_score')}",
             f"Acceptance metric: {research_brief.get('acceptance_metric', 'composite_score')}",
-            f"Minimum improvement pct: {self._format_metric(research_brief.get('min_improvement_pct'))}",
-            f"Current best model: {current_best.get('model_name', 'unknown')}",
-            f"Current best composite_score: {self._format_metric(current_best.get('composite_score'))}",
-            f"Accepted experiments in memory: {len(experiment_memory.get('accepted_experiments', []))}",
-            f"Requested proposals: {max(1, int(proposal_count))}",
+            f"Current best: {current_best.get('model_name', 'unknown')} | composite={self._format_metric(current_best.get('composite_score'))}",
+            f"Strongest family: {family_state.get('strongest_active_family') or 'unknown'}",
+            "Allowed families: " + ", ".join(sorted(available_models.keys())),
+            "Saturated families: " + self._format_family_list(family_state.get("saturated_families", [])),
+            "Underexplored but weak families: "
+            + self._format_family_list(family_state.get("underexplored_weak_families", [])),
+            "Underexplored and still worth probing: "
+            + self._format_family_list(family_state.get("underexplored_promising_families", [])),
+            "Temporarily blocked families: "
+            + self._format_family_list(family_state.get("temporarily_blocked_families", [])),
+            "Avoid saturated or temporarily blocked families unless the proposal is materially different from recent runs.",
+            "Do not repeat exact recent configs.",
+            "Schema example: {\"model_name\":\"MODEL\",\"params\":{}}",
         ]
-        required_families = research_brief.get("required_model_families", [])
-        if isinstance(required_families, list) and required_families:
-            lines.append("Required model families: " + ", ".join(str(item) for item in required_families))
-        historic_counts = diversity_state.get("historic_family_counts", {})
-        if isinstance(historic_counts, dict) and historic_counts:
-            lines.append("Historic proposal family counts: " + json.dumps(historic_counts, sort_keys=True))
-        if search_progress:
+        if prompt_variant == "compact":
+            lines.append("Think step by step internally, then output ONLY the final JSON object.")
+        if single_proposal_mode:
+            lines.extend(
+                [
+                    "Return exactly one JSON object.",
+                    "No markdown.",
+                    "No explanation.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"Return exactly one JSON array with up to {max(1, int(proposal_count))} proposal objects.",
+                    "No markdown.",
+                    "No explanation.",
+                ]
+            )
+
+        if search_progress and prompt_variant == "rich":
             lines.append("Search progress: " + json.dumps(search_progress, sort_keys=True))
+        if diversity_state.get("historic_family_counts") and prompt_variant == "rich":
+            lines.append(
+                "Historic family counts: " + json.dumps(diversity_state.get("historic_family_counts", {}), sort_keys=True)
+            )
+        if prompt_variant == "rich":
+            lines.append(
+                f"Accepted experiments in memory: {len(experiment_memory.get('accepted_experiments', []))}"
+            )
+            lines.append("Family state: " + json.dumps(self._compact_family_state_payload(family_state), sort_keys=True))
+
         if recent_trials:
-            lines.append("Recent trials:")
+            lines.append(f"Recent trials (last {len(recent_trials)}):")
             for trial in recent_trials:
+                trial_id = trial.get("experiment_id")
+                if not trial_id:
+                    trial_id = f"trial-{trial.get('trial_number', 'unknown')}"
                 lines.append(
-                    f"{trial.get('model_name', 'unknown')} | composite={self._format_metric(trial.get('composite_score'))} | "
-                    f"verdict={trial.get('validation_verdict', 'UNKNOWN')} | params={json.dumps(self._extract_trial_params(trial), sort_keys=True)}"
+                    f"{trial_id} | "
+                    f"model={trial.get('model_name', 'unknown')} | "
+                    f"composite={self._format_metric(trial.get('composite_score'))} | "
+                    f"verdict={trial.get('validation_verdict', 'UNKNOWN')} | "
+                    f"params={json.dumps(self._extract_trial_params(trial), sort_keys=True)}"
                 )
+
         lines.append("Available models and parameter ranges:")
         for model_name, model_config in available_models.items():
             lines.append(f"{model_name}: {self._format_search_space(model_config.get('search_space', {}))}")
-        lines.append(
-            "Each proposal must include model_name, params, proposal_family, and hypothesis. "
-            "Do not repeat exact model-plus-parameter combinations."
-        )
         return "\n".join(lines)
 
     def _build_proposals_schema(self, available_models: dict[str, dict[str, Any]], proposal_count: int) -> dict[str, Any]:
@@ -564,6 +719,22 @@ class ProposalEngine:
         except (TypeError, ValueError):
             return "n/a"
 
+    @staticmethod
+    def _format_family_list(families: list[str]) -> str:
+        if not families:
+            return "none"
+        return ", ".join(str(item) for item in families)
+
+    @staticmethod
+    def _compact_family_state_payload(family_state: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "strongest_active_family": family_state.get("strongest_active_family"),
+            "saturated_families": family_state.get("saturated_families", []),
+            "underexplored_promising_families": family_state.get("underexplored_promising_families", []),
+            "underexplored_weak_families": family_state.get("underexplored_weak_families", []),
+            "temporarily_blocked_families": family_state.get("temporarily_blocked_families", []),
+        }
+
     def _format_search_space(self, search_space: dict[str, dict[str, Any]]) -> str:
         parts: list[str] = []
         for name, spec in search_space.items():
@@ -589,15 +760,152 @@ class ProposalEngine:
             return value
         return json.dumps(value)
 
+    def _extract_structured_output(
+        self,
+        *,
+        channels: dict[str, str],
+        expect_array: bool,
+    ) -> tuple[str, str, Any, bool]:
+        ordered_channels = [
+            ("response", channels.get("response_text", "")),
+            ("thinking", channels.get("thinking_text", "")),
+            ("backend_raw", channels.get("backend_raw_text", "")),
+        ]
+        for channel_name, raw_text in ordered_channels:
+            parsed = self._extract_json(raw_text, expect_array=expect_array)
+            if parsed is not None:
+                return raw_text.strip(), channel_name, parsed, False
+
+        for _, raw_text in ordered_channels:
+            repaired = self._repair_json_text(raw_text, expect_array=expect_array)
+            if repaired is None:
+                continue
+            try:
+                parsed = json.loads(repaired)
+            except Exception:
+                continue
+            if (expect_array and not isinstance(parsed, list)) or (not expect_array and not isinstance(parsed, dict)):
+                continue
+            return repaired, "repaired_json", parsed, True
+
+        fallback_text = next((text for _, text in ordered_channels if text.strip()), "")
+        return fallback_text.strip(), "response", None, False
+
     def _extract_json(self, raw_text: str, *, expect_array: bool) -> Any:
-        cleaned = raw_text.strip()
+        cleaned = self._clean_json_candidate(raw_text)
         if not cleaned:
             return None
-        matcher = JSON_ARRAY_PATTERN if expect_array else JSON_OBJECT_PATTERN
-        match = matcher.search(cleaned)
-        if match is None:
-            return None
         try:
-            return json.loads(match.group(0))
+            parsed = json.loads(cleaned)
+        except Exception:
+            parsed = None
+        if parsed is not None and ((expect_array and isinstance(parsed, list)) or (not expect_array and isinstance(parsed, dict))):
+            return parsed
+
+        start_char = "[" if expect_array else "{"
+        end_char = "]" if expect_array else "}"
+        start_index = cleaned.find(start_char)
+        end_index = cleaned.rfind(end_char)
+        if start_index == -1 or end_index == -1 or end_index <= start_index:
+            return None
+        candidate = cleaned[start_index : end_index + 1]
+        try:
+            parsed = json.loads(candidate)
         except Exception:
             return None
+        if (expect_array and isinstance(parsed, list)) or (not expect_array and isinstance(parsed, dict)):
+            return parsed
+        return None
+
+    def _repair_json_text(self, raw_text: str, *, expect_array: bool) -> str | None:
+        cleaned = self._clean_json_candidate(raw_text)
+        if not cleaned:
+            return None
+        if re.search(r"}\s*{", cleaned) or re.search(r"]\s*\[", cleaned):
+            return None
+
+        start_char = "[" if expect_array else "{"
+        start_index = cleaned.find(start_char)
+        if start_index == -1:
+            return None
+        candidate = cleaned[start_index:]
+        candidate = re.sub(r",(\s*[}\]])", r"\1", candidate)
+
+        if self._contains_multiple_top_level_objects(candidate, expect_array=expect_array):
+            return None
+
+        brace_balance = 0
+        bracket_balance = 0
+        in_string = False
+        escape = False
+        for character in candidate:
+            if escape:
+                escape = False
+                continue
+            if character == "\\":
+                escape = True
+                continue
+            if character == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if character == "{":
+                brace_balance += 1
+            elif character == "}":
+                brace_balance -= 1
+                if brace_balance < 0:
+                    return None
+            elif character == "[":
+                bracket_balance += 1
+            elif character == "]":
+                bracket_balance -= 1
+                if bracket_balance < 0:
+                    return None
+
+        repaired = candidate + ("}" * brace_balance) + ("]" * bracket_balance)
+        try:
+            parsed = json.loads(repaired)
+        except Exception:
+            return None
+        if (expect_array and isinstance(parsed, list)) or (not expect_array and isinstance(parsed, dict)):
+            return repaired
+        return None
+
+    @staticmethod
+    def _clean_json_candidate(raw_text: str) -> str:
+        cleaned = str(raw_text or "").strip()
+        if not cleaned:
+            return ""
+        cleaned = JSON_FENCE_PATTERN.sub("", cleaned).strip()
+        return cleaned
+
+    @staticmethod
+    def _contains_multiple_top_level_objects(candidate: str, *, expect_array: bool) -> bool:
+        if expect_array:
+            return False
+        depth = 0
+        in_string = False
+        escape = False
+        object_count = 0
+        for character in candidate:
+            if escape:
+                escape = False
+                continue
+            if character == "\\":
+                escape = True
+                continue
+            if character == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if character == "{":
+                depth += 1
+                if depth == 1:
+                    object_count += 1
+                    if object_count > 1:
+                        return True
+            elif character == "}":
+                depth = max(0, depth - 1)
+        return False

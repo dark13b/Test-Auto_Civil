@@ -456,6 +456,16 @@ llm:
   enabled: false
   backend_mode: hybrid
   allow_deterministic_fallback: true
+  default_local_proposal_model: qwen3:8b
+  compact_prompt_models: [qwen3:4b]
+  enable_regeneration_on_reject: true
+  max_regeneration_attempts: 1
+  duplicate_similarity_thresholds:
+    numeric_tolerance: 0.05
+    float_round_digits: 4
+  temporarily_block_saturated_families: true
+  diversity:
+    max_family_share: 0.35
   interval_trials: 15
   interaction_interval_minutes: 5
   smart_model_after_progress: 0.67

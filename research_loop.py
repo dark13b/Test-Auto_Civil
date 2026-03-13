@@ -408,6 +408,7 @@ def _build_proposal_engine(config: dict[str, Any], outputs_dir: Path) -> Proposa
         interaction_log_path=interaction_log_path,
         log_interactions=bool(llm_config.get("log_interactions", True)),
         include_no_think_directive=bool(llm_config.get("include_no_think_directive", False)),
+        llm_config=llm_config,
     )
 
 
@@ -447,16 +448,21 @@ def _select_scout_candidates(
             scout_limit=scout_limit,
         )
         if llm_candidates:
+            interaction_summary = getattr(proposal_engine, "last_interaction_summary", {})
             return llm_candidates, {
                 "proposal_mode": "llm",
                 "proposal_backend": proposal_engine.backend_name,
                 "proposal_count": len(llm_candidates),
+                "proposal_model": interaction_summary.get("model"),
+                "prompt_variant": interaction_summary.get("prompt_variant"),
             }
         if not allow_deterministic_fallback:
             return [], {
                 "proposal_mode": "llm_unavailable",
                 "proposal_backend": proposal_engine.backend_name,
                 "proposal_count": 0,
+                "proposal_model": None,
+                "prompt_variant": None,
             }
 
     deterministic_candidates = research_lab.scout_experiments(
@@ -478,6 +484,45 @@ def _select_scout_candidates(
         "proposal_mode": "deterministic_fallback",
         "proposal_backend": "fallback",
         "proposal_count": len(deterministic_candidates),
+        "proposal_model": None,
+        "prompt_variant": None,
+    }
+
+
+def analyze_interaction_log(outputs_dir: Path, *, filename: str = "llm_interactions.jsonl") -> dict[str, Any]:
+    interaction_path = outputs_dir / filename
+    if not interaction_path.exists():
+        return {
+            "exists": False,
+            "interaction_count": 0,
+            "channel_counts": {},
+            "rejection_counts": {},
+        }
+
+    channel_counts: dict[str, int] = {}
+    rejection_counts: dict[str, int] = {}
+    repair_count = 0
+    parse_success_count = 0
+    with interaction_path.open("r", encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+    for record in records:
+        channel = str(record.get("extracted_from_channel", "unknown"))
+        channel_counts[channel] = channel_counts.get(channel, 0) + 1
+        if bool(record.get("repair_used", False)):
+            repair_count += 1
+        if bool(record.get("parse_success", False)):
+            parse_success_count += 1
+        rejection = record.get("rejection_reason")
+        if isinstance(rejection, dict):
+            code = str(rejection.get("code", "unknown"))
+            rejection_counts[code] = rejection_counts.get(code, 0) + 1
+    return {
+        "exists": True,
+        "interaction_count": len(records),
+        "channel_counts": channel_counts,
+        "rejection_counts": rejection_counts,
+        "repair_count": repair_count,
+        "parse_success_count": parse_success_count,
     }
 
 
@@ -564,7 +609,10 @@ def run_engineering_research_loop(
         log_status(
             "INFO scout_candidate_source | "
             f"cycle={cycle_number} | mode={proposal_metadata['proposal_mode']} | "
-            f"backend={proposal_metadata['proposal_backend']} | count={proposal_metadata['proposal_count']}"
+            f"backend={proposal_metadata['proposal_backend']} | "
+            f"model={proposal_metadata.get('proposal_model')} | "
+            f"prompt_variant={proposal_metadata.get('prompt_variant')} | "
+            f"count={proposal_metadata['proposal_count']}"
         )
         if not scout_candidates:
             log_status(f"INFO no_scout_candidates_remaining | cycle={cycle_number}")
@@ -874,6 +922,11 @@ def main() -> int:
         action="store_true",
         help="Validate final artifact consistency and exit.",
     )
+    parser.add_argument(
+        "--analyze-interactions",
+        action="store_true",
+        help="Summarize llm_interactions.jsonl and exit.",
+    )
     args = parser.parse_args()
 
     try:
@@ -883,6 +936,19 @@ def main() -> int:
             write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
             log_status(f"Final artifact validation complete. consistent={validation_report['consistent']}")
             return 0 if validation_report["consistent"] else 1
+
+        if args.analyze_interactions:
+            interaction_summary = analyze_interaction_log(outputs_dir)
+            log_status(
+                "Interaction analysis | "
+                f"exists={interaction_summary['exists']} | "
+                f"count={interaction_summary['interaction_count']} | "
+                f"channels={json.dumps(interaction_summary['channel_counts'], sort_keys=True)} | "
+                f"rejections={json.dumps(interaction_summary['rejection_counts'], sort_keys=True)} | "
+                f"repairs={interaction_summary.get('repair_count', 0)} | "
+                f"parse_success={interaction_summary.get('parse_success_count', 0)}"
+            )
+            return 0
 
         best_result = run_engineering_research_loop(
             cycles_override=args.cycles,

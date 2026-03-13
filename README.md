@@ -233,6 +233,8 @@ llm:
   enabled: true
   backend_mode: hybrid
   allow_deterministic_fallback: true
+  default_local_proposal_model: qwen3:8b
+  compact_prompt_models: [qwen3:4b]
   ollama:
     base_url: http://localhost:11434
     fast_model: qwen3:4b
@@ -245,6 +247,10 @@ llm:
     primary: ollama
     fallback: openai
 ```
+
+Proposal prompts now route by configured model capability instead of hardcoded prompt text. Models listed in `llm.compact_prompt_models` receive compact prompts with only the best summary, the last 5 relevant trials, current family-state blocks, allowed families, and strict JSON rules. Other models receive the richer prompt variant with a slightly wider history and family-state context.
+
+Proposal execution now has a post-parse gate before any experiment runs. Exact duplicates, near-duplicates, saturated-family repeats, malformed payloads, and weak-family retries without meaningful novelty are rejected and logged. When the gate rejects a candidate, the proposer can regenerate once (`llm.enable_regeneration_on_reject` / `llm.max_regeneration_attempts`) and then falls back to the deterministic research surface.
 
 What the LLM layer is allowed to do:
 - generate hypotheses
@@ -260,6 +266,17 @@ What it is not allowed to do:
 - redefine the final artifact source of truth
 
 `outputs/final_metrics.json` remains canonical even when LLM proposals are enabled.
+
+`outputs/llm_interactions.jsonl` now records the prompt variant, raw response/thinking channels, the final extracted text, `extracted_from_channel`, JSON repair usage, duplicate rejection metadata, regeneration attempts, fallback usage, and the final parsed candidate. This makes empty-response / thinking-text recoveries explicit instead of silent.
+
+Family-state reasoning is shared between prompting and gating. Each proposal cycle summarizes:
+- `strongest_active_family`
+- `saturated_families`
+- `underexplored_promising_families`
+- `underexplored_weak_families`
+- `temporarily_blocked_families`
+
+Underexplored families are no longer encouraged on trial count alone; recent measured outcomes decide whether a family is still worth probing.
 
 ## Data modes
 
