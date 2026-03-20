@@ -1,8 +1,8 @@
-"""Engineering validation rules for concrete strength predictions."""
+"""Context-aware engineering validation rules for concrete strength predictions."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -10,16 +10,132 @@ import pandas as pd
 
 from feature_engineering import build_engineering_features
 
-CONTEXT_DURABILITY_WATER_CEMENT_LIMITS = {
-    "exposed": 0.45,
-    "structural": 0.50,
+WARNING_CATEGORY_HARD_CONSTRAINT = "Hard Constraint"
+WARNING_CATEGORY_ENGINEERING_CAUTION = "Engineering Caution"
+WARNING_CATEGORY_DATA_REVIEW_FLAG = "Data Review Flag"
+
+SEVERITY_HIGH = "high"
+SEVERITY_MEDIUM = "medium"
+SEVERITY_LOW = "low"
+
+CONFIDENCE_HIGH = "high"
+CONFIDENCE_MODERATE = "moderate"
+CONFIDENCE_LIMITED = "limited"
+
+DEFAULT_DURABILITY_WATER_CEMENT_LIMITS = {
     "general": 0.60,
+    "structural": 0.50,
+    "exposed": 0.45,
+    "severe": 0.45,
+    "marine": 0.40,
+    "freeze_thaw": 0.45,
+    "sulfate": 0.45,
 }
+
+EXPOSURE_CLASS_ALIASES = {
+    "general": "general",
+    "mild": "general",
+    "normal": "general",
+    "structural": "structural",
+    "exposed": "exposed",
+    "exterior": "exposed",
+    "severe": "severe",
+    "marine": "marine",
+    "chloride": "marine",
+    "freeze_thaw": "freeze_thaw",
+    "freeze-thaw": "freeze_thaw",
+    "frost": "freeze_thaw",
+    "sulfate": "sulfate",
+}
+
+CONFIDENCE_ORDER = {
+    CONFIDENCE_LIMITED: 0,
+    CONFIDENCE_MODERATE: 1,
+    CONFIDENCE_HIGH: 2,
+}
+
+
+def _safe_float(value: Any) -> float | None:
+    """Return a finite float when possible."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(result):
+        return None
+    return result
+
+
+def _normalize_token(value: Any) -> str:
+    """Normalize free-text metadata to a stable token."""
+    return str(value).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    """Preserve input order while removing duplicates."""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _confidence_minimum(*levels: str) -> str:
+    """Return the lowest confidence level in a collection."""
+    if not levels:
+        return CONFIDENCE_HIGH
+    return min(levels, key=lambda level: CONFIDENCE_ORDER.get(level, -1))
+
+
+def _format_factor_value(value: Any) -> str:
+    """Render a factor value for evidence summaries."""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.3f}"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    return str(value)
+
+
+@dataclass(frozen=True)
+class WarningRecord:
+    """Structured warning payload exposed to users and reports."""
+
+    warning_code: str
+    warning_category: str
+    severity: str
+    message: str
+    triggering_factors: dict[str, Any]
+    evidence_summary: str
+    academic_note: str
+    recommended_review_action: str
+    assessment_confidence: str
+    downgraded_from: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "warning_code": self.warning_code,
+            "warning_category": self.warning_category,
+            "severity": self.severity,
+            "message": self.message,
+            "triggering_factors": dict(self.triggering_factors),
+            "evidence_summary": self.evidence_summary,
+            "academic_note": self.academic_note,
+            "recommended_review_action": self.recommended_review_action,
+            "assessment_confidence": self.assessment_confidence,
+        }
+        if self.downgraded_from is not None:
+            payload["downgraded_from"] = self.downgraded_from
+        return payload
 
 
 @dataclass
 class EngineeringValidator:
-    """Validate predictions against domain-specific engineering rules."""
+    """Validate predictions against context-aware engineering rules."""
 
     min_strength_mpa: float
     max_strength_mpa: float
@@ -39,12 +155,33 @@ class EngineeringValidator:
     context_type: str = "general"
     water_column: str = "water"
     cement_column: str = "cement"
+    durability_water_cement_limits: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_DURABILITY_WATER_CEMENT_LIMITS)
+    )
+    scm_meaningful_replacement_threshold: float = 0.15
+    high_volume_scm_replacement_threshold: float = 0.45
+    age_regime_early_max_days: float = 7.0
+    age_regime_later_min_days: float = 56.0
+    workability_support_superplasticizer_ratio: float = 0.01
+    paste_rich_aggregate_paste_ratio_threshold: float = 2.85
+    shrinkage_low_water_binder_threshold: float = 0.38
+    shrinkage_strength_threshold: float = 50.0
+    scm_durability_preferred_water_binder_ratio: float = 0.45
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "EngineeringValidator":
         """Construct a validator from the project configuration."""
         bounds = config["engineering_bounds"]
         rules = config["validator"]
+        durability_limits = dict(DEFAULT_DURABILITY_WATER_CEMENT_LIMITS)
+        configured_limits = rules.get("durability_water_cement_limits", {})
+        if isinstance(configured_limits, dict):
+            for exposure_name, limit in configured_limits.items():
+                normalized_name = _normalize_token(exposure_name)
+                coerced_limit = _safe_float(limit)
+                if coerced_limit is not None:
+                    durability_limits[normalized_name] = coerced_limit
+
         return cls(
             min_strength_mpa=float(bounds["min"]),
             max_strength_mpa=float(bounds["max"]),
@@ -68,30 +205,313 @@ class EngineeringValidator:
             high_water_cement_strength_unfavorable_water_binder_ratio=float(
                 rules.get("high_water_cement_strength_unfavorable_water_binder_ratio", 0.50)
             ),
+            durability_water_cement_limits=durability_limits,
+            scm_meaningful_replacement_threshold=float(
+                rules.get("scm_meaningful_replacement_threshold", 0.15)
+            ),
+            high_volume_scm_replacement_threshold=float(
+                rules.get("high_volume_scm_replacement_threshold", 0.45)
+            ),
+            age_regime_early_max_days=float(rules.get("age_regime_early_max_days", 7.0)),
+            age_regime_later_min_days=float(rules.get("age_regime_later_min_days", 56.0)),
+            workability_support_superplasticizer_ratio=float(
+                rules.get("workability_support_superplasticizer_ratio", 0.01)
+            ),
+            paste_rich_aggregate_paste_ratio_threshold=float(
+                rules.get("paste_rich_aggregate_paste_ratio_threshold", 2.85)
+            ),
+            shrinkage_low_water_binder_threshold=float(
+                rules.get("shrinkage_low_water_binder_threshold", 0.38)
+            ),
+            shrinkage_strength_threshold=float(rules.get("shrinkage_strength_threshold", 50.0)),
+            scm_durability_preferred_water_binder_ratio=float(
+                rules.get("scm_durability_preferred_water_binder_ratio", 0.45)
+            ),
         )
 
     def __post_init__(self) -> None:
-        """Validate validator configuration after dataclass initialization."""
-        if self.context_type not in CONTEXT_DURABILITY_WATER_CEMENT_LIMITS:
-            valid_contexts = ", ".join(sorted(CONTEXT_DURABILITY_WATER_CEMENT_LIMITS))
+        """Validate configuration after dataclass initialization."""
+        if self.context_type not in self.durability_water_cement_limits:
+            valid_contexts = ", ".join(sorted(self.durability_water_cement_limits))
             raise ValueError(f"validator.context_type must be one of: {valid_contexts}")
 
-    def _durability_water_cement_limit(self) -> float:
-        """Return the water/cement durability threshold for the active context."""
-        return float(
-            CONTEXT_DURABILITY_WATER_CEMENT_LIMITS.get(
-                self.context_type,
-                self.durability_water_cement_warn,
-            )
-        )
-
-    def _prepare_frame(self, x_test: pd.DataFrame) -> pd.DataFrame:
+    def _prepare_frame(self, x_frame: pd.DataFrame) -> pd.DataFrame:
         """Ensure engineered columns required by the validator are present."""
-        if self.water_column not in x_test.columns or self.cement_column not in x_test.columns:
+        if self.water_column not in x_frame.columns or self.cement_column not in x_frame.columns:
             raise ValueError(
                 f"Required columns '{self.water_column}' and '{self.cement_column}' are missing."
             )
-        return build_engineering_features(x_test)
+        return build_engineering_features(x_frame)
+
+    def _build_evidence_summary(self, factors: dict[str, Any]) -> str:
+        """Convert triggering factors into a compact evidence summary."""
+        rendered = [
+            f"{name}={_format_factor_value(value)}"
+            for name, value in factors.items()
+            if value is not None and value != ""
+        ]
+        return ", ".join(rendered)
+
+    def _make_warning_record(
+        self,
+        *,
+        warning_code: str,
+        warning_category: str,
+        severity: str,
+        message: str,
+        triggering_factors: dict[str, Any],
+        academic_note: str,
+        recommended_review_action: str,
+        assessment_confidence: str,
+        downgraded_from: str | None = None,
+    ) -> dict[str, Any]:
+        """Build one structured warning record."""
+        return WarningRecord(
+            warning_code=warning_code,
+            warning_category=warning_category,
+            severity=severity,
+            message=message,
+            triggering_factors=triggering_factors,
+            evidence_summary=self._build_evidence_summary(triggering_factors),
+            academic_note=academic_note,
+            recommended_review_action=recommended_review_action,
+            assessment_confidence=assessment_confidence,
+            downgraded_from=downgraded_from,
+        ).to_dict()
+
+    def _age_regime(self, age_days: float | None) -> tuple[str, str]:
+        """Return the age regime code and label."""
+        if age_days is None:
+            return "unknown_age", "unknown age regime"
+        if age_days < self.age_regime_early_max_days:
+            return "early_age", "early-age regime"
+        if age_days > self.age_regime_later_min_days:
+            return "later_age", "later-age / extended curing regime"
+        return "standard_28_day", "standard 28-day curing regime"
+
+    def _resolve_exposure_context(self, sample: pd.Series) -> dict[str, Any]:
+        """Resolve exposure metadata into a durability screening context."""
+        for column_name in ("exposure_class", "exposure_severity", "durability_context", "exposure"):
+            if column_name not in sample.index:
+                continue
+            normalized = EXPOSURE_CLASS_ALIASES.get(_normalize_token(sample[column_name]))
+            if normalized is None:
+                continue
+            return {
+                "label": normalized,
+                "source": column_name,
+                "water_cement_limit": float(self.durability_water_cement_limits[normalized]),
+                "confidence": CONFIDENCE_HIGH,
+                "metadata_available": True,
+            }
+
+        return {
+            "label": self.context_type,
+            "source": "config_default",
+            "water_cement_limit": float(
+                self.durability_water_cement_limits.get(self.context_type, self.durability_water_cement_warn)
+            ),
+            "confidence": CONFIDENCE_MODERATE,
+            "metadata_available": False,
+        }
+
+    def _resolve_workability_support(self, sample: pd.Series) -> dict[str, Any]:
+        """Resolve explicit or inferred workability-support metadata."""
+        for column_name in (
+            "workability_support",
+            "admixture_workability_support",
+            "workability_support_metadata",
+        ):
+            if column_name not in sample.index:
+                continue
+            value = sample[column_name]
+            if isinstance(value, (bool, np.bool_)):
+                return {
+                    "status": "supported" if bool(value) else "unsupported",
+                    "source": column_name,
+                    "confidence": CONFIDENCE_HIGH,
+                }
+            normalized = _normalize_token(value)
+            if normalized in {"supported", "support", "true", "yes", "available"}:
+                return {
+                    "status": "supported",
+                    "source": column_name,
+                    "confidence": CONFIDENCE_HIGH,
+                }
+            if normalized in {"unsupported", "false", "no", "absent"}:
+                return {
+                    "status": "unsupported",
+                    "source": column_name,
+                    "confidence": CONFIDENCE_HIGH,
+                }
+
+        superplasticizer_binder_ratio = _safe_float(sample.get("superplasticizer_binder_ratio"))
+        superplasticizer = _safe_float(sample.get("superplasticizer"))
+        if superplasticizer_binder_ratio is not None and (
+            superplasticizer_binder_ratio >= self.workability_support_superplasticizer_ratio
+        ):
+            return {
+                "status": "supported",
+                "source": "superplasticizer_binder_ratio",
+                "confidence": CONFIDENCE_MODERATE,
+            }
+        if superplasticizer is not None and superplasticizer > 0.0:
+            return {
+                "status": "limited",
+                "source": "superplasticizer",
+                "confidence": CONFIDENCE_MODERATE,
+            }
+        if superplasticizer is not None:
+            return {
+                "status": "unsupported",
+                "source": "superplasticizer",
+                "confidence": CONFIDENCE_MODERATE,
+            }
+        return {
+            "status": "unknown",
+            "source": "missing",
+            "confidence": CONFIDENCE_LIMITED,
+        }
+
+    def _scm_regime(
+        self,
+        supplementary_ratio: float | None,
+        fly_ash_ratio: float | None,
+        slag_ratio: float | None,
+    ) -> tuple[str, str]:
+        """Classify the SCM replacement regime."""
+        supplementary_ratio = supplementary_ratio or 0.0
+        fly_ash_ratio = fly_ash_ratio or 0.0
+        slag_ratio = slag_ratio or 0.0
+        high_volume_slag_threshold = min(
+            self.slag_replacement_warn,
+            max(0.55, self.high_volume_scm_replacement_threshold + 0.10),
+        )
+        if supplementary_ratio < self.scm_meaningful_replacement_threshold:
+            return "plain_cement", "plain-cement regime"
+        if (
+            supplementary_ratio >= self.high_volume_scm_replacement_threshold
+            or fly_ash_ratio >= self.fly_ash_replacement_warn
+            or slag_ratio >= high_volume_slag_threshold
+        ):
+            return "high_volume_scm", "high-volume SCM regime"
+        return "scm_bearing", "SCM-bearing regime"
+
+    def _build_context(self, sample: pd.Series, prediction: float) -> dict[str, Any]:
+        """Build the context bundle used by the rule engine."""
+        water_cement_ratio = _safe_float(sample.get("water_cement_ratio"))
+        water_binder_ratio = _safe_float(sample.get("water_binder_ratio"))
+        total_binder = _safe_float(sample.get("total_binder"))
+        supplementary_replacement_ratio = _safe_float(sample.get("supplementary_replacement_ratio"))
+        fly_ash_replacement_ratio = _safe_float(sample.get("fly_ash_replacement_ratio"))
+        slag_replacement_ratio = _safe_float(sample.get("slag_replacement_ratio"))
+        aggregate_paste_ratio = _safe_float(sample.get("aggregate_paste_ratio"))
+        cement_content = _safe_float(sample.get(self.cement_column))
+        water_content = _safe_float(sample.get(self.water_column))
+        slag_content = _safe_float(sample.get("slag"))
+        fly_ash_content = _safe_float(sample.get("fly_ash"))
+        age_days = _safe_float(sample.get("age"))
+        superplasticizer = _safe_float(sample.get("superplasticizer"))
+
+        age_regime_code, age_regime_label = self._age_regime(age_days)
+        scm_regime_code, scm_regime_label = self._scm_regime(
+            supplementary_replacement_ratio,
+            fly_ash_replacement_ratio,
+            slag_replacement_ratio,
+        )
+        exposure_context = self._resolve_exposure_context(sample)
+        workability_support = self._resolve_workability_support(sample)
+
+        return {
+            "prediction_mpa": float(prediction),
+            "cement_content": cement_content,
+            "water_content": water_content,
+            "slag_content": slag_content,
+            "fly_ash_content": fly_ash_content,
+            "scm_content": None
+            if slag_content is None and fly_ash_content is None
+            else float((slag_content or 0.0) + (fly_ash_content or 0.0)),
+            "water_cement_ratio": water_cement_ratio,
+            "water_binder_ratio": water_binder_ratio,
+            "total_binder": total_binder,
+            "supplementary_replacement_ratio": supplementary_replacement_ratio,
+            "fly_ash_replacement_ratio": fly_ash_replacement_ratio,
+            "slag_replacement_ratio": slag_replacement_ratio,
+            "aggregate_paste_ratio": aggregate_paste_ratio,
+            "superplasticizer": superplasticizer,
+            "age_days": age_days,
+            "age_regime_code": age_regime_code,
+            "age_regime_label": age_regime_label,
+            "scm_regime_code": scm_regime_code,
+            "scm_regime_label": scm_regime_label,
+            "exposure_context": exposure_context,
+            "workability_support": workability_support,
+            "assessment_confidence": CONFIDENCE_HIGH,
+        }
+
+    def _component_hard_constraints(self, context: dict[str, Any]) -> list[tuple[str, str]]:
+        """Return component-level hard-constraint violations."""
+        violations: list[tuple[str, str]] = []
+        numeric_components = {
+            "cement_content": context["cement_content"],
+            "water_content": context["water_content"],
+            "slag_content": context["slag_content"],
+            "fly_ash_content": context["fly_ash_content"],
+            "age_days": context["age_days"],
+            "total_binder": context["total_binder"],
+        }
+        for name, value in numeric_components.items():
+            if value is None:
+                continue
+            if value < 0.0:
+                violations.append(
+                    (
+                        f"invalid_{name}_state",
+                        f"{name.replace('_', ' ').capitalize()} is negative and the mix definition is invalid.",
+                    )
+                )
+        if context["total_binder"] is not None and context["total_binder"] <= 0.0:
+            violations.append(
+                (
+                    "invalid_total_binder_state",
+                    "Total binder content is non-positive and the mix cannot be evaluated reliably.",
+                )
+            )
+        if context["age_days"] is not None and context["age_days"] <= 0.0:
+            violations.append(
+                (
+                    "invalid_age_state",
+                    "Age must be positive for a physically interpretable curing regime.",
+                )
+            )
+        return violations
+
+    def _build_contextual_summary(
+        self,
+        *,
+        context: dict[str, Any],
+        hard_constraints: list[dict[str, Any]],
+        engineering_cautions: list[dict[str, Any]],
+        data_review_flags: list[dict[str, Any]],
+        downgraded_warnings: list[dict[str, Any]],
+    ) -> str:
+        """Build a short human-readable summary for one evaluated mix."""
+        summary_parts = [
+            context["scm_regime_label"],
+            context["age_regime_label"],
+            f"durability context={context['exposure_context']['label']}",
+        ]
+        if hard_constraints:
+            summary_parts.append(f"{len(hard_constraints)} hard constraint(s)")
+        if engineering_cautions:
+            summary_parts.append(f"{len(engineering_cautions)} engineering caution(s)")
+        if data_review_flags:
+            summary_parts.append(f"{len(data_review_flags)} data review flag(s)")
+        if downgraded_warnings:
+            summary_parts.append("water/cement-only screening was downgraded where SCM-age context was available")
+        if len(summary_parts) == 3:
+            summary_parts.append("no contextual warnings fired")
+        return "; ".join(summary_parts)
 
     def _evaluate_single_sample(
         self,
@@ -100,171 +520,555 @@ class EngineeringValidator:
         prediction: float,
         actual_value: float | None = None,
     ) -> dict[str, Any]:
-        """Evaluate a single prediction against engineering rules."""
-        warning_reasons: list[str] = []
-        failure_reasons: list[str] = []
-        statistical_error_reasons: list[str] = []
-        durability_caution_reasons: list[str] = []
-        dataset_anomaly_reasons: list[str] = []
-        triggered_rules: list[str] = []
+        """Evaluate a single prediction against context-aware engineering rules."""
+        context = self._build_context(sample, prediction)
+        hard_constraints_by_code: dict[str, dict[str, Any]] = {}
+        engineering_cautions_by_code: dict[str, dict[str, Any]] = {}
+        data_review_flags_by_code: dict[str, dict[str, Any]] = {}
+        downgraded_warnings: list[dict[str, Any]] = []
+        rule_evaluation_trace: list[dict[str, Any]] = []
 
         def add_warning(
-            reason: str,
-            rule_name: str,
+            store: dict[str, dict[str, Any]],
             *,
-            statistical: bool = False,
-            durability: bool = False,
-            dataset_anomaly: bool = False,
+            warning_code: str,
+            warning_category: str,
+            severity: str,
+            message: str,
+            triggering_factors: dict[str, Any],
+            academic_note: str,
+            recommended_review_action: str,
+            assessment_confidence: str,
+            downgraded_from: str | None = None,
         ) -> None:
-            """Append a warning once and optionally classify it."""
-            if reason not in warning_reasons:
-                warning_reasons.append(reason)
-            if statistical and reason not in statistical_error_reasons:
-                statistical_error_reasons.append(reason)
-            if durability and reason not in durability_caution_reasons:
-                durability_caution_reasons.append(reason)
-            if dataset_anomaly and reason not in dataset_anomaly_reasons:
-                dataset_anomaly_reasons.append(reason)
-            if rule_name not in triggered_rules:
-                triggered_rules.append(rule_name)
+            if warning_code in store:
+                return
+            warning_record = self._make_warning_record(
+                warning_code=warning_code,
+                warning_category=warning_category,
+                severity=severity,
+                message=message,
+                triggering_factors=triggering_factors,
+                academic_note=academic_note,
+                recommended_review_action=recommended_review_action,
+                assessment_confidence=assessment_confidence,
+                downgraded_from=downgraded_from,
+            )
+            store[warning_code] = warning_record
+            rule_evaluation_trace.append(
+                {
+                    "warning_code": warning_code,
+                    "outcome": "fired",
+                    "warning_category": warning_category,
+                    "severity": severity,
+                    "considered_factors": dict(triggering_factors),
+                }
+            )
 
-        def add_failure(reason: str, rule_name: str) -> None:
-            """Append a hard failure once."""
-            if reason not in failure_reasons:
-                failure_reasons.append(reason)
-            if reason not in statistical_error_reasons:
-                statistical_error_reasons.append(reason)
-            if rule_name not in triggered_rules:
-                triggered_rules.append(rule_name)
+        def add_downgrade(
+            *,
+            warning_code: str,
+            downgraded_from: str,
+            downgrade_reason: str,
+            contextual_basis: dict[str, Any],
+        ) -> None:
+            if warning_code in {item["warning_code"] for item in downgraded_warnings}:
+                return
+            downgraded_warnings.append(
+                {
+                    "warning_code": warning_code,
+                    "downgraded_from": downgraded_from,
+                    "downgraded_to": "suppressed",
+                    "downgrade_reason": downgrade_reason,
+                    "contextual_basis": dict(contextual_basis),
+                }
+            )
+            rule_evaluation_trace.append(
+                {
+                    "warning_code": warning_code,
+                    "outcome": "downgraded",
+                    "from_category": downgraded_from,
+                    "to_category": "suppressed",
+                    "reason": downgrade_reason,
+                    "considered_factors": dict(contextual_basis),
+                }
+            )
 
-        water_cement_ratio = float(sample["water_cement_ratio"])
-        water_binder_ratio = float(sample["water_binder_ratio"])
-        total_binder = float(sample["total_binder"])
-        supplementary_replacement_ratio = float(sample["supplementary_replacement_ratio"])
-        fly_ash_replacement_ratio = float(sample["fly_ash_replacement_ratio"])
-        slag_replacement_ratio = float(sample["slag_replacement_ratio"])
-        age = float(sample["age"])
-        scm_present = supplementary_replacement_ratio > 0.0
-
-        if not np.isfinite(prediction):
-            add_failure(
-                "Prediction is non-finite and cannot be interpreted as a concrete strength.",
-                "prediction_non_finite",
+        prediction_value = context["prediction_mpa"]
+        if not np.isfinite(prediction_value):
+            add_warning(
+                hard_constraints_by_code,
+                warning_code="prediction_non_finite",
+                warning_category=WARNING_CATEGORY_HARD_CONSTRAINT,
+                severity=SEVERITY_HIGH,
+                message="Prediction is non-finite and cannot be interpreted.",
+                triggering_factors={"prediction_mpa": prediction_value},
+                academic_note=(
+                    "A non-finite prediction does not represent a physically interpretable compressive "
+                    "strength and should be treated as an invalid model output."
+                ),
+                recommended_review_action="Inspect the model output path before using this prediction.",
+                assessment_confidence=CONFIDENCE_HIGH,
             )
         else:
-            if prediction < 0.0:
-                add_failure("Negative predicted strength is physically impossible.", "prediction_negative_strength")
-            if prediction < self.min_strength_mpa:
-                add_failure(
-                    "Prediction falls below configured minimum strength bound.",
-                    "prediction_below_min_bound",
+            if prediction_value < 0.0:
+                add_warning(
+                    hard_constraints_by_code,
+                    warning_code="prediction_negative_strength",
+                    warning_category=WARNING_CATEGORY_HARD_CONSTRAINT,
+                    severity=SEVERITY_HIGH,
+                    message="Predicted strength is negative.",
+                    triggering_factors={"prediction_mpa": prediction_value},
+                    academic_note=(
+                        "Negative compressive strength is physically impossible and indicates a model or "
+                        "data integrity failure."
+                    ),
+                    recommended_review_action="Reject the prediction and inspect the model or feature inputs.",
+                    assessment_confidence=CONFIDENCE_HIGH,
                 )
-            if prediction > self.max_strength_mpa:
-                add_failure(
-                    "Prediction exceeds configured maximum strength bound.",
-                    "prediction_above_max_bound",
+            if prediction_value < self.min_strength_mpa:
+                add_warning(
+                    hard_constraints_by_code,
+                    warning_code="prediction_below_min_bound",
+                    warning_category=WARNING_CATEGORY_HARD_CONSTRAINT,
+                    severity=SEVERITY_HIGH,
+                    message="Predicted strength falls below the configured lower engineering bound.",
+                    triggering_factors={
+                        "prediction_mpa": prediction_value,
+                        "configured_min_strength_mpa": self.min_strength_mpa,
+                    },
+                    academic_note=(
+                        "Configured engineering bounds define the accepted operating range for governed model "
+                        "outputs and should be enforced before downstream interpretation."
+                    ),
+                    recommended_review_action="Reject the prediction or revise the governing configuration.",
+                    assessment_confidence=CONFIDENCE_HIGH,
+                )
+            if prediction_value > self.max_strength_mpa:
+                add_warning(
+                    hard_constraints_by_code,
+                    warning_code="prediction_above_max_bound",
+                    warning_category=WARNING_CATEGORY_HARD_CONSTRAINT,
+                    severity=SEVERITY_HIGH,
+                    message="Predicted strength exceeds the configured upper engineering bound.",
+                    triggering_factors={
+                        "prediction_mpa": prediction_value,
+                        "configured_max_strength_mpa": self.max_strength_mpa,
+                    },
+                    academic_note=(
+                        "Configured engineering bounds define the accepted operating range for governed model "
+                        "outputs and prevent unreviewed extrapolation."
+                    ),
+                    recommended_review_action="Reject the prediction or revise the governing configuration.",
+                    assessment_confidence=CONFIDENCE_HIGH,
                 )
 
-            high_water_cement_high_strength = (
-                water_cement_ratio > self.suspicious_water_cement_ratio
-                and prediction > self.suspicious_strength_mpa
+        for warning_code, message in self._component_hard_constraints(context):
+            add_warning(
+                hard_constraints_by_code,
+                warning_code=warning_code,
+                warning_category=WARNING_CATEGORY_HARD_CONSTRAINT,
+                severity=SEVERITY_HIGH,
+                message=message,
+                triggering_factors={
+                    "cement_content": context["cement_content"],
+                    "water_content": context["water_content"],
+                    "slag_content": context["slag_content"],
+                    "fly_ash_content": context["fly_ash_content"],
+                    "age_days": context["age_days"],
+                    "total_binder": context["total_binder"],
+                },
+                academic_note=(
+                    "Negative constituent values, non-positive binder content, or non-positive age indicate an "
+                    "invalid mixture state rather than a debatable engineering warning."
+                ),
+                recommended_review_action="Verify the raw mix metadata before accepting the record.",
+                assessment_confidence=CONFIDENCE_HIGH,
             )
-            if high_water_cement_high_strength:
-                early_age = age <= self.high_water_cement_strength_hard_fail_max_age_days
-                low_scm_replacement = (
-                    supplementary_replacement_ratio
-                    < self.high_water_cement_strength_low_scm_threshold
+
+        if hard_constraints_by_code:
+            hard_constraints = list(hard_constraints_by_code.values())
+            engineering_cautions: list[dict[str, Any]] = []
+            data_review_flags: list[dict[str, Any]] = []
+            contextual_summary = self._build_contextual_summary(
+                context=context,
+                hard_constraints=hard_constraints,
+                engineering_cautions=engineering_cautions,
+                data_review_flags=data_review_flags,
+                downgraded_warnings=downgraded_warnings,
+            )
+            return self._build_sample_report(
+                row_index=row_index,
+                prediction=prediction_value,
+                actual_value=actual_value,
+                context=context,
+                hard_constraints=hard_constraints,
+                engineering_cautions=engineering_cautions,
+                data_review_flags=data_review_flags,
+                downgraded_warnings=downgraded_warnings,
+                rule_evaluation_trace=rule_evaluation_trace,
+                contextual_summary=contextual_summary,
+            )
+
+        water_cement_ratio = context["water_cement_ratio"]
+        water_binder_ratio = context["water_binder_ratio"]
+        total_binder = context["total_binder"]
+        supplementary_replacement_ratio = context["supplementary_replacement_ratio"]
+        age_days = context["age_days"]
+        exposure_context = context["exposure_context"]
+        workability_support = context["workability_support"]
+
+        high_strength = prediction_value > self.suspicious_strength_mpa
+        high_water_cement = (water_cement_ratio or 0.0) > self.suspicious_water_cement_ratio
+        high_water_binder = (
+            (water_binder_ratio or 0.0) >= self.high_water_cement_strength_unfavorable_water_binder_ratio
+        )
+        low_binder = total_binder is not None and total_binder < self.total_binder_low_warn
+        meaningful_scm = (
+            (supplementary_replacement_ratio or 0.0) >= self.scm_meaningful_replacement_threshold
+        )
+        high_volume_scm = context["scm_regime_code"] == "high_volume_scm"
+        early_age = context["age_regime_code"] == "early_age"
+        later_age = context["age_regime_code"] == "later_age"
+
+        if high_volume_scm:
+            review_factors = {
+                "age_regime": context["age_regime_label"],
+                "water_binder_ratio": water_binder_ratio,
+                "total_binder": total_binder,
+                "supplementary_replacement_ratio": supplementary_replacement_ratio,
+                "fly_ash_replacement_ratio": context["fly_ash_replacement_ratio"],
+                "slag_replacement_ratio": context["slag_replacement_ratio"],
+                "prediction_mpa": prediction_value,
+            }
+            add_warning(
+                data_review_flags_by_code,
+                warning_code="high_volume_scm_regime_review",
+                warning_category=WARNING_CATEGORY_DATA_REVIEW_FLAG,
+                severity=SEVERITY_MEDIUM,
+                message="High-volume SCM regime requires age-aware review.",
+                triggering_factors=review_factors,
+                academic_note=(
+                    "High replacement SCM systems can follow different strength-development trajectories than "
+                    "plain-cement mixtures, so they should be reviewed with water/binder ratio, total binder, "
+                    "and curing age in view before judging plausibility."
+                ),
+                recommended_review_action=(
+                    "Review curing age, binder replacement strategy, and strength-test metadata before treating "
+                    "the mix as anomalous."
+                ),
+                assessment_confidence=CONFIDENCE_HIGH,
+            )
+
+        if high_strength and high_water_cement:
+            plausibility_factors = {
+                "prediction_mpa": prediction_value,
+                "water_cement_ratio": water_cement_ratio,
+                "water_binder_ratio": water_binder_ratio,
+                "total_binder": total_binder,
+                "supplementary_replacement_ratio": supplementary_replacement_ratio,
+                "age_days": age_days,
+                "age_regime": context["age_regime_label"],
+                "scm_regime": context["scm_regime_label"],
+            }
+            contradictory_indicators: list[str] = []
+            if high_water_binder:
+                contradictory_indicators.append("water_binder_ratio")
+            if low_binder:
+                contradictory_indicators.append("total_binder")
+            if early_age:
+                contradictory_indicators.append("age_days")
+            if not meaningful_scm:
+                contradictory_indicators.append("supplementary_replacement_ratio")
+
+            if meaningful_scm and later_age and not high_water_binder and not low_binder:
+                add_downgrade(
+                    warning_code="high_water_cement_high_strength_context_review",
+                    downgraded_from=WARNING_CATEGORY_DATA_REVIEW_FLAG,
+                    downgrade_reason=(
+                        "SCM replacement, water/binder ratio, and later-age curing provide a more relevant "
+                        "context than water/cement ratio alone for this mix."
+                    ),
+                    contextual_basis=plausibility_factors,
                 )
-                unfavorable_water_binder_ratio = (
-                    water_binder_ratio
-                    >= self.high_water_cement_strength_unfavorable_water_binder_ratio
+            elif not meaningful_scm and early_age and high_water_binder:
+                add_warning(
+                    hard_constraints_by_code,
+                    warning_code="high_water_cement_high_strength_context_review",
+                    warning_category=WARNING_CATEGORY_HARD_CONSTRAINT,
+                    severity=SEVERITY_HIGH,
+                    message="Early-age high strength is incompatible with the binder-water context.",
+                    triggering_factors=plausibility_factors,
+                    academic_note=(
+                        "High early-age strength at very high water/cement ratio remains implausible when SCM "
+                        "replacement is limited and the binder-based water ratio is still unfavorable."
+                    ),
+                    recommended_review_action="Reject unless the mix metadata or test age is corrected.",
+                    assessment_confidence=CONFIDENCE_HIGH,
+                )
+            elif meaningful_scm and len(contradictory_indicators) >= 2:
+                add_warning(
+                    data_review_flags_by_code,
+                    warning_code="high_water_cement_high_strength_context_review",
+                    warning_category=WARNING_CATEGORY_DATA_REVIEW_FLAG,
+                    severity=SEVERITY_MEDIUM,
+                    message="Strength remains unusual after SCM-age screening.",
+                    triggering_factors=plausibility_factors,
+                    academic_note=(
+                        "SCM-bearing mixes should be screened with water/binder ratio, total binder, and curing "
+                        "age before they are called anomalous; once several of those indicators still disagree, "
+                        "manual review is warranted."
+                    ),
+                    recommended_review_action="Review curing age, binder chemistry, and test metadata together.",
+                    assessment_confidence=CONFIDENCE_HIGH,
+                )
+            else:
+                add_warning(
+                    data_review_flags_by_code,
+                    warning_code="high_water_cement_high_strength_context_review",
+                    warning_category=WARNING_CATEGORY_DATA_REVIEW_FLAG,
+                    severity=SEVERITY_MEDIUM,
+                    message="Strength is high relative to the water-ratio context.",
+                    triggering_factors=plausibility_factors,
+                    academic_note=(
+                        "High strength alongside a very high water/cement ratio is not automatically impossible, "
+                        "but it becomes more credible only when binder ratio, age, and SCM regime support it."
+                    ),
+                    recommended_review_action="Review age, binder ratio, and supplementary binder context together.",
+                    assessment_confidence=CONFIDENCE_HIGH,
                 )
 
-                # Plain w/c becomes too blunt once SCM replacement and later-age strength gain
-                # enter the mix. Keep this combination as a hard reject only when the binder
-                # context also looks implausible for early-age concrete.
-                if early_age and low_scm_replacement and unfavorable_water_binder_ratio:
-                    add_failure(
-                        "Very high water/cement ratio paired with high early-age strength, low SCM replacement, and an unfavorable water/binder ratio remains implausible.",
-                        "high_water_cement_ratio_with_high_strength_hard_fail",
-                    )
-                else:
-                    add_warning(
-                        "High strength at very high water/cement ratio is unusual; review curing age and SCM binder effects before accepting it.",
-                        "high_water_cement_ratio_with_high_strength_warn",
-                        statistical=True,
-                        dataset_anomaly=True,
-                    )
-                    if scm_present:
-                        add_warning(
-                            "SCM-bearing mixes should be screened with water/binder ratio and curing age, not water/cement ratio alone.",
-                            "scm_mix_water_binder_context_used",
-                            statistical=True,
-                        )
-                    if early_age and unfavorable_water_binder_ratio:
-                        add_warning(
-                            "Binder-based water ratio is still high for the predicted early-age strength; verify curing and testing context.",
-                            "early_age_high_strength_with_unfavorable_water_binder_ratio_warn",
-                            statistical=True,
-                        )
+        if age_days is not None and age_days <= self.early_age_days_warn and prediction_value > self.early_age_strength_warn:
+            early_strength_factors = {
+                "prediction_mpa": prediction_value,
+                "age_days": age_days,
+                "water_binder_ratio": water_binder_ratio,
+                "total_binder": total_binder,
+                "scm_regime": context["scm_regime_label"],
+            }
+            if meaningful_scm and not high_water_binder and not low_binder:
+                add_warning(
+                    engineering_cautions_by_code,
+                    warning_code="early_age_strength_review",
+                    warning_category=WARNING_CATEGORY_ENGINEERING_CAUTION,
+                    severity=SEVERITY_LOW,
+                    message="Very early strength should be checked against curing details.",
+                    triggering_factors=early_strength_factors,
+                    academic_note=(
+                        "Very early-age strengths can be legitimate in well-controlled systems, but they remain "
+                        "sensitive to curing regime, temperature history, and binder chemistry."
+                    ),
+                    recommended_review_action="Confirm the curing and test-age metadata before final acceptance.",
+                    assessment_confidence=CONFIDENCE_HIGH,
+                )
+            else:
+                add_warning(
+                    data_review_flags_by_code,
+                    warning_code="early_age_strength_review",
+                    warning_category=WARNING_CATEGORY_DATA_REVIEW_FLAG,
+                    severity=SEVERITY_MEDIUM,
+                    message="Very early strength looks unusually high for the recorded age.",
+                    triggering_factors=early_strength_factors,
+                    academic_note=(
+                        "Very high strength at a very early age is sensitive to curing regime and binder "
+                        "chemistry, so the observation should be reviewed before it is treated as ordinary."
+                    ),
+                    recommended_review_action="Verify the test age, curing regime, and specimen history.",
+                    assessment_confidence=CONFIDENCE_HIGH,
+                )
 
-        if water_cement_ratio > self._durability_water_cement_limit():
+        durability_factors = {
+            "water_cement_ratio": water_cement_ratio,
+            "water_binder_ratio": water_binder_ratio,
+            "durability_limit": exposure_context["water_cement_limit"],
+            "exposure_class": exposure_context["label"],
+            "scm_regime": context["scm_regime_label"],
+            "age_regime": context["age_regime_label"],
+        }
+        if water_cement_ratio is not None and water_cement_ratio > exposure_context["water_cement_limit"]:
+            severity = SEVERITY_MEDIUM
+            message = "Water ratio exceeds exposure-based durability guidance."
+            confidence = exposure_context["confidence"]
+            if not exposure_context["metadata_available"]:
+                message = "Water ratio exceeds fallback general guidance for durability."
+            emit_durability_caution = True
+            if (
+                meaningful_scm
+                and (water_binder_ratio or 0.0) <= self.scm_durability_preferred_water_binder_ratio
+                and not early_age
+            ):
+                severity = SEVERITY_LOW
+                durability_factors["binder_context_softens_screen"] = True
+                add_downgrade(
+                    warning_code=(
+                        "durability_exposure_water_ratio_caution"
+                        if exposure_context["metadata_available"]
+                        else "durability_general_water_ratio_caution"
+                    ),
+                    downgraded_from=WARNING_CATEGORY_ENGINEERING_CAUTION,
+                    downgrade_reason=(
+                        "SCM-bearing mixes are screened primarily with water/binder ratio and curing context, "
+                        "so the cement-only water ratio remains secondary guidance here."
+                    ),
+                    contextual_basis=durability_factors,
+                )
+                if not exposure_context["metadata_available"]:
+                    emit_durability_caution = False
+
+            if emit_durability_caution:
+                add_warning(
+                    engineering_cautions_by_code,
+                    warning_code=(
+                        "durability_exposure_water_ratio_caution"
+                        if exposure_context["metadata_available"]
+                        else "durability_general_water_ratio_caution"
+                    ),
+                    warning_category=WARNING_CATEGORY_ENGINEERING_CAUTION,
+                    severity=severity,
+                    message=message,
+                    triggering_factors=durability_factors,
+                    academic_note=(
+                        "Durability limits are exposure-dependent. When exposure metadata is known, the mix should be "
+                        "screened against that context; when it is absent, only general guidance can be applied."
+                    ),
+                    recommended_review_action=(
+                        "Confirm the exposure class and review curing, permeability, and binder selection before "
+                        "final durability sign-off."
+                        if exposure_context["metadata_available"]
+                        else "Add exposure metadata before treating this screen as a definitive durability decision."
+                    ),
+                    assessment_confidence=confidence,
+                )
+
+        if total_binder is not None and total_binder < self.total_binder_low_warn:
+            low_binder_factors = {
+                "total_binder": total_binder,
+                "water_binder_ratio": water_binder_ratio,
+                "water_cement_ratio": water_cement_ratio,
+                "exposure_class": exposure_context["label"],
+                "prediction_mpa": prediction_value,
+            }
+            severity = SEVERITY_LOW
+            if exposure_context["metadata_available"] or (water_binder_ratio or 0.0) > 0.50:
+                severity = SEVERITY_MEDIUM
             add_warning(
-                f"Water/cement ratio exceeds the typical durability limit for {self.context_type} concrete.",
-                "water_cement_ratio_warn_exceeds_durability_limit",
-                durability=True,
-            )
-        if water_binder_ratio < self.low_water_binder_warn:
-            add_warning(
-                "Water/binder ratio is very low; workability may be compromised.",
-                "water_binder_ratio_warn_too_low",
-                durability=True,
-            )
-        if total_binder < self.total_binder_low_warn:
-            add_warning(
-                "Total binder content is low; durability may be at risk.",
-                "total_binder_warn_too_low",
-                durability=True,
-            )
-        if total_binder > self.total_binder_high_warn:
-            add_warning(
-                "Total binder content is high; shrinkage risk increases.",
-                "total_binder_warn_too_high",
-                durability=True,
-            )
-        if fly_ash_replacement_ratio > self.fly_ash_replacement_warn:
-            add_warning(
-                "Fly ash replacement ratio exceeds the typical ACI substitution guidance.",
-                "fly_ash_replacement_ratio_warn_too_high",
-                dataset_anomaly=True,
-            )
-        if slag_replacement_ratio > self.slag_replacement_warn:
-            add_warning(
-                "Slag replacement ratio exceeds the typical BS 8500 guidance.",
-                "slag_replacement_ratio_warn_too_high",
-                dataset_anomaly=True,
-            )
-        if age < self.early_age_days_warn and prediction > self.early_age_strength_warn:
-            add_warning(
-                "Early-age strength prediction is suspiciously high for the curing age.",
-                "early_age_strength_warn_suspicious",
-                statistical=True,
-            )
-        if (
-            scm_present
-            and water_binder_ratio >= self.high_water_cement_strength_unfavorable_water_binder_ratio
-            and age <= self.high_water_cement_strength_hard_fail_max_age_days
-            and np.isfinite(prediction)
-            and prediction > self.suspicious_strength_mpa
-        ):
-            add_warning(
-                "SCM-rich mix still shows a relatively high water/binder ratio for the predicted early-age strength; review curing and binder chemistry.",
-                "scm_mix_high_water_binder_ratio_warn",
-                statistical=True,
+                engineering_cautions_by_code,
+                warning_code="low_binder_durability_caution",
+                warning_category=WARNING_CATEGORY_ENGINEERING_CAUTION,
+                severity=severity,
+                message="Binder content may be lean for the durability context.",
+                triggering_factors=low_binder_factors,
+                academic_note=(
+                    "Low total binder content can make durability more sensitive to curing quality and exposure "
+                    "severity, particularly when the water ratio is not correspondingly low."
+                ),
+                recommended_review_action="Review exposure severity, curing assumptions, and paste sufficiency.",
+                assessment_confidence=(
+                    exposure_context["confidence"]
+                    if exposure_context["metadata_available"]
+                    else CONFIDENCE_MODERATE
+                ),
             )
 
+        paste_rich = (context["aggregate_paste_ratio"] or np.inf) <= self.paste_rich_aggregate_paste_ratio_threshold
+        dense_matrix = (water_binder_ratio or np.inf) <= self.shrinkage_low_water_binder_threshold
+        high_strength_demand = prediction_value >= self.shrinkage_strength_threshold
+        shrinkage_indicators = sum([paste_rich, dense_matrix, high_strength_demand])
+        if total_binder is not None and total_binder > self.total_binder_high_warn and shrinkage_indicators >= 2:
+            add_warning(
+                engineering_cautions_by_code,
+                warning_code="high_binder_shrinkage_caution",
+                warning_category=WARNING_CATEGORY_ENGINEERING_CAUTION,
+                severity=SEVERITY_MEDIUM,
+                message="Paste-rich high-binder mix may have elevated shrinkage risk.",
+                triggering_factors={
+                    "total_binder": total_binder,
+                    "aggregate_paste_ratio": context["aggregate_paste_ratio"],
+                    "water_binder_ratio": water_binder_ratio,
+                    "prediction_mpa": prediction_value,
+                },
+                academic_note=(
+                    "High binder content becomes more shrinkage-sensitive when it is paired with a paste-rich "
+                    "aggregate balance, low water/binder ratio, or high strength demand."
+                ),
+                recommended_review_action="Review shrinkage mitigation, curing duration, and paste volume control.",
+                assessment_confidence=CONFIDENCE_HIGH,
+            )
+
+        if water_binder_ratio is not None and water_binder_ratio < self.low_water_binder_warn:
+            severity = SEVERITY_MEDIUM
+            if workability_support["status"] == "supported":
+                severity = SEVERITY_LOW
+            elif workability_support["status"] == "unsupported":
+                severity = SEVERITY_HIGH
+            add_warning(
+                engineering_cautions_by_code,
+                warning_code="low_water_binder_workability_caution",
+                warning_category=WARNING_CATEGORY_ENGINEERING_CAUTION,
+                severity=severity,
+                message=(
+                    "Very low water/binder ratio relies on declared workability support."
+                    if workability_support["status"] == "supported"
+                    else "Very low water/binder ratio may compromise workability."
+                ),
+                triggering_factors={
+                    "water_binder_ratio": water_binder_ratio,
+                    "workability_support": workability_support["status"],
+                    "support_source": workability_support["source"],
+                    "superplasticizer": context["superplasticizer"],
+                },
+                academic_note=(
+                    "Very low water/binder mixtures often need verified admixture support or placement controls "
+                    "to remain workable and consolidatable."
+                ),
+                recommended_review_action="Check slump/workability evidence and admixture support before acceptance.",
+                assessment_confidence=workability_support["confidence"],
+            )
+
+        hard_constraints = list(hard_constraints_by_code.values())
+        engineering_cautions = list(engineering_cautions_by_code.values())
+        data_review_flags = list(data_review_flags_by_code.values())
+        contextual_summary = self._build_contextual_summary(
+            context=context,
+            hard_constraints=hard_constraints,
+            engineering_cautions=engineering_cautions,
+            data_review_flags=data_review_flags,
+            downgraded_warnings=downgraded_warnings,
+        )
+        return self._build_sample_report(
+            row_index=row_index,
+            prediction=prediction_value,
+            actual_value=actual_value,
+            context=context,
+            hard_constraints=hard_constraints,
+            engineering_cautions=engineering_cautions,
+            data_review_flags=data_review_flags,
+            downgraded_warnings=downgraded_warnings,
+            rule_evaluation_trace=rule_evaluation_trace,
+            contextual_summary=contextual_summary,
+        )
+
+    def _build_sample_report(
+        self,
+        *,
+        row_index: Any,
+        prediction: float,
+        actual_value: float | None,
+        context: dict[str, Any],
+        hard_constraints: list[dict[str, Any]],
+        engineering_cautions: list[dict[str, Any]],
+        data_review_flags: list[dict[str, Any]],
+        downgraded_warnings: list[dict[str, Any]],
+        rule_evaluation_trace: list[dict[str, Any]],
+        contextual_summary: str,
+    ) -> dict[str, Any]:
+        """Build the public sample report with modern and compatibility fields."""
+        warning_reasons = [item["message"] for item in engineering_cautions + data_review_flags]
+        failure_reasons = [item["message"] for item in hard_constraints]
+        engineering_caution_reasons = [item["message"] for item in engineering_cautions]
+        data_review_flag_reasons = [item["message"] for item in data_review_flags]
         overall_verdict = "PASS"
-        if failure_reasons:
+        if hard_constraints:
             overall_verdict = "FAIL"
         elif warning_reasons:
             overall_verdict = "WARN"
@@ -274,45 +1078,66 @@ class EngineeringValidator:
             "prediction_mpa": float(prediction),
             "actual_mpa": actual_value,
             "context_type": self.context_type,
-            "water_cement_ratio": water_cement_ratio,
-            "water_binder_ratio": water_binder_ratio,
-            "total_binder": total_binder,
-            "supplementary_replacement_ratio": supplementary_replacement_ratio,
-            "fly_ash_replacement_ratio": fly_ash_replacement_ratio,
-            "slag_replacement_ratio": slag_replacement_ratio,
-            "age_days": age,
-            "statistical_error_reasons": statistical_error_reasons,
+            "water_cement_ratio": context["water_cement_ratio"],
+            "water_binder_ratio": context["water_binder_ratio"],
+            "total_binder": context["total_binder"],
+            "cement_content": context["cement_content"],
+            "scm_content": context["scm_content"],
+            "supplementary_replacement_ratio": context["supplementary_replacement_ratio"],
+            "fly_ash_replacement_ratio": context["fly_ash_replacement_ratio"],
+            "slag_replacement_ratio": context["slag_replacement_ratio"],
+            "age_days": context["age_days"],
+            "exposure_class": context["exposure_context"]["label"],
+            "workability_support": context["workability_support"]["status"],
+            "hard_constraints": hard_constraints,
+            "engineering_cautions": engineering_cautions,
+            "data_review_flags": data_review_flags,
             "warning_reasons": warning_reasons,
             "failure_reasons": failure_reasons,
             "hard_failure_reasons": list(failure_reasons),
-            "durability_caution_reasons": durability_caution_reasons,
-            "durability_warning_reasons": list(durability_caution_reasons),
-            "dataset_anomaly_reasons": dataset_anomaly_reasons,
-            "triggered_rules": triggered_rules,
-            "statistical_error_count": len(statistical_error_reasons),
-            "warning_count": len(warning_reasons),
-            "failure_count": len(failure_reasons),
-            "hard_failure_count": len(failure_reasons),
-            "durability_caution_count": len(durability_caution_reasons),
-            "durability_warning_count": len(durability_caution_reasons),
-            "dataset_anomaly_count": len(dataset_anomaly_reasons),
+            "engineering_caution_reasons": engineering_caution_reasons,
+            "durability_caution_reasons": list(engineering_caution_reasons),
+            "durability_warning_reasons": list(engineering_caution_reasons),
+            "data_review_flag_reasons": data_review_flag_reasons,
+            "dataset_anomaly_reasons": list(data_review_flag_reasons),
+            "statistical_error_reasons": list(data_review_flag_reasons),
+            "triggered_rules": [
+                item["warning_code"]
+                for item in hard_constraints + engineering_cautions + data_review_flags
+            ],
+            "hard_constraint_reasons": list(failure_reasons),
+            "downgraded_warnings": downgraded_warnings,
+            "downgraded_rule_codes": [item["warning_code"] for item in downgraded_warnings],
+            "rule_evaluation_trace": rule_evaluation_trace,
+            "contextual_summary": contextual_summary,
+            "confidence_of_warning_assessment": context["assessment_confidence"],
+            "hard_constraint_count": len(hard_constraints),
+            "engineering_caution_count": len(engineering_cautions),
+            "data_review_flag_count": len(data_review_flags),
+            "warning_count": len(engineering_cautions) + len(data_review_flags),
+            "failure_count": len(hard_constraints),
+            "hard_failure_count": len(hard_constraints),
+            "durability_caution_count": len(engineering_cautions),
+            "durability_warning_count": len(engineering_cautions),
+            "dataset_anomaly_count": len(data_review_flags),
+            "statistical_error_count": len(data_review_flags),
             "overall_verdict": overall_verdict,
         }
 
     def evaluate_samples(
         self,
         predictions: np.ndarray,
-        x_test: pd.DataFrame,
-        y_test: pd.Series | None = None,
+        x_frame: pd.DataFrame,
+        y_true: pd.Series | None = None,
     ) -> list[dict[str, Any]]:
         """Return per-sample validation details for a set of predictions."""
-        if len(predictions) != len(x_test):
+        if len(predictions) != len(x_frame):
             raise ValueError("Prediction length does not match the provided feature frame.")
 
-        prepared_frame = self._prepare_frame(x_test)
+        prepared_frame = self._prepare_frame(x_frame)
         sample_reports: list[dict[str, Any]] = []
         for position, (row_index, prediction) in enumerate(zip(prepared_frame.index.tolist(), predictions)):
-            actual_value = None if y_test is None else float(y_test.iloc[position])
+            actual_value = None if y_true is None else float(y_true.iloc[position])
             sample_reports.append(
                 self._evaluate_single_sample(
                     row_index=row_index,
@@ -326,109 +1151,211 @@ class EngineeringValidator:
     def validate_model(
         self,
         model: Any,
-        x_test: pd.DataFrame,
-        y_test: pd.Series | None = None,
+        x_frame: pd.DataFrame,
+        y_true: pd.Series | None = None,
     ) -> dict[str, Any]:
-        """Run a trained model on a test set and evaluate engineering rules."""
-        predictions = np.asarray(model.predict(x_test), dtype=float)
-        return self.validate_predictions(predictions, x_test, y_test)
+        """Run a trained model on a feature frame and evaluate engineering rules."""
+        predictions = np.asarray(model.predict(x_frame), dtype=float)
+        return self.validate_predictions(predictions, x_frame, y_true)
 
     def validate_predictions(
         self,
         predictions: np.ndarray,
-        x_test: pd.DataFrame,
-        y_test: pd.Series | None = None,
+        x_frame: pd.DataFrame,
+        y_true: pd.Series | None = None,
     ) -> dict[str, Any]:
         """Validate raw predictions and return a structured report."""
-        sample_reports = self.evaluate_samples(predictions, x_test, y_test)
-        failed_samples = [sample for sample in sample_reports if sample["overall_verdict"] == "FAIL"]
-        warning_samples = [sample for sample in sample_reports if sample["warning_reasons"]]
+        sample_reports = self.evaluate_samples(predictions, x_frame, y_true)
+        hard_constraint_samples = [sample for sample in sample_reports if sample["hard_constraints"]]
+        engineering_caution_samples = [sample for sample in sample_reports if sample["engineering_cautions"]]
+        data_review_flag_samples = [sample for sample in sample_reports if sample["data_review_flags"]]
+        warning_samples = [
+            sample
+            for sample in sample_reports
+            if sample["engineering_cautions"] or sample["data_review_flags"]
+        ]
         warning_only_samples = [sample for sample in sample_reports if sample["overall_verdict"] == "WARN"]
-        statistical_error_samples = [
-            sample for sample in sample_reports if sample["statistical_error_reasons"]
-        ]
-        durability_caution_samples = [
-            sample for sample in sample_reports if sample["durability_caution_reasons"]
-        ]
-        dataset_anomaly_samples = [sample for sample in sample_reports if sample["dataset_anomaly_reasons"]]
         total_samples = len(sample_reports)
-        passed_samples = total_samples - len(failed_samples) - len(warning_only_samples)
+        passed_samples = total_samples - len(hard_constraint_samples) - len(warning_only_samples)
         pass_rate = passed_samples / total_samples if total_samples else 0.0
+
         overall_verdict = "PASS"
-        if failed_samples:
+        if hard_constraint_samples:
             overall_verdict = "FAIL"
         elif warning_only_samples:
             overall_verdict = "WARN"
 
-        warn_reasons = sorted(
-            {
-                reason
-                for sample in sample_reports
-                for reason in sample["warning_reasons"]
-            }
+        hard_constraint_reasons = _unique_strings(
+            [reason for sample in sample_reports for reason in sample["hard_constraint_reasons"]]
         )
-        statistical_error_reasons = sorted(
-            {
-                reason
-                for sample in sample_reports
-                for reason in sample["statistical_error_reasons"]
-            }
+        engineering_caution_reasons = _unique_strings(
+            [reason for sample in sample_reports for reason in sample["engineering_caution_reasons"]]
         )
-        hard_fail_reasons = sorted(
-            {
-                reason
-                for sample in sample_reports
-                for reason in sample["failure_reasons"]
-            }
-        )
-        durability_caution_reasons = sorted(
-            {
-                reason
-                for sample in sample_reports
-                for reason in sample["durability_caution_reasons"]
-            }
-        )
-        dataset_anomaly_reasons = sorted(
-            {
-                reason
-                for sample in sample_reports
-                for reason in sample["dataset_anomaly_reasons"]
-            }
+        data_review_flag_reasons = _unique_strings(
+            [reason for sample in sample_reports for reason in sample["data_review_flag_reasons"]]
         )
         rule_violations_by_sample: dict[str, int] = {}
+        downgraded_warning_details: list[dict[str, Any]] = []
+        high_priority_warnings: list[dict[str, Any]] = []
         for sample in sample_reports:
             for rule_name in sample["triggered_rules"]:
                 rule_violations_by_sample[rule_name] = rule_violations_by_sample.get(rule_name, 0) + 1
+            for downgraded_warning in sample["downgraded_warnings"]:
+                downgraded_warning_details.append(
+                    {
+                        "sample_index": sample["index"],
+                        **dict(downgraded_warning),
+                    }
+                )
+            for warning in sample["hard_constraints"] + sample["engineering_cautions"] + sample["data_review_flags"]:
+                if (
+                    warning["warning_category"] == WARNING_CATEGORY_HARD_CONSTRAINT
+                    or warning["severity"] == SEVERITY_HIGH
+                ):
+                    high_priority_warnings.append(
+                        {
+                            "sample_index": sample["index"],
+                            **dict(warning),
+                        }
+                    )
+
+        report_confidence = _confidence_minimum(
+            *[sample["confidence_of_warning_assessment"] for sample in sample_reports]
+        )
+        contextual_summary = (
+            sample_reports[0]["contextual_summary"]
+            if len(sample_reports) == 1
+            else (
+                f"{len(hard_constraint_samples)} sample(s) with hard constraints, "
+                f"{len(engineering_caution_samples)} with engineering cautions, "
+                f"{len(data_review_flag_samples)} with data review flags, "
+                f"{len(downgraded_warning_details)} downgraded rule decision(s)."
+            )
+        )
 
         return {
             "context_type": self.context_type,
             "pass_rate": pass_rate,
-            "failed_samples": failed_samples,
+            "failed_samples": hard_constraint_samples,
+            "hard_constraint_samples": hard_constraint_samples,
             "warning_samples": warning_samples,
-            "suspicious_samples": statistical_error_samples,
-            "statistical_error_samples": statistical_error_samples,
-            "durability_caution_samples": durability_caution_samples,
-            "durability_warning_samples": durability_caution_samples,
-            "dataset_anomaly_samples": dataset_anomaly_samples,
-            "failed_count": len(failed_samples),
-            "hard_failed_count": len(failed_samples),
-            "warning_count": len(warning_samples),
-            "suspicious_count": len(statistical_error_samples),
-            "statistical_errors": len(statistical_error_samples),
-            "statistical_error_count": len(statistical_error_samples),
-            "durability_warnings": len(durability_caution_samples),
-            "durability_caution_count": len(durability_caution_samples),
-            "durability_warning_count": len(durability_caution_samples),
-            "dataset_anomalies": len(dataset_anomaly_samples),
-            "dataset_anomaly_count": len(dataset_anomaly_samples),
-            "warn_reasons": warn_reasons,
-            "statistical_error_reasons": statistical_error_reasons,
-            "hard_fail_reasons": hard_fail_reasons,
-            "durability_caution_reasons": durability_caution_reasons,
-            "durability_warning_reasons": durability_caution_reasons,
-            "dataset_anomaly_reasons": dataset_anomaly_reasons,
-            "rule_violations_by_sample": rule_violations_by_sample,
+            "suspicious_samples": data_review_flag_samples,
+            "statistical_error_samples": data_review_flag_samples,
+            "engineering_caution_samples": engineering_caution_samples,
+            "durability_caution_samples": engineering_caution_samples,
+            "durability_warning_samples": engineering_caution_samples,
+            "data_review_flag_samples": data_review_flag_samples,
+            "dataset_anomaly_samples": data_review_flag_samples,
             "sample_reports": sample_reports,
+            "hard_constraint_count": len(hard_constraint_samples),
+            "failed_count": len(hard_constraint_samples),
+            "hard_failed_count": len(hard_constraint_samples),
+            "engineering_caution_count": len(engineering_caution_samples),
+            "warning_count": len(warning_samples),
+            "data_review_flag_count": len(data_review_flag_samples),
+            "suspicious_count": len(data_review_flag_samples),
+            "statistical_errors": len(data_review_flag_samples),
+            "statistical_error_count": len(data_review_flag_samples),
+            "durability_warnings": len(engineering_caution_samples),
+            "durability_caution_count": len(engineering_caution_samples),
+            "durability_warning_count": len(engineering_caution_samples),
+            "dataset_anomalies": len(data_review_flag_samples),
+            "dataset_anomaly_count": len(data_review_flag_samples),
+            "warn_reasons": _unique_strings(engineering_caution_reasons + data_review_flag_reasons),
+            "hard_constraint_reasons": hard_constraint_reasons,
+            "hard_fail_reasons": list(hard_constraint_reasons),
+            "engineering_caution_reasons": engineering_caution_reasons,
+            "durability_caution_reasons": list(engineering_caution_reasons),
+            "durability_warning_reasons": list(engineering_caution_reasons),
+            "data_review_flag_reasons": data_review_flag_reasons,
+            "dataset_anomaly_reasons": list(data_review_flag_reasons),
+            "statistical_error_reasons": list(data_review_flag_reasons),
+            "rule_violations_by_sample": rule_violations_by_sample,
+            "downgraded_warning_details": downgraded_warning_details,
+            "downgraded_warning_count": len(downgraded_warning_details),
+            "high_priority_warnings": high_priority_warnings,
+            "contextual_summary": contextual_summary,
+            "confidence_of_warning_assessment": report_confidence,
             "overall_verdict": overall_verdict,
             "verdict": overall_verdict,
         }
+
+
+def summarize_validation_report(validation_report: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact validation summary with new and legacy aliases."""
+    hard_constraint_count = int(
+        validation_report.get(
+            "hard_constraint_count",
+            validation_report.get("hard_failed_count", validation_report.get("failed_count", 0)),
+        )
+    )
+    engineering_caution_count = int(
+        validation_report.get(
+            "engineering_caution_count",
+            validation_report.get("durability_caution_count", validation_report.get("warning_count", 0)),
+        )
+    )
+    data_review_flag_count = int(
+        validation_report.get(
+            "data_review_flag_count",
+            validation_report.get(
+                "dataset_anomaly_count",
+                validation_report.get("suspicious_count", validation_report.get("statistical_error_count", 0)),
+            ),
+        )
+    )
+    hard_constraint_reasons = list(
+        validation_report.get(
+            "hard_constraint_reasons",
+            validation_report.get("hard_fail_reasons", []),
+        )
+    )
+    engineering_caution_reasons = list(
+        validation_report.get(
+            "engineering_caution_reasons",
+            validation_report.get("durability_caution_reasons", []),
+        )
+    )
+    data_review_flag_reasons = list(
+        validation_report.get(
+            "data_review_flag_reasons",
+            validation_report.get(
+                "dataset_anomaly_reasons",
+                validation_report.get("statistical_error_reasons", []),
+            ),
+        )
+    )
+    return {
+        "context_type": validation_report.get("context_type", "general"),
+        "pass_rate": float(validation_report.get("pass_rate", 0.0)),
+        "verdict": validation_report.get("verdict", validation_report.get("overall_verdict", "UNKNOWN")),
+        "hard_constraint_count": hard_constraint_count,
+        "hard_failed_count": hard_constraint_count,
+        "failed_count": hard_constraint_count,
+        "engineering_caution_count": engineering_caution_count,
+        "warning_count": int(
+            validation_report.get("warning_count", engineering_caution_count + data_review_flag_count)
+        ),
+        "durability_caution_count": engineering_caution_count,
+        "durability_warning_count": engineering_caution_count,
+        "durability_warnings": engineering_caution_count,
+        "data_review_flag_count": data_review_flag_count,
+        "dataset_anomaly_count": data_review_flag_count,
+        "dataset_anomalies": data_review_flag_count,
+        "suspicious_count": data_review_flag_count,
+        "statistical_errors": data_review_flag_count,
+        "statistical_error_count": data_review_flag_count,
+        "hard_constraint_reasons": hard_constraint_reasons,
+        "hard_fail_reasons": list(hard_constraint_reasons),
+        "engineering_caution_reasons": engineering_caution_reasons,
+        "durability_caution_reasons": list(engineering_caution_reasons),
+        "durability_warning_reasons": list(engineering_caution_reasons),
+        "data_review_flag_reasons": data_review_flag_reasons,
+        "dataset_anomaly_reasons": list(data_review_flag_reasons),
+        "statistical_error_reasons": list(data_review_flag_reasons),
+        "contextual_summary": validation_report.get("contextual_summary", ""),
+        "confidence_of_warning_assessment": validation_report.get(
+            "confidence_of_warning_assessment",
+            CONFIDENCE_HIGH,
+        ),
+    }

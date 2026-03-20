@@ -42,6 +42,7 @@ from train import (
     split_dataset,
     to_serializable,
 )
+from validator import summarize_validation_report
 
 
 OPTUNA_RESULTS_COLUMNS = [
@@ -370,16 +371,17 @@ def build_trial_record(
         return base_record
 
     validation_report = result["validation_report"]
+    validation_metrics = result.get("val_metrics", result.get("test_metrics", {}))
     base_record.update(
         {
             "rmse": result["rmse"],
             "mae": result["mae"],
             "r2": result["r2"],
             "composite_score": result["composite_score"],
-            "test_rmse": result["test_metrics"]["rmse"],
-            "test_mae": result["test_metrics"]["mae"],
-            "test_r2": result["test_metrics"]["r2"],
-            "test_composite_score": result["test_metrics"]["composite_score"],
+            "test_rmse": validation_metrics.get("rmse"),
+            "test_mae": validation_metrics.get("mae"),
+            "test_r2": validation_metrics.get("r2"),
+            "test_composite_score": validation_metrics.get("composite_score"),
             "validation_pass_rate": validation_report["pass_rate"],
             "failed_count": validation_report["failed_count"],
             "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
@@ -518,32 +520,7 @@ def calculate_improvement_percentage(baseline_score: float, best_score: float) -
 
 def build_validation_summary(validation_report: dict[str, Any]) -> dict[str, Any]:
     """Flatten the validator report into the stable final-metrics summary shape."""
-    return {
-        "context_type": validation_report.get("context_type", "general"),
-        "pass_rate": float(validation_report.get("pass_rate", 0.0)),
-        "hard_failed_count": int(
-            validation_report.get("hard_failed_count", validation_report.get("failed_count", 0))
-        ),
-        "warning_count": int(validation_report.get("warning_count", 0)),
-        "statistical_errors": int(
-            validation_report.get(
-                "statistical_errors",
-                validation_report.get("statistical_error_count", validation_report.get("suspicious_count", 0)),
-            )
-        ),
-        "durability_warnings": int(
-            validation_report.get(
-                "durability_warnings",
-                validation_report.get(
-                    "durability_warning_count",
-                    validation_report.get("durability_caution_count", 0),
-                ),
-            )
-        ),
-        "dataset_anomalies": int(
-            validation_report.get("dataset_anomalies", validation_report.get("dataset_anomaly_count", 0))
-        ),
-    }
+    return summarize_validation_report(validation_report)
 
 
 def build_final_metrics_payload(
@@ -565,7 +542,7 @@ def build_final_metrics_payload(
         "best_model_name": final_best_result["model_name"],
         "best_model_hyperparameters": copy.deepcopy(final_best_result["hyperparameters"]),
         "validation_summary": build_validation_summary(validation_report),
-        "holdout_metrics": copy.deepcopy(final_best_result.get("test_metrics", {})),
+        "validation_metrics": copy.deepcopy(final_best_result.get("val_metrics", final_best_result.get("test_metrics", {}))),
     }
 
 
@@ -789,7 +766,7 @@ def _build_repaired_trial_record(
     best_trial_number = None if best_result is None else _safe_int(best_result.get("trial_number", best_result.get("best_trial")))
     if best_result is not None and best_trial_number == trial_number:
         validation_report = best_result.get("validation_report", {})
-        test_metrics = best_result.get("test_metrics", {})
+        test_metrics = best_result.get("val_metrics", best_result.get("test_metrics", {}))
         base_row.update(
             {
                 "model_name": best_result.get("model_name", base_row["model_name"]),
@@ -877,8 +854,8 @@ def build_post_search_ensemble(
     config: dict[str, Any],
     x_train: pd.DataFrame,
     y_train: pd.Series,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
     validator: EngineeringValidator,
 ) -> dict[str, Any]:
     """Build and evaluate a stacking ensemble from the best unique model families in the Optuna CSV."""
@@ -1010,8 +987,8 @@ def build_post_search_ensemble(
         ensemble_configs,
         x_train,
         y_train,
-        x_test,
-        y_test,
+        x_val,
+        y_val,
         validator,
         config,
     )
@@ -1022,16 +999,8 @@ def build_post_search_ensemble(
     ensemble_result["status"] = "built"
     save_json_artifact(ensemble_metrics_path, ensemble_result)
 
-    previous_best_score = float(
-        current_best_result.get(
-            "holdout_composite",
-            current_best_result.get("test_metrics", {}).get(
-                "composite_score",
-                current_best_result["composite_score"],
-            ),
-        )
-    )
-    ensemble_score = float(ensemble_result["composite_score"])
+    previous_best_score = float(current_best_result.get("cv_r2", current_best_result.get("r2", -1e9)))
+    ensemble_score = float(ensemble_result["cv_r2"])
     if ensemble_score > previous_best_score:
         numeric_trial_numbers = pd.to_numeric(optuna_frame["trial_number"], errors="coerce")
         max_trial_number = numeric_trial_numbers.max()
@@ -1073,7 +1042,7 @@ def build_post_search_ensemble(
             ),
         )
         log_status(
-            f"INFO ensemble_beats_best | ensemble={ensemble_score:.4f} | previous_best={previous_best_score:.4f}"
+            f"INFO ensemble_beats_best_cv_r2 | ensemble={ensemble_score:.4f} | previous_best={previous_best_score:.4f}"
         )
         try:
             from uncertainty import recalibrate_uncertainty_artifacts
@@ -1121,7 +1090,7 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
     baseline_metrics = load_json_artifact(baseline_metrics_path)
 
     data = load_dataset(config)
-    x_train, x_test, y_train, y_test = split_dataset(data, config)
+    x_train, x_val, _, y_train, y_val, _ = split_dataset(data, config)
     validator = EngineeringValidator.from_config(config)
     available_models = get_available_model_configs(config)
     required_families = [family for family in brief.get("required_model_families", []) if family in available_models]
@@ -1407,8 +1376,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
                 params,
                 x_train,
                 y_train,
-                x_test,
-                y_test,
+                x_val,
+                y_val,
                 validator,
                 config,
             )
@@ -1590,8 +1559,8 @@ def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
             config,
             x_train,
             y_train,
-            x_test,
-            y_test,
+            x_val,
+            y_val,
             validator,
         )
     final_best_result = finalize_search_artifacts(outputs_dir, baseline_metrics)

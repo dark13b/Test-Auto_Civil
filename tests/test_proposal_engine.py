@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from proposal_engine import ProposalEngine
+from proposal_engine import ProposalEngine, ProposalExtractionError
 
 
 class RecordingBackend:
@@ -108,7 +108,13 @@ class ProposalEngineTests(unittest.TestCase):
         return history
 
     def test_prompt_builder_uses_schema_only_example_and_no_anchored_real_model_example(self) -> None:
-        backend = RecordingBackend([{"response_text": "not-json"}])
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"prompt probe"}',
+                }
+            ]
+        )
         engine = self._make_engine(backend)
 
         engine.generate_experiment_proposals(
@@ -129,7 +135,13 @@ class ProposalEngineTests(unittest.TestCase):
         self.assertNotIn('{"model_name":"LGBMRegressor"', prompt)
 
     def test_qwen4b_uses_compact_prompt_mode_and_only_last_five_trials(self) -> None:
-        backend = RecordingBackend([{"response_text": "not-json"}])
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"compact probe"}',
+                }
+            ]
+        )
         engine = self._make_engine(backend)
 
         engine.generate_experiment_proposals(
@@ -150,10 +162,16 @@ class ProposalEngineTests(unittest.TestCase):
         self.assertIn("trial-3", prompt)
         self.assertNotIn("trial-2", prompt)
         self.assertNotIn("trial-1", prompt)
-        self.assertIn("Think step by step internally, then output ONLY the final JSON object.", prompt)
+        self.assertNotIn("Think step by step internally", prompt)
 
     def test_qwen8b_uses_rich_prompt_mode(self) -> None:
-        backend = RecordingBackend([{"response_text": "not-json"}])
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"rich probe"}',
+                }
+            ]
+        )
         engine = self._make_engine(backend)
 
         engine.generate_experiment_proposals(
@@ -172,6 +190,48 @@ class ProposalEngineTests(unittest.TestCase):
         self.assertEqual(engine.last_interaction_summary["prompt_variant"], "rich")
         self.assertIn("trial-1", prompt)
         self.assertIn("Family state", prompt)
+
+    def test_default_local_qwen8b_uses_compact_prompt_when_no_model_hint_is_passed(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"default model probe"}',
+                }
+            ]
+        )
+        engine = self._make_engine(
+            backend,
+            llm_config={
+                "default_local_proposal_model": "qwen3:8b",
+                "compact_prompt_models": ["qwen3:8b"],
+                "enable_regeneration_on_reject": False,
+                "max_regeneration_attempts": 0,
+                "duplicate_similarity_thresholds": {
+                    "numeric_tolerance": 0.05,
+                    "float_round_digits": 4,
+                },
+                "temporarily_block_saturated_families": True,
+                "diversity": {"max_family_share": 0.35},
+            },
+        )
+
+        engine.generate_experiment_proposals(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=1,
+            trial_history=self._build_trial_history(7),
+            search_progress=self.search_progress,
+            model_hint=None,
+        )
+
+        prompt = backend.prompts[0]
+        self.assertEqual(engine.last_interaction_summary["prompt_variant"], "compact")
+        self.assertEqual(backend.models[0], "qwen3:8b")
+        self.assertIn("trial-7", prompt)
+        self.assertNotIn("trial-1", prompt)
 
     def test_response_extraction_prefers_response_text_when_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -201,7 +261,7 @@ class ProposalEngineTests(unittest.TestCase):
         self.assertEqual(proposals[0]["model_name"], "ModelFamilyA")
         self.assertEqual(record["extracted_from_channel"], "response")
 
-    def test_response_extraction_falls_back_to_thinking_text_and_logs_warning(self) -> None:
+    def test_response_extraction_raises_when_visible_response_is_empty_even_if_thinking_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "llm_interactions.jsonl"
             backend = RecordingBackend(
@@ -215,8 +275,8 @@ class ProposalEngineTests(unittest.TestCase):
             )
             engine = self._make_engine(backend, log_path=log_path)
 
-            with self.assertLogs("proposal_engine", level="WARNING") as captured:
-                proposals = engine.generate_experiment_proposals(
+            with self.assertRaises(ProposalExtractionError):
+                engine.generate_experiment_proposals(
                     available_models=self.available_models,
                     research_brief=self.research_brief,
                     current_best=self.current_best,
@@ -225,11 +285,6 @@ class ProposalEngineTests(unittest.TestCase):
                     proposal_count=1,
                     model_hint="qwen3:4b",
                 )
-                record = self._read_jsonl(log_path)[0]
-
-        self.assertEqual(len(proposals), 1)
-        self.assertIn("qwen3 response was empty; extracted from thinking_text", "\n".join(captured.output))
-        self.assertEqual(record["extracted_from_channel"], "thinking")
 
     def test_json_repair_success_marks_repair_used(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -334,17 +389,16 @@ class ProposalEngineTests(unittest.TestCase):
             },
         )
 
-        proposals = engine.generate_experiment_proposals(
-            available_models=self.available_models,
-            research_brief=self.research_brief,
-            current_best=self.current_best,
-            experiment_memory=self.experiment_memory,
-            diversity_state={},
-            proposal_count=1,
-            model_hint="qwen3:8b",
-        )
-
-        self.assertEqual(proposals, [])
+        with self.assertRaises(ProposalExtractionError):
+            engine.generate_experiment_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory=self.experiment_memory,
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:8b",
+            )
 
 
 if __name__ == "__main__":

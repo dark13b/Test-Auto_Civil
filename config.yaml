@@ -43,6 +43,11 @@ data:
     enabled: true
     contamination: 0.03
 
+data_split:
+  train_size: 0.70
+  val_size: 0.15
+  test_size: 0.15
+
 metrics:
   primary_metric: rmse
   direction: minimize
@@ -60,14 +65,31 @@ validator:
   suspicious_water_cement_ratio: 0.7
   suspicious_strength_mpa: 30.0
   durability_water_cement_warn: 0.6
+  scm_meaningful_replacement_threshold: 0.15
+  high_volume_scm_replacement_threshold: 0.45
+  age_regime_early_max_days: 7.0
+  age_regime_later_min_days: 56.0
+  durability_water_cement_limits:
+    general: 0.60
+    structural: 0.50
+    exposed: 0.45
+    severe: 0.45
+    marine: 0.40
+    freeze_thaw: 0.45
+    sulfate: 0.45
   # Keep very high w/c + high strength as a hard reject only when the
   # binder context also looks implausible for early-age concrete.
   high_water_cement_strength_hard_fail_max_age_days: 28.0
   high_water_cement_strength_low_scm_threshold: 0.20
   high_water_cement_strength_unfavorable_water_binder_ratio: 0.50
   low_water_binder_warn: 0.25
+  workability_support_superplasticizer_ratio: 0.01
   total_binder_low_warn: 250.0
   total_binder_high_warn: 550.0
+  paste_rich_aggregate_paste_ratio_threshold: 2.85
+  shrinkage_low_water_binder_threshold: 0.38
+  shrinkage_strength_threshold: 50.0
+  scm_durability_preferred_water_binder_ratio: 0.45
   fly_ash_replacement_warn: 0.4
   slag_replacement_warn: 0.7
   early_age_days_warn: 3.0
@@ -442,7 +464,7 @@ research:
   brief_path: research_brief.md
   editable_surface_path: research_lab.py
   memory_filename: experiment_memory.json
-  max_cycles: 6
+  max_cycles: 10
   max_runtime_minutes: 0
   max_trial_seconds: 0
   scout_candidates_per_cycle: 8
@@ -450,14 +472,21 @@ research:
   scout_cv_repeats: 1
   confirm_cv_repeats: 3
   max_family_repeats_per_cycle: 1
+  exploit_delta_ratio: 0.15
   rebuild_reports_on_keep: true
 
 llm:
-  enabled: false
-  backend_mode: hybrid
+  enabled: true
+  backend_mode: ollama
   allow_deterministic_fallback: true
   default_local_proposal_model: qwen3:8b
-  compact_prompt_models: [qwen3:4b]
+  default_openai_model: gpt-4o
+  qwen_thinking_mode: false
+  ollama_base_url: http://localhost:11434
+  temperature: 0.3
+  num_predict: 2048
+  request_timeout_seconds: 120
+  compact_prompt_models: [qwen3:4b, qwen3:8b]
   enable_regeneration_on_reject: true
   max_regeneration_attempts: 1
   duplicate_similarity_thresholds:
@@ -469,7 +498,7 @@ llm:
   interval_trials: 15
   interaction_interval_minutes: 5
   smart_model_after_progress: 0.67
-  include_no_think_directive: false
+  include_no_think_directive: true
   log_interactions: true
   interaction_log_filename: llm_interactions.jsonl
   ollama:
@@ -477,13 +506,16 @@ llm:
     model: qwen3:8b
     fast_model: qwen3:4b
     smart_model: qwen3:8b
-    timeout_seconds: 30
+    options:
+      num_ctx: 2048
+      num_gpu: 1
+    timeout_seconds: 120
     use_cli_fallback: true
   openai:
     base_url: https://api.openai.com/v1/responses
-    model: gpt-5.1-mini
+    model: gpt-4o
     api_key_env: OPENAI_API_KEY
-    timeout_seconds: 30
+    timeout_seconds: 120
   hybrid:
     primary: ollama
     fallback: openai

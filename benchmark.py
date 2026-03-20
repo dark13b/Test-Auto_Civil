@@ -32,6 +32,7 @@ from train import (
     to_serializable,
 )
 from uncertainty import UncertaintyEstimator
+from validator import summarize_validation_report as summarize_validation_report_payload
 
 
 def load_json_artifact(path: Path) -> dict[str, Any]:
@@ -96,20 +97,9 @@ def markdown_table(frame: pd.DataFrame, *, digits: int = 4) -> str:
 
 def summarize_validation_report(validation_report: dict[str, Any]) -> dict[str, Any]:
     """Keep only compact validator fields needed for the benchmark artifacts."""
-    return {
-        "verdict": validation_report.get("verdict", "UNKNOWN"),
-        "pass_rate": float(validation_report.get("pass_rate", 0.0)),
-        "failed_count": int(validation_report.get("failed_count", 0)),
-        "hard_failed_count": int(
-            validation_report.get("hard_failed_count", validation_report.get("failed_count", 0))
-        ),
-        "warning_count": int(validation_report.get("warning_count", 0)),
-        "suspicious_count": int(validation_report.get("suspicious_count", 0)),
-        "durability_caution_count": int(validation_report.get("durability_caution_count", 0)),
-        "dataset_anomaly_count": int(validation_report.get("dataset_anomaly_count", 0)),
-        "warn_reasons": list(validation_report.get("warn_reasons", [])),
-        "hard_fail_reasons": list(validation_report.get("hard_fail_reasons", [])),
-    }
+    summary = summarize_validation_report_payload(validation_report)
+    summary["warn_reasons"] = list(validation_report.get("warn_reasons", []))
+    return summary
 
 
 def compute_range_thresholds(y_train: pd.Series) -> dict[str, float]:
@@ -296,8 +286,8 @@ def evaluate_benchmark_model(
     params: dict[str, Any],
     x_train: pd.DataFrame,
     y_train: pd.Series,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
     config: dict[str, Any],
     validator: EngineeringValidator,
     cv_splitter: Any,
@@ -319,19 +309,19 @@ def evaluate_benchmark_model(
     training_time_seconds = float(time.perf_counter() - fit_start)
 
     prediction_start = time.perf_counter()
-    y_pred = np.asarray(model.predict(x_test), dtype=float)
+    y_pred = np.asarray(model.predict(x_val), dtype=float)
     prediction_time_seconds = float(time.perf_counter() - prediction_start)
 
     repeated_prediction_start = time.perf_counter()
     repeat_count = 20
     for _ in range(repeat_count):
-        model.predict(x_test)
+        model.predict(x_val)
     repeated_prediction_seconds = float(time.perf_counter() - repeated_prediction_start) / repeat_count
 
-    holdout_metrics = compute_regression_metrics(y_test, y_pred, config, float(y_train.mean()))
-    validation_report = validator.validate_predictions(y_pred, x_test, y_test)
+    holdout_metrics = compute_regression_metrics(y_val, y_pred, config, float(y_train.mean()))
+    validation_report = validator.validate_predictions(y_pred, x_val, y_val)
     validation_summary = summarize_validation_report(validation_report)
-    range_metrics = compute_rmse_by_range(y_test, y_pred, range_thresholds)
+    range_metrics = compute_rmse_by_range(y_val, y_pred, range_thresholds)
 
     result = {
         "model_name": model_name,
@@ -352,7 +342,7 @@ def evaluate_benchmark_model(
         "holdout_composite": float(holdout_metrics["composite_score"]),
         "training_time_seconds": training_time_seconds,
         "prediction_time_seconds": prediction_time_seconds,
-        "inference_time_ms_per_sample": float((repeated_prediction_seconds * 1000.0) / max(len(x_test), 1)),
+        "inference_time_ms_per_sample": float((repeated_prediction_seconds * 1000.0) / max(len(x_val), 1)),
         "validation_summary": validation_summary,
         "validation_verdict": validation_summary["verdict"],
         "validation_pass_rate": validation_summary["pass_rate"],
@@ -725,7 +715,7 @@ def main() -> int:
         reference_payload = load_reference_payload(outputs_dir, config)
 
         dataset = load_dataset(config)
-        x_train, x_test, y_train, y_test = split_dataset(dataset, config)
+        x_train, x_val, _, y_train, y_val, _ = split_dataset(dataset, config)
         validator = EngineeringValidator.from_config(config)
         benchmark_config = config["benchmark"]
         cv_splitter = build_cv_splitter(
@@ -759,8 +749,8 @@ def main() -> int:
                 best_params,
                 x_train,
                 y_train,
-                x_test,
-                y_test,
+                x_val,
+                y_val,
                 config,
                 validator,
                 cv_splitter,

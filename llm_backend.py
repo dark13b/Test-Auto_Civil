@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import shutil
 import subprocess
 from typing import Any
 
+# Declared in requirements.txt for reproducible backend installs.
 import requests
+
+from model_routing import resolve_model_for_backend
 
 
 DEFAULT_LLM_CONFIG: dict[str, Any] = {
@@ -17,6 +21,8 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
     "backend_mode": "ollama",
     "allow_deterministic_fallback": True,
     "default_local_proposal_model": "qwen3:8b",
+    "default_openai_model": "gpt-4o",
+    "qwen_thinking_mode": False,
     "compact_prompt_models": ["qwen3:4b"],
     "enable_regeneration_on_reject": True,
     "max_regeneration_attempts": 1,
@@ -39,6 +45,7 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
         "model": "qwen3:8b",
         "fast_model": "qwen3:4b",
         "smart_model": "qwen3:8b",
+        "options": {},
         "timeout_seconds": 30,
         "use_cli_fallback": True,
     },
@@ -57,6 +64,8 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
         "summary_enabled": True,
     },
 }
+
+LOGGER = logging.getLogger("llm_backend")
 
 
 class BackendUnavailableError(RuntimeError):
@@ -77,7 +86,20 @@ def get_llm_config(config: dict[str, Any]) -> dict[str, Any]:
     """Return a normalized LLM configuration with legacy compatibility."""
     llm_config = config.get("llm")
     if isinstance(llm_config, dict) and llm_config:
-        return _deep_merge(DEFAULT_LLM_CONFIG, llm_config)
+        normalized = _deep_merge(DEFAULT_LLM_CONFIG, llm_config)
+        normalized["default_local_proposal_model"] = str(
+            normalized.get("default_local_proposal_model") or normalized.get("ollama", {}).get("model") or "qwen3:8b"
+        )
+        normalized["default_openai_model"] = str(
+            normalized.get("default_openai_model") or normalized.get("openai", {}).get("model") or "gpt-4o"
+        )
+        normalized["ollama"]["model"] = str(
+            normalized.get("ollama", {}).get("model") or normalized["default_local_proposal_model"]
+        )
+        normalized["openai"]["model"] = str(
+            normalized.get("openai", {}).get("model") or normalized["default_openai_model"]
+        )
+        return normalized
 
     legacy = dict(config.get("search", {}).get("llm_proposals", {}))
     if not legacy:
@@ -116,6 +138,7 @@ def get_llm_config(config: dict[str, Any]) -> dict[str, Any]:
             "timeout_seconds": int(legacy.get("timeout_seconds", normalized["ollama"]["timeout_seconds"])),
         },
     )
+    normalized["default_openai_model"] = str(normalized.get("openai", {}).get("model", "gpt-4o"))
     return normalized
 
 
@@ -185,6 +208,7 @@ def extract_text_channels(payload: dict[str, Any]) -> dict[str, str]:
                 backend_raw_text = candidate_value
             break
 
+    # LOGGING ONLY - never parse as control output.
     for thinking_key in ("thinking", "thought", "reasoning"):
         candidate_value = raw_payload.get(thinking_key)
         if isinstance(candidate_value, str) and candidate_value.strip() and not thinking_text:
@@ -256,14 +280,45 @@ class OllamaBackend(LLMBackend):
         llm_config = get_llm_config(config)
         ollama_config = llm_config["ollama"]
         self.base_url = str(ollama_config.get("base_url", "http://localhost:11434")).rstrip("/")
-        self.default_model = str(
-            ollama_config.get("model")
-            or resolve_default_local_proposal_model(llm_config)
-        )
+        self.default_model = str(resolve_model_for_backend(None, "ollama", {"llm": llm_config}))
         self.fast_model = str(ollama_config.get("fast_model", self.default_model))
         self.smart_model = str(ollama_config.get("smart_model", self.default_model))
+        self.request_options = dict(ollama_config.get("options", {}))
         self.timeout_seconds = max(1, int(ollama_config.get("timeout_seconds", 30)))
         self.use_cli_fallback = bool(ollama_config.get("use_cli_fallback", True))
+        self.qwen_thinking_mode = bool(llm_config.get("qwen_thinking_mode", False))
+
+    @staticmethod
+    def _is_qwen_model(model: str) -> bool:
+        return "qwen" in str(model).lower()
+
+    def _resolved_request_options(
+        self,
+        *,
+        model: str,
+        max_output_tokens: int,
+        temperature: float,
+    ) -> dict[str, Any]:
+        options = dict(self.request_options)
+        options.update(
+            {
+                "temperature": temperature,
+                "num_predict": max_output_tokens,
+            }
+        )
+        if self._is_qwen_model(model) and not self.qwen_thinking_mode:
+            options["think"] = False
+        return options
+
+    def _compose_prompt(self, prompt: str, system_prompt: str | None, model: str) -> str:
+        prompt_parts = []
+        if system_prompt:
+            prompt_parts.append(system_prompt)
+        prompt_parts.append(prompt)
+        combined = "\n\n".join(prompt_parts)
+        if self._is_qwen_model(model) and not self.qwen_thinking_mode:
+            combined = combined.rstrip() + "\n/no_think"
+        return combined
 
     def _http_available(self) -> bool:
         try:
@@ -302,6 +357,7 @@ class OllamaBackend(LLMBackend):
         temperature: float = 0.2,
     ) -> dict[str, Any]:
         model_name = str(model or self.default_model)
+        LOGGER.debug("[LLM] Resolved model: %s via ollama", model_name)
         if self._http_available():
             return self._generate_http(
                 prompt,
@@ -331,15 +387,17 @@ class OllamaBackend(LLMBackend):
         max_output_tokens: int,
         temperature: float,
     ) -> dict[str, Any]:
-        composed_prompt = prompt if not system_prompt else f"{system_prompt}\n\n{prompt}"
+        composed_prompt = self._compose_prompt(prompt, system_prompt, model)
+        options = self._resolved_request_options(
+            model=model,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+        )
         payload: dict[str, Any] = {
             "model": model,
             "prompt": composed_prompt,
             "stream": False,
-            "options": {
-                "temperature": temperature,
-                "num_predict": max_output_tokens,
-            },
+            "options": options,
         }
         if response_format is not None:
             payload["format"] = response_format
@@ -372,11 +430,12 @@ class OllamaBackend(LLMBackend):
         max_output_tokens: int,
         temperature: float,
     ) -> dict[str, Any]:
-        prompt_parts = []
-        if system_prompt:
-            prompt_parts.append(system_prompt)
-        prompt_parts.append(prompt)
-        cli_prompt = "\n\n".join(prompt_parts)
+        cli_prompt = self._compose_prompt(prompt, system_prompt, model)
+        options = self._resolved_request_options(
+            model=model,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+        )
         result = subprocess.run(
             ["ollama", "run", model],
             input=cli_prompt,
@@ -399,7 +458,7 @@ class OllamaBackend(LLMBackend):
             "raw": {
                 "returncode": result.returncode,
                 "stderr": result.stderr,
-                "temperature": temperature,
+                "options": options,
             },
         }
 
@@ -410,9 +469,10 @@ class OpenAIBackend(LLMBackend):
     backend_name = "openai"
 
     def __init__(self, config: dict[str, Any]):
-        openai_config = get_llm_config(config)["openai"]
+        llm_config = get_llm_config(config)
+        openai_config = llm_config["openai"]
         self.base_url = str(openai_config.get("base_url", "https://api.openai.com/v1/responses"))
-        self.default_model = str(openai_config.get("model", "gpt-5.1-mini"))
+        self.default_model = str(resolve_model_for_backend(None, "openai", {"llm": llm_config}))
         self.api_key_env = str(openai_config.get("api_key_env", "OPENAI_API_KEY"))
         self.timeout_seconds = max(1, int(openai_config.get("timeout_seconds", 30)))
 

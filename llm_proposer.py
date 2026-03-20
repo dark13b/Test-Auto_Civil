@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from llm_backend import get_llm_config, resolve_backend, resolve_default_local_proposal_model
+from llm_backend import get_llm_config, resolve_backend
+from model_routing import resolve_model_for_backend
 from proposal_engine import ProposalEngine
 
 
@@ -139,17 +140,11 @@ class LLMProposer:
 
     def _resolve_model_hints(self) -> tuple[str | None, str | None, str | None]:
         backend_mode = str(self.llm_config.get("backend_mode", "ollama")).lower()
+        resolved_default = resolve_model_for_backend(None, backend_mode, self.config)
         if backend_mode == "openai":
-            model_name = str(self.llm_config.get("openai", {}).get("model", "gpt-5.1-mini"))
-            return model_name, model_name, model_name
-        if backend_mode == "hybrid":
-            primary = str(self.llm_config.get("hybrid", {}).get("primary", "ollama")).lower()
-            if primary == "openai":
-                model_name = str(self.llm_config.get("openai", {}).get("model", "gpt-5.1-mini"))
-                return model_name, model_name, model_name
+            return resolved_default, resolved_default, resolved_default
         ollama_config = self.llm_config.get("ollama", {})
-        default_local_model = resolve_default_local_proposal_model(self.llm_config)
         compact_models = [str(item) for item in self.llm_config.get("compact_prompt_models", []) if str(item).strip()]
-        compact_model = compact_models[0] if compact_models else str(ollama_config.get("fast_model", default_local_model))
-        smart_model = str(ollama_config.get("smart_model", default_local_model))
-        return default_local_model, smart_model, compact_model
+        compact_model = compact_models[0] if compact_models else str(ollama_config.get("fast_model", resolved_default))
+        smart_model = str(ollama_config.get("smart_model", resolved_default))
+        return resolved_default, smart_model, compact_model

@@ -28,7 +28,7 @@ from sklearn.ensemble import (
 )
 from sklearn.linear_model import ElasticNet, LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold, RepeatedKFold, cross_validate, train_test_split
+from sklearn.model_selection import KFold, RepeatedKFold, cross_val_score, cross_validate, train_test_split
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -36,7 +36,8 @@ from sklearn.svm import SVR
 from sklearn.tree import DecisionTreeRegressor
 
 from feature_engineering import ENGINEERED_FEATURE_COLUMNS, build_engineering_features
-from validator import EngineeringValidator
+from integrity_checks import assert_no_cv_label_fraud
+from validator import EngineeringValidator, summarize_validation_report
 
 try:
     from lightgbm import LGBMRegressor
@@ -179,20 +180,38 @@ def build_stratification_bins(target: pd.Series, n_bins: int) -> pd.Series:
 def split_dataset(
     frame: pd.DataFrame,
     config: dict[str, Any],
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-    """Split the dataset into train and test partitions with target stratification."""
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """Split the dataset into train, validation, and locked-test partitions."""
     feature_columns = get_input_columns(config)
     target_column = get_target_column(config)
     x = frame[feature_columns].copy()
     y = frame[target_column].copy()
     stratify_labels = build_stratification_bins(y, int(config["data"]["stratify_bins"]))
-    return train_test_split(
+    data_split = dict(config.get("data_split", {}))
+    train_size = float(data_split.get("train_size", 0.70))
+    val_size = float(data_split.get("val_size", 0.15))
+    test_size = float(data_split.get("test_size", config.get("data", {}).get("test_size", 0.15)))
+    total = train_size + val_size + test_size
+    if not np.isclose(total, 1.0):
+        raise ValueError("data_split train/val/test sizes must sum to 1.0")
+
+    x_train_val, x_test, y_train_val, y_test = train_test_split(
         x,
         y,
-        test_size=float(config["data"]["test_size"]),
-        random_state=int(config["experiment"]["random_seed"]),
+        test_size=test_size,
+        random_state=42,
         stratify=stratify_labels,
     )
+    train_val_stratify = build_stratification_bins(y_train_val, int(config["data"]["stratify_bins"]))
+    val_relative_size = val_size / max(train_size + val_size, 1e-8)
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_train_val,
+        y_train_val,
+        test_size=val_relative_size,
+        random_state=42,
+        stratify=train_val_stratify,
+    )
+    return x_train, x_val, x_test, y_train, y_val, y_test
 
 
 def calculate_composite_score(
@@ -496,18 +515,19 @@ def evaluate_candidate(
     params: dict[str, Any],
     x_train: pd.DataFrame,
     y_train: pd.Series,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
     validator: EngineeringValidator,
     config: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
-    """Train, cross-validate, test, and validate a candidate model."""
+    """Train, cross-validate, validate, and validate engineering constraints."""
     candidate_model = instantiate_model(model_name, params, config)
     cv_metrics = cross_validate_model(candidate_model, x_train, y_train, config)
     candidate_model.fit(x_train, y_train)
-    test_predictions = np.asarray(candidate_model.predict(x_test), dtype=float)
-    test_metrics = compute_regression_metrics(y_test, test_predictions, config, float(y_train.mean()))
-    validation_report = validator.validate_predictions(test_predictions, x_test, y_test)
+    val_predictions = np.asarray(candidate_model.predict(x_val), dtype=float)
+    val_metrics = compute_regression_metrics(y_val, val_predictions, config, float(y_train.mean()))
+    validation_report = validator.validate_predictions(val_predictions, x_val, y_val)
+    validation_summary = summarize_validation_report(validation_report)
     result = {
         "model_name": model_name,
         "hyperparameters": params,
@@ -516,7 +536,8 @@ def evaluate_candidate(
         "r2": cv_metrics["r2"],
         "composite_score": cv_metrics["composite_score"],
         "cv_metrics": cv_metrics,
-        "test_metrics": test_metrics,
+        "val_metrics": val_metrics,
+        "test_metrics": val_metrics,
         "validation_verdict": validation_report["verdict"],
         "validation_report": validation_report,
     }
@@ -528,49 +549,40 @@ def evaluate_candidate(
             "cv_mae": cv_metrics["mae"],
             "cv_r2": cv_metrics["r2"],
             "cv_composite": cv_metrics["composite_score"],
-            "holdout_rmse": test_metrics["rmse"],
-            "holdout_mae": test_metrics["mae"],
-            "holdout_r2": test_metrics["r2"],
-            "holdout_composite": test_metrics["composite_score"],
+            "val_rmse": val_metrics["rmse"],
+            "val_mae": val_metrics["mae"],
+            "val_r2": val_metrics["r2"],
+            "val_composite": val_metrics["composite_score"],
             "validator_context_type": validation_report.get("context_type", "general"),
             "validation_pass_rate": validation_report["pass_rate"],
-            "failed_count": validation_report["failed_count"],
-            "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
-            "warning_count": validation_report["warning_count"],
-            "suspicious_count": validation_report["suspicious_count"],
-            "statistical_errors": validation_report.get(
-                "statistical_errors",
-                validation_report.get("statistical_error_count", validation_report["suspicious_count"]),
-            ),
-            "statistical_error_count": validation_report.get(
-                "statistical_error_count",
-                validation_report.get("statistical_errors", validation_report["suspicious_count"]),
-            ),
-            "durability_warnings": validation_report.get(
-                "durability_warnings",
-                validation_report.get("durability_warning_count", validation_report.get("durability_caution_count", 0)),
-            ),
-            "durability_warning_count": validation_report.get(
-                "durability_warning_count",
-                validation_report.get("durability_warnings", validation_report.get("durability_caution_count", 0)),
-            ),
-            "durability_caution_count": validation_report.get("durability_caution_count", 0),
-            "dataset_anomalies": validation_report.get(
-                "dataset_anomalies",
-                validation_report.get("dataset_anomaly_count", 0),
-            ),
-            "dataset_anomaly_count": validation_report.get("dataset_anomaly_count", 0),
+            "failed_count": validation_summary["failed_count"],
+            "hard_constraint_count": validation_summary["hard_constraint_count"],
+            "hard_failed_count": validation_summary["hard_failed_count"],
+            "warning_count": validation_summary["warning_count"],
+            "engineering_caution_count": validation_summary["engineering_caution_count"],
+            "suspicious_count": validation_summary["suspicious_count"],
+            "statistical_errors": validation_summary["statistical_errors"],
+            "statistical_error_count": validation_summary["statistical_error_count"],
+            "durability_warnings": validation_summary["durability_warnings"],
+            "durability_warning_count": validation_summary["durability_warning_count"],
+            "durability_caution_count": validation_summary["durability_caution_count"],
+            "data_review_flag_count": validation_summary["data_review_flag_count"],
+            "dataset_anomalies": validation_summary["dataset_anomalies"],
+            "dataset_anomaly_count": validation_summary["dataset_anomaly_count"],
             "warn_reasons": validation_report["warn_reasons"],
-            "statistical_error_reasons": validation_report.get("statistical_error_reasons", []),
-            "hard_fail_reasons": validation_report.get("hard_fail_reasons", []),
-            "durability_warning_reasons": validation_report.get(
-                "durability_warning_reasons",
-                validation_report.get("durability_caution_reasons", []),
-            ),
-            "durability_caution_reasons": validation_report.get("durability_caution_reasons", []),
-            "dataset_anomaly_reasons": validation_report.get("dataset_anomaly_reasons", []),
+            "hard_constraint_reasons": validation_summary["hard_constraint_reasons"],
+            "statistical_error_reasons": validation_summary["statistical_error_reasons"],
+            "hard_fail_reasons": validation_summary["hard_fail_reasons"],
+            "engineering_caution_reasons": validation_summary["engineering_caution_reasons"],
+            "durability_warning_reasons": validation_summary["durability_warning_reasons"],
+            "durability_caution_reasons": validation_summary["durability_caution_reasons"],
+            "data_review_flag_reasons": validation_summary["data_review_flag_reasons"],
+            "dataset_anomaly_reasons": validation_summary["dataset_anomaly_reasons"],
+            "contextual_summary": validation_summary["contextual_summary"],
+            "confidence_of_warning_assessment": validation_summary["confidence_of_warning_assessment"],
         }
     )
+    assert_no_cv_label_fraud(result)
     return candidate_model, result
 
 
@@ -578,8 +590,8 @@ def build_stacking_ensemble(
     configs: list[tuple[str, dict[str, Any]]],
     x_train: pd.DataFrame,
     y_train: pd.Series,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
     validator: EngineeringValidator,
     config: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
@@ -607,11 +619,51 @@ def build_stacking_ensemble(
         cv=build_cv_splitter(config),
         n_jobs=-1,
     )
+
+    cv_splitter = build_cv_splitter(config, n_splits=5, repeats=1, random_state=42)
+    cv_r2 = float(np.mean(cross_val_score(stacking_model, x_train, y_train, cv=cv_splitter, scoring="r2")))
+    cv_rmse = float(
+        np.mean(
+            -cross_val_score(
+                stacking_model,
+                x_train,
+                y_train,
+                cv=cv_splitter,
+                scoring="neg_root_mean_squared_error",
+            )
+        )
+    )
+    cv_mae = float(
+        np.mean(
+            -cross_val_score(
+                stacking_model,
+                x_train,
+                y_train,
+                cv=cv_splitter,
+                scoring="neg_mean_absolute_error",
+            )
+        )
+    )
+    cv_metrics = {
+        "rmse": cv_rmse,
+        "mae": cv_mae,
+        "r2": cv_r2,
+        "composite_score": float(
+            calculate_composite_score(
+                cv_rmse,
+                cv_mae,
+                cv_r2,
+                float(y_train.mean()),
+                config["metrics"]["composite_weights"],
+            )
+        ),
+    }
     stacking_model.fit(x_train, y_train)
 
-    test_predictions = np.asarray(stacking_model.predict(x_test), dtype=float)
-    test_metrics = compute_regression_metrics(y_test, test_predictions, config, float(y_train.mean()))
-    validation_report = validator.validate_predictions(test_predictions, x_test, y_test)
+    val_predictions = np.asarray(stacking_model.predict(x_val), dtype=float)
+    val_metrics = compute_regression_metrics(y_val, val_predictions, config, float(y_train.mean()))
+    validation_report = validator.validate_predictions(val_predictions, x_val, y_val)
+    validation_summary = summarize_validation_report(validation_report)
     result = {
         "model_name": "StackingRegressor",
         "hyperparameters": {
@@ -619,64 +671,56 @@ def build_stacking_ensemble(
             "meta_learner": "Ridge",
             "passthrough": True,
         },
-        "rmse": test_metrics["rmse"],
-        "mae": test_metrics["mae"],
-        "r2": test_metrics["r2"],
-        "composite_score": test_metrics["composite_score"],
-        "cv_metrics": test_metrics,
-        "test_metrics": test_metrics,
+        "rmse": cv_metrics["rmse"],
+        "mae": cv_metrics["mae"],
+        "r2": cv_metrics["r2"],
+        "composite_score": cv_metrics["composite_score"],
+        "cv_metrics": cv_metrics,
+        "val_metrics": val_metrics,
+        "test_metrics": val_metrics,
         "validation_verdict": validation_report["verdict"],
         "validation_report": validation_report,
     }
     result.update(
         {
-            "cv_rmse": test_metrics["rmse"],
-            "cv_mae": test_metrics["mae"],
-            "cv_r2": test_metrics["r2"],
-            "cv_composite": test_metrics["composite_score"],
-            "holdout_rmse": test_metrics["rmse"],
-            "holdout_mae": test_metrics["mae"],
-            "holdout_r2": test_metrics["r2"],
-            "holdout_composite": test_metrics["composite_score"],
+            "cv_rmse": cv_metrics["rmse"],
+            "cv_mae": cv_metrics["mae"],
+            "cv_r2": cv_metrics["r2"],
+            "cv_composite": cv_metrics["composite_score"],
+            "val_rmse": val_metrics["rmse"],
+            "val_mae": val_metrics["mae"],
+            "val_r2": val_metrics["r2"],
+            "val_composite": val_metrics["composite_score"],
             "validator_context_type": validation_report.get("context_type", "general"),
             "validation_pass_rate": validation_report["pass_rate"],
-            "failed_count": validation_report["failed_count"],
-            "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
-            "warning_count": validation_report["warning_count"],
-            "suspicious_count": validation_report["suspicious_count"],
-            "statistical_errors": validation_report.get(
-                "statistical_errors",
-                validation_report.get("statistical_error_count", validation_report["suspicious_count"]),
-            ),
-            "statistical_error_count": validation_report.get(
-                "statistical_error_count",
-                validation_report.get("statistical_errors", validation_report["suspicious_count"]),
-            ),
-            "durability_warnings": validation_report.get(
-                "durability_warnings",
-                validation_report.get("durability_warning_count", validation_report.get("durability_caution_count", 0)),
-            ),
-            "durability_warning_count": validation_report.get(
-                "durability_warning_count",
-                validation_report.get("durability_warnings", validation_report.get("durability_caution_count", 0)),
-            ),
-            "durability_caution_count": validation_report.get("durability_caution_count", 0),
-            "dataset_anomalies": validation_report.get(
-                "dataset_anomalies",
-                validation_report.get("dataset_anomaly_count", 0),
-            ),
-            "dataset_anomaly_count": validation_report.get("dataset_anomaly_count", 0),
+            "failed_count": validation_summary["failed_count"],
+            "hard_constraint_count": validation_summary["hard_constraint_count"],
+            "hard_failed_count": validation_summary["hard_failed_count"],
+            "warning_count": validation_summary["warning_count"],
+            "engineering_caution_count": validation_summary["engineering_caution_count"],
+            "suspicious_count": validation_summary["suspicious_count"],
+            "statistical_errors": validation_summary["statistical_errors"],
+            "statistical_error_count": validation_summary["statistical_error_count"],
+            "durability_warnings": validation_summary["durability_warnings"],
+            "durability_warning_count": validation_summary["durability_warning_count"],
+            "durability_caution_count": validation_summary["durability_caution_count"],
+            "data_review_flag_count": validation_summary["data_review_flag_count"],
+            "dataset_anomalies": validation_summary["dataset_anomalies"],
+            "dataset_anomaly_count": validation_summary["dataset_anomaly_count"],
             "warn_reasons": validation_report["warn_reasons"],
-            "statistical_error_reasons": validation_report.get("statistical_error_reasons", []),
-            "hard_fail_reasons": validation_report.get("hard_fail_reasons", []),
-            "durability_warning_reasons": validation_report.get(
-                "durability_warning_reasons",
-                validation_report.get("durability_caution_reasons", []),
-            ),
-            "durability_caution_reasons": validation_report.get("durability_caution_reasons", []),
-            "dataset_anomaly_reasons": validation_report.get("dataset_anomaly_reasons", []),
+            "hard_constraint_reasons": validation_summary["hard_constraint_reasons"],
+            "statistical_error_reasons": validation_summary["statistical_error_reasons"],
+            "hard_fail_reasons": validation_summary["hard_fail_reasons"],
+            "engineering_caution_reasons": validation_summary["engineering_caution_reasons"],
+            "durability_warning_reasons": validation_summary["durability_warning_reasons"],
+            "durability_caution_reasons": validation_summary["durability_caution_reasons"],
+            "data_review_flag_reasons": validation_summary["data_review_flag_reasons"],
+            "dataset_anomaly_reasons": validation_summary["dataset_anomaly_reasons"],
+            "contextual_summary": validation_summary["contextual_summary"],
+            "confidence_of_warning_assessment": validation_summary["confidence_of_warning_assessment"],
         }
     )
+    assert_no_cv_label_fraud(result)
     return stacking_model, result
 
 def get_runtime_library_versions() -> dict[str, str]:
@@ -883,7 +927,7 @@ def main() -> int:
         set_global_seed(int(config["experiment"]["random_seed"]))
         outputs_dir = get_outputs_dir(config)
         data = load_dataset(config)
-        x_train, x_test, y_train, y_test = split_dataset(data, config)
+        x_train, x_val, _, y_train, y_val, _ = split_dataset(data, config)
         validator = EngineeringValidator.from_config(config)
 
         baseline_name = str(config["baseline_model"]["model_name"])
@@ -894,8 +938,8 @@ def main() -> int:
             baseline_params,
             x_train,
             y_train,
-            x_test,
-            y_test,
+            x_val,
+            y_val,
             validator,
             config,
         )
@@ -917,7 +961,7 @@ def main() -> int:
             + format_metrics_summary(baseline_result["cv_metrics"])
             + f" | Validation={baseline_result['validation_verdict']}"
         )
-        log_status("Baseline test metrics: " + format_metrics_summary(baseline_result["test_metrics"]))
+        log_status("Baseline validation metrics: " + format_metrics_summary(baseline_result["val_metrics"]))
         return 0
     except Exception as exc:
         log_status(f"Baseline training failed: {exc}")

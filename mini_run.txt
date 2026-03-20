@@ -1,0 +1,6 @@
+visible response did not contain valid structured JSON: Visible response was empty or did not contain valid JSON.
+visible response did not contain valid structured JSON: Visible response was empty or did not contain valid JSON.
+[2026-03-15 10:19:45] INFO research_brief_loaded | path=E:\Random IDEA\AutoResearch\auto-civil-lab\research_brief.md | accept_metric=composite_score | min_improvement_pct=0.0000
+[2026-03-15 10:21:44] INFO scout_candidate_source | cycle=1 | mode=deterministic_fallback | backend=fallback | model=None | prompt_variant=None | count=1
+[2026-03-15 10:23:51] INFO scout_candidate_source | cycle=2 | mode=deterministic_fallback | backend=fallback | model=None | prompt_variant=None | count=1
+[2026-03-15 10:24:23] Research loop complete. Best model: LGBMRegressor | Composite=0.9202 | Validation=WARN

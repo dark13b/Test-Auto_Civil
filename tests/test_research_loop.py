@@ -289,7 +289,11 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 }),
                 patch.object(research_loop, "get_available_model_configs", return_value=available_models),
                 patch.object(research_loop, "load_dataset", return_value="dataset"),
-                patch.object(research_loop, "split_dataset", return_value=("x_train", "x_test", "y_train", "y_test")),
+                patch.object(
+                    research_loop,
+                    "split_dataset",
+                    return_value=("x_train", "x_val", "x_test", "y_train", "y_val", "y_test"),
+                ),
                 patch.object(research_loop.EngineeringValidator, "from_config", return_value=object()),
                 patch.object(research_loop, "read_research_surface_state", return_value={"accepted_experiments": []}),
                 patch.object(research_loop, "_build_proposal_engine", return_value=StubProposalEngine([

@@ -14,7 +14,7 @@ import pandas as pd
 
 import research_lab
 from llm_backend import get_llm_config, resolve_backend
-from proposal_engine import ProposalEngine
+from proposal_engine import ProposalEngine, ProposalExtractionError
 from research_protocol import (
     RESEARCH_RESULTS_COLUMNS,
     apply_keep_to_research_surface,
@@ -42,6 +42,7 @@ from train import (
     set_global_seed,
     split_dataset,
 )
+from validator import summarize_validation_report
 
 
 RESEARCH_RESULTS_FILENAME = "research_results.csv"
@@ -149,30 +150,7 @@ def _load_current_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any
 
 
 def _build_validation_summary(validation_report: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "context_type": validation_report.get("context_type", "general"),
-        "pass_rate": float(validation_report.get("pass_rate", 0.0)),
-        "hard_failed_count": int(validation_report.get("hard_failed_count", validation_report.get("failed_count", 0))),
-        "warning_count": int(validation_report.get("warning_count", 0)),
-        "statistical_errors": int(
-            validation_report.get(
-                "statistical_errors",
-                validation_report.get("statistical_error_count", validation_report.get("suspicious_count", 0)),
-            )
-        ),
-        "durability_warnings": int(
-            validation_report.get(
-                "durability_warnings",
-                validation_report.get(
-                    "durability_warning_count",
-                    validation_report.get("durability_caution_count", 0),
-                ),
-            )
-        ),
-        "dataset_anomalies": int(
-            validation_report.get("dataset_anomalies", validation_report.get("dataset_anomaly_count", 0))
-        ),
-    }
+    return summarize_validation_report(validation_report)
 
 
 def _build_final_metrics_payload(
@@ -193,7 +171,7 @@ def _build_final_metrics_payload(
         "best_model_name": best_result["model_name"],
         "best_model_hyperparameters": copy.deepcopy(best_result["hyperparameters"]),
         "validation_summary": _build_validation_summary(validation_report),
-        "holdout_metrics": copy.deepcopy(best_result.get("test_metrics", {})),
+        "validation_metrics": copy.deepcopy(best_result.get("val_metrics", best_result.get("test_metrics", {}))),
     }
 
 
@@ -260,17 +238,17 @@ def _build_record(
         return record
 
     validation_report = result.get("validation_report", {})
-    test_metrics = result.get("test_metrics", {})
+    val_metrics = result.get("val_metrics", result.get("test_metrics", {}))
     record.update(
         {
             "rmse": result.get("rmse"),
             "mae": result.get("mae"),
             "r2": result.get("r2"),
             "composite_score": result.get("composite_score"),
-            "test_rmse": test_metrics.get("rmse"),
-            "test_mae": test_metrics.get("mae"),
-            "test_r2": test_metrics.get("r2"),
-            "test_composite_score": test_metrics.get("composite_score"),
+            "test_rmse": val_metrics.get("rmse"),
+            "test_mae": val_metrics.get("mae"),
+            "test_r2": val_metrics.get("r2"),
+            "test_composite_score": val_metrics.get("composite_score"),
             "validation_pass_rate": validation_report.get("pass_rate"),
             "failed_count": validation_report.get("failed_count"),
             "hard_failed_count": validation_report.get("hard_failed_count", validation_report.get("failed_count")),
@@ -289,8 +267,8 @@ def _evaluate_stage_candidate(
     config: dict[str, Any],
     x_train: pd.DataFrame,
     y_train: pd.Series,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
     validator: EngineeringValidator,
 ) -> tuple[Any, dict[str, Any]]:
     return evaluate_candidate(
@@ -298,8 +276,8 @@ def _evaluate_stage_candidate(
         dict(experiment["params"]),
         x_train,
         y_train,
-        x_test,
-        y_test,
+        x_val,
+        y_val,
         validator,
         config,
     )
@@ -318,8 +296,8 @@ def _evaluate_reference_if_possible(
     confirm_config: dict[str, Any],
     x_train: pd.DataFrame,
     y_train: pd.Series,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
     validator: EngineeringValidator,
 ) -> dict[str, Any]:
     model_name = str(current_best_result.get("model_name", ""))
@@ -331,8 +309,8 @@ def _evaluate_reference_if_possible(
             dict(current_best_result.get("hyperparameters", {})),
             x_train,
             y_train,
-            x_test,
-            y_test,
+            x_val,
+            y_val,
             validator,
             confirm_config,
         )
@@ -426,19 +404,23 @@ def _select_scout_candidates(
     allow_deterministic_fallback: bool = True,
     trial_history: list[dict[str, Any]] | None = None,
     search_progress: dict[str, Any] | None = None,
+    exploit_delta_ratio: float = 0.15,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     llm_candidates: list[dict[str, Any]] = []
     if proposal_engine is not None and proposal_engine.is_available():
-        llm_candidates = proposal_engine.generate_experiment_proposals(
-            available_models=available_models,
-            research_brief=brief,
-            current_best=current_best,
-            experiment_memory=memory_payload,
-            diversity_state=_build_diversity_state(memory_payload),
-            proposal_count=scout_limit,
-            trial_history=trial_history or [],
-            search_progress=search_progress or {},
-        )
+        try:
+            llm_candidates = proposal_engine.generate_experiment_proposals(
+                available_models=available_models,
+                research_brief=brief,
+                current_best=current_best,
+                experiment_memory=memory_payload,
+                diversity_state=_build_diversity_state(memory_payload),
+                proposal_count=scout_limit,
+                trial_history=trial_history or [],
+                search_progress=search_progress or {},
+            )
+        except ProposalExtractionError:
+            llm_candidates = []
         llm_candidates = _normalize_llm_candidates(llm_candidates, available_models)
         llm_candidates = filter_diverse_candidates(
             candidates=llm_candidates,
@@ -472,6 +454,7 @@ def _select_scout_candidates(
         experiment_memory=memory_payload,
         current_best=current_best,
         scout_limit=scout_limit * 2,
+        exploit_delta_ratio=exploit_delta_ratio,
     )
     deterministic_candidates = filter_diverse_candidates(
         candidates=deterministic_candidates,
@@ -551,7 +534,7 @@ def run_engineering_research_loop(
 
     available_models = get_available_model_configs(config)
     data = load_dataset(config)
-    x_train, x_test, y_train, y_test = split_dataset(data, config)
+    x_train, x_val, _, y_train, y_val, _ = split_dataset(data, config)
     validator = EngineeringValidator.from_config(config)
 
     results_path = outputs_dir / RESEARCH_RESULTS_FILENAME
@@ -605,6 +588,7 @@ def run_engineering_research_loop(
             current_run_signatures=current_run_signatures,
             proposal_engine=proposal_engine,
             allow_deterministic_fallback=bool(llm_config.get("allow_deterministic_fallback", True)),
+            exploit_delta_ratio=float(research_config.get("exploit_delta_ratio", 0.15)),
         )
         log_status(
             "INFO scout_candidate_source | "
@@ -634,8 +618,8 @@ def run_engineering_research_loop(
                     config=scout_config,
                     x_train=x_train,
                     y_train=y_train,
-                    x_test=x_test,
-                    y_test=y_test,
+                    x_val=x_val,
+                    y_val=y_val,
                     validator=validator,
                 )
                 runtime_seconds = time.perf_counter() - started_at
@@ -721,8 +705,8 @@ def run_engineering_research_loop(
                 confirm_config=confirm_config,
                 x_train=x_train,
                 y_train=y_train,
-                x_test=x_test,
-                y_test=y_test,
+                x_val=x_val,
+                y_val=y_val,
                 validator=validator,
             )
             if confirm_candidates
@@ -744,8 +728,8 @@ def run_engineering_research_loop(
                     config=confirm_config,
                     x_train=x_train,
                     y_train=y_train,
-                    x_test=x_test,
-                    y_test=y_test,
+                    x_val=x_val,
+                    y_val=y_val,
                     validator=validator,
                 )
                 runtime_seconds = time.perf_counter() - started_at

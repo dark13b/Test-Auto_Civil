@@ -8,17 +8,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.base import clone
-from sklearn.model_selection import train_test_split
-
 from feature_engineering import build_engineering_features
 from train import (
-    build_stratification_bins,
     get_base_input_columns,
     get_input_columns,
-    load_pickle_artifact,
     get_outputs_dir,
     get_project_root,
+    load_pickle_artifact,
     load_config,
     load_dataset,
     log_status,
@@ -34,15 +30,22 @@ except ImportError:
 
 
 class UncertaintyEstimator:
-    """Estimate prediction intervals with quantile and conformal methods."""
+    """Estimate intervals without refitting the report model.
+
+    This estimator does not refit the model. It calibrates intervals on the
+    validation partition using the exact model object passed at construction.
+    """
 
     def __init__(
         self,
         model_path: str | Path | None = None,
+        model: Any | None = None,
+        report_model: Any | None = None,
         config_path: str | Path | None = None,
         method: str | None = None,
         outputs_dir: str | Path | None = None,
         report_filename: str = "uncertainty_calibration.json",
+        refit_model: bool = False,
     ) -> None:
         """Load configuration, data, and interval estimators."""
         self.project_root = get_project_root()
@@ -70,29 +73,26 @@ class UncertaintyEstimator:
             raise ValueError(
                 "engineering.uncertainty_method must be one of: conformal, quantile, both."
             )
-        if not self.model_path.exists():
+        if refit_model:
+            raise ValueError("UncertaintyEstimator does not support refitting the model.")
+        if model is None and not self.model_path.exists():
             raise FileNotFoundError(
                 f"Best search model not found at {self.model_path}. Run search.py before uncertainty.py."
             )
 
         set_global_seed(self.seed)
-        self.loaded_model = load_pickle_artifact(self.model_path)
+        self.model = model if model is not None else load_pickle_artifact(self.model_path)
+        self.report_model = report_model if report_model is not None else self.model
+        assert id(self.model) == id(self.report_model), (
+            "Uncertainty model and report model must be the same fitted object."
+        )
         dataset = load_dataset(self.config)
-        x_train_full, x_test, y_train_full, y_test = split_dataset(dataset, self.config)
-        calibration_fraction = float(self.config["uncertainty"]["calibration_fraction"])
-        calibration_bins = build_stratification_bins(
-            y_train_full,
-            max(2, int(self.config["data"]["stratify_bins"])),
+        self.x_train, self.x_calibration, _, self.y_train, self.y_calibration, _ = split_dataset(
+            dataset,
+            self.config,
         )
-        self.x_train, self.x_calibration, self.y_train, self.y_calibration = train_test_split(
-            x_train_full,
-            y_train_full,
-            test_size=calibration_fraction,
-            random_state=self.seed,
-            stratify=calibration_bins,
-        )
-        self.x_test = x_test
-        self.y_test = y_test
+        self.x_validation = self.x_calibration
+        self.y_validation = self.y_calibration
         self._fit_estimators()
 
     def _load_config(self, config_path: str | Path | None) -> dict[str, Any]:
@@ -139,10 +139,9 @@ class UncertaintyEstimator:
     def _fit_estimators(self) -> None:
         """Fit the interval estimators required by the selected method."""
         if self.method in {"conformal", "both"}:
-            self.conformal_model = clone(self.loaded_model)
-            self.conformal_model.fit(self.x_train, self.y_train)
+            self.conformal_model = self.model
             calibration_predictions = np.asarray(
-                self.conformal_model.predict(self.x_calibration),
+                self.model.predict(self.x_calibration),
                 dtype=float,
             )
             nonconformity_scores = np.abs(np.asarray(self.y_calibration, dtype=float) - calibration_predictions)
@@ -272,9 +271,9 @@ class UncertaintyEstimator:
 
     def _predict_conformal(self, x: pd.DataFrame) -> pd.DataFrame:
         """Predict conformal intervals."""
-        if self.conformal_model is None or self.conformal_global_quantile is None:
+        if self.conformal_global_quantile is None:
             raise RuntimeError("Conformal estimator is not initialized.")
-        predicted = np.asarray(self.conformal_model.predict(x), dtype=float)
+        predicted = np.asarray(self.model.predict(x), dtype=float)
         strength_bins = self._assign_strength_bins(predicted)
         quantiles = np.asarray(
             [
@@ -301,7 +300,7 @@ class UncertaintyEstimator:
         if not self.quantile_models:
             raise RuntimeError("Quantile estimator is not initialized.")
         lower = np.asarray(self.quantile_models["lower"].predict(x), dtype=float)
-        predicted = np.asarray(self.quantile_models["median"].predict(x), dtype=float)
+        predicted = np.asarray(self.model.predict(x), dtype=float)
         upper = np.asarray(self.quantile_models["upper"].predict(x), dtype=float)
         return pd.DataFrame(
             {
@@ -357,10 +356,10 @@ class UncertaintyEstimator:
 
     def calibration_report(self) -> dict[str, Any]:
         """Calculate and save calibration statistics for the configured interval method."""
-        interval_frame = self.predict_with_interval(self.x_test)
+        interval_frame = self.predict_with_interval(self.x_validation)
         covered = (
-            (self.y_test.to_numpy(dtype=float) >= interval_frame["lower_90"].to_numpy(dtype=float))
-            & (self.y_test.to_numpy(dtype=float) <= interval_frame["upper_90"].to_numpy(dtype=float))
+            (self.y_validation.to_numpy(dtype=float) >= interval_frame["lower_90"].to_numpy(dtype=float))
+            & (self.y_validation.to_numpy(dtype=float) <= interval_frame["upper_90"].to_numpy(dtype=float))
         )
         coverage = float(np.mean(covered))
         mean_interval_width = float(interval_frame["interval_width"].mean())
@@ -404,7 +403,7 @@ class UncertaintyEstimator:
             "mean_interval_width": mean_interval_width,
             "sharpness": mean_interval_width,
             "calibration_sample_count": int(len(self.y_calibration)),
-            "test_sample_count": int(len(self.y_test)),
+            "validation_sample_count": int(len(self.y_validation)),
             "reliability_plot_data": grouped.to_dict(orient="records"),
             "coverage_audit": {
                 "global_status": audit_status,

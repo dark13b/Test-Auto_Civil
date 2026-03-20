@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -26,6 +27,10 @@ from train import (
     split_dataset,
 )
 from uncertainty import UncertaintyEstimator
+from validator import summarize_validation_report
+
+
+REPORT_CONTEXT = SimpleNamespace()
 
 
 def load_json_artifact(path: Path) -> dict[str, Any]:
@@ -267,7 +272,12 @@ def main() -> int:
         optuna_results = pd.read_csv(outputs_dir / "optuna_results.csv")
 
         data = load_dataset(config)
-        x_train, x_test, y_train, y_test = split_dataset(data, config)
+        x_train, _, x_test, y_train, _, y_test = split_dataset(data, config)
+        ctx = REPORT_CONTEXT
+        assert getattr(ctx, "_test_set_used_in_report", False) is False, (
+            "x_test has already been used. Holdout integrity violated."
+        )
+        ctx._test_set_used_in_report = True
         validator = EngineeringValidator.from_config(config)
         baseline_pred = np.asarray(baseline_model.predict(x_test), dtype=float)
         y_pred = np.asarray(best_model.predict(x_test), dtype=float)
@@ -284,7 +294,12 @@ def main() -> int:
         feature_importance = compute_feature_importance(best_model, x_test, y_test, config, best_search_result)
         create_feature_importance_plot(feature_importance, outputs_dir)
         rmse_by_range = create_performance_by_range_plot(y_test, y_pred, outputs_dir)
-        uncertainty_estimator = UncertaintyEstimator(method=str(config["engineering"]["uncertainty_method"]))
+        uncertainty_estimator = UncertaintyEstimator(
+            model=best_model,
+            report_model=best_model,
+            method=str(config["engineering"]["uncertainty_method"]),
+            outputs_dir=outputs_dir,
+        )
         uncertainty_audit = uncertainty_estimator.calibration_report()
         interval_frame = uncertainty_estimator.predict_with_interval(x_test)
         audit_coverages = {
@@ -305,30 +320,7 @@ def main() -> int:
             float(baseline_metrics["composite_score"]),
             float(best_search_result["composite_score"]),
         )
-        validation_summary = {
-            "context_type": validation_report.get("context_type", "general"),
-            "pass_rate": float(validation_report["pass_rate"]),
-            "hard_failed_count": int(validation_report.get("hard_failed_count", validation_report["failed_count"])),
-            "warning_count": int(validation_report["warning_count"]),
-            "statistical_errors": int(
-                validation_report.get(
-                    "statistical_errors",
-                    validation_report.get("statistical_error_count", validation_report["suspicious_count"]),
-                )
-            ),
-            "durability_warnings": int(
-                validation_report.get(
-                    "durability_warnings",
-                    validation_report.get(
-                        "durability_warning_count",
-                        validation_report.get("durability_caution_count", 0),
-                    ),
-                )
-            ),
-            "dataset_anomalies": int(
-                validation_report.get("dataset_anomalies", validation_report.get("dataset_anomaly_count", 0))
-            ),
-        }
+        validation_summary = summarize_validation_report(validation_report)
         final_metrics = dict(canonical_final_metrics) if isinstance(canonical_final_metrics, dict) else {}
         final_metrics.update(
             {
@@ -354,9 +346,9 @@ def main() -> int:
             f"Composite={validation_result['composite_score']:.4f} | "
             f"Improvement={improvement_percentage:.2f}% | "
             f"Validation={validation_result['validation_verdict']} | "
-            f"StatisticalErrors={validation_summary['statistical_errors']} | "
-            f"DurabilityWarnings={validation_summary['durability_warnings']} | "
-            f"DatasetAnomalies={validation_summary['dataset_anomalies']}"
+            f"HardConstraints={validation_summary['hard_constraint_count']} | "
+            f"EngineeringCautions={validation_summary['engineering_caution_count']} | "
+            f"DataReviewFlags={validation_summary['data_review_flag_count']}"
         )
         return 0
     except Exception as exc:

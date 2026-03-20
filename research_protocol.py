@@ -62,6 +62,10 @@ RESEARCH_RESULTS_COLUMNS = [
 ]
 
 
+class DuplicateExperimentError(ValueError):
+    """Raised when LAB_STATE contains duplicate accepted experiment identities."""
+
+
 def _to_float(value: Any, fallback: float) -> float:
     try:
         return float(value)
@@ -691,9 +695,55 @@ def write_research_surface_state(research_lab_path: Path, state: dict[str, Any])
     research_lab_path.write_text(updated_text, encoding="utf-8")
 
 
+def validate_lab_state_integrity(lab_state: dict[str, Any]) -> dict[str, Any]:
+    """Validate accepted experiment identities within the mutable LAB_STATE payload."""
+    accepted_entries = lab_state.get("accepted_experiments", [])
+    if not isinstance(accepted_entries, list):
+        raise ValueError("LAB_STATE.accepted_experiments must be a list.")
+
+    seen_entries: dict[str, dict[str, Any]] = {}
+    for entry in accepted_entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Each accepted_experiment entry must be a dictionary.")
+        experiment_id = str(entry.get("experiment_id", "")).strip()
+        if not experiment_id:
+            raise ValueError("Each accepted_experiment entry must include experiment_id.")
+
+        if experiment_id in seen_entries:
+            previous_entry = seen_entries[experiment_id]
+            previous_score = _to_serializable(previous_entry.get("composite_score"))
+            current_score = _to_serializable(entry.get("composite_score"))
+            if previous_score != current_score:
+                raise DuplicateExperimentError(
+                    "Experiment "
+                    f"{experiment_id} already accepted with conflicting composite_score values "
+                    f"({previous_score} vs {current_score})."
+                )
+            raise DuplicateExperimentError(
+                f"Experiment {experiment_id} already accepted. State integrity violation."
+            )
+
+        seen_entries[experiment_id] = entry
+
+    return lab_state
+
+
 def apply_keep_to_research_surface(research_lab_path: Path, accepted_entry: dict[str, Any]) -> dict[str, Any]:
     """Persist an accepted experiment into the controlled research surface."""
     state = read_research_surface_state(research_lab_path)
+    validate_lab_state_integrity(state)
+
+    experiment_id = str(accepted_entry.get("experiment_id", "")).strip()
+    existing_ids = {
+        str(entry.get("experiment_id", "")).strip()
+        for entry in state.get("accepted_experiments", [])
+        if isinstance(entry, dict)
+    }
+    if experiment_id and experiment_id in existing_ids:
+        raise DuplicateExperimentError(
+            f"Experiment {experiment_id} already accepted. State integrity violation."
+        )
+
     accepted = list(state.get("accepted_experiments", []))
     accepted.append(copy.deepcopy(accepted_entry))
     state["accepted_experiments"] = accepted
@@ -703,6 +753,7 @@ def apply_keep_to_research_surface(research_lab_path: Path, accepted_entry: dict
     if proposal_family:
         recent_families.append(str(proposal_family))
     state["recent_kept_families"] = recent_families[-25:]
+    validate_lab_state_integrity(state)
     write_research_surface_state(research_lab_path, state)
     return state
 

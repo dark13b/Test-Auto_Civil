@@ -6,7 +6,13 @@ surface. Future research changes belong here, not in the orchestration code.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+from research_protocol import DuplicateExperimentError, validate_lab_state_integrity
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 # RESEARCH_SURFACE_STATE_START
@@ -24,12 +30,36 @@ LAB_STATE = {'accepted_experiments': [{'composite_score': 0.9043986057974769,
                            'confirm_improvement_pct': 0.8290739967398005,
                            'experiment_id': 'confirm-llm-scout-002',
                            'model_name': 'LGBMRegressor',
-                           'proposal_family': 'LGBMRegressor-expansive'}],
+                           'proposal_family': 'LGBMRegressor-expansive'},
+                          {'composite_score': 0.9193021590292377,
+                           'confirm_improvement_pct': 0.009889934472547395,
+                           'experiment_id': 'confirm-scout-010-lgbmregressor-exploit',
+                           'model_name': 'LGBMRegressor',
+                           'proposal_family': 'LGBMRegressor-exploit'},
+                          {'composite_score': 0.9201538422832174,
+                           'confirm_improvement_pct': 0.0842258027725169,
+                           'experiment_id': 'confirm-scout-011-lgbmregressor-exploit-learning_rate-down',
+                           'model_name': 'LGBMRegressor',
+                           'proposal_family': 'LGBMRegressor-exploit'},
+                          {'composite_score': 0.920218743794953,
+                           'confirm_improvement_pct': 0.007053332687783711,
+                           'experiment_id': 'confirm-scout-019-lgbmregressor-exploit-colsample_bytree-down',
+                           'model_name': 'LGBMRegressor',
+                           'proposal_family': 'LGBMRegressor-exploit'}],
  'recent_kept_families': ['RandomForestRegressor-exploit',
                           'LGBMRegressor-expansive',
-                          'LGBMRegressor-expansive'],
+                          'LGBMRegressor-expansive',
+                          'LGBMRegressor-exploit',
+                          'LGBMRegressor-exploit',
+                          'LGBMRegressor-exploit'],
  'surface_version': 1}
 # RESEARCH_SURFACE_STATE_END
+
+try:
+    validate_lab_state_integrity(LAB_STATE)
+except DuplicateExperimentError as exc:
+    LOGGER.critical("Invalid checked-in LAB_STATE: %s", exc)
+    raise
 
 
 def _numeric_anchor(low: float, high: float, anchor: str, *, step: float | None = None, log: bool = False) -> float:
@@ -124,40 +154,106 @@ def _mutate_current_best(
     current_best: dict[str, Any],
     available_models: dict[str, dict[str, Any]],
     sequence_id: int,
-) -> dict[str, Any] | None:
+    exploit_delta_ratio: float = 0.15,
+) -> list[dict[str, Any]]:
     model_name = str(current_best.get("model_name", ""))
     if model_name not in available_models:
-        return None
+        return []
 
     search_space = dict(available_models[model_name].get("search_space", {}))
     base_params = dict(current_best.get("hyperparameters", {}))
     if not search_space or not base_params:
-        return None
-
-    mutated = dict(base_params)
-    for parameter_name, spec in search_space.items():
-        if parameter_name not in mutated:
-            continue
-        if spec.get("type") == "int":
-            step = int(spec.get("step", 1))
-            high = int(spec["high"])
-            mutated[parameter_name] = min(int(mutated[parameter_name]) + step, high)
-            break
-        if spec.get("type") == "float":
-            high = float(spec["high"])
-            mutated[parameter_name] = min(float(mutated[parameter_name]) * 1.15, high)
-            break
+        return []
 
     display_name = str(available_models[model_name].get("display_name", model_name))
-    return {
-        "experiment_id": f"scout-{sequence_id:03d}-{model_name.lower()}-exploit",
-        "stage": "scout",
-        "model_name": model_name,
-        "display_name": display_name,
-        "proposal_family": f"{model_name}-exploit",
-        "hypothesis": f"{display_name} exploit around current best",
-        "params": mutated,
-    }
+    candidates: list[dict[str, Any]] = []
+    seen_signatures: set[tuple[tuple[str, Any], ...]] = set()
+
+    def _register_candidate(mutated_params: dict[str, Any], mutation_label: str) -> None:
+        signature = tuple(sorted(mutated_params.items()))
+        if signature in seen_signatures:
+            return
+        seen_signatures.add(signature)
+        candidates.append(
+            {
+                "experiment_id": f"scout-{len(candidates) + sequence_id:03d}-{model_name.lower()}-exploit-{mutation_label}",
+                "stage": "scout",
+                "model_name": model_name,
+                "display_name": display_name,
+                "proposal_family": f"{model_name}-exploit",
+                "hypothesis": f"{display_name} exploit around current best via {mutation_label}",
+                "params": mutated_params,
+            }
+        )
+
+    for parameter_name, spec in search_space.items():
+        if parameter_name not in base_params:
+            continue
+        parameter_type = spec.get("type")
+        base_value = base_params[parameter_name]
+        if parameter_type == "int":
+            step = max(1, int(spec.get("step", 1)))
+            low = int(spec["low"])
+            high = int(spec["high"])
+            for direction, delta in (("down", -step), ("up", step)):
+                mutated_value = int(base_value) + delta
+                mutated_value = min(max(mutated_value, low), high)
+                if mutated_value == int(base_value):
+                    continue
+                mutated = dict(base_params)
+                mutated[parameter_name] = mutated_value
+                _register_candidate(mutated, f"{parameter_name}-{direction}")
+        elif parameter_type == "float":
+            low = float(spec["low"])
+            high = float(spec["high"])
+            base_numeric = float(base_value)
+            if bool(spec.get("log", False)):
+                delta_ratio = max(float(exploit_delta_ratio), 1e-6)
+                for direction, factor in (("down", 1.0 - delta_ratio), ("up", 1.0 + delta_ratio)):
+                    if factor <= 0.0:
+                        continue
+                    mutated_value = min(max(base_numeric * factor, low), high)
+                    mutated_value = round(float(mutated_value), 12)
+                    if abs(mutated_value - base_numeric) <= 1e-12:
+                        continue
+                    mutated = dict(base_params)
+                    mutated[parameter_name] = mutated_value
+                    _register_candidate(mutated, f"{parameter_name}-{direction}")
+                continue
+
+            span = high - low
+            delta = max(span * 0.15, abs(base_numeric) * 0.15, 1e-6)
+            for direction, sign in (("down", -1.0), ("up", 1.0)):
+                mutated_value = min(max(base_numeric + sign * delta, low), high)
+                mutated_value = round(float(mutated_value), 12)
+                if abs(mutated_value - base_numeric) <= 1e-12:
+                    continue
+                mutated = dict(base_params)
+                mutated[parameter_name] = float(mutated_value)
+                _register_candidate(mutated, f"{parameter_name}-{direction}")
+        elif parameter_type == "categorical":
+            choices = list(spec.get("choices", []))
+            if not choices:
+                continue
+            if base_value in choices:
+                index = choices.index(base_value)
+                neighbor_indices = [index - 1, index + 1]
+            else:
+                neighbor_indices = [0, len(choices) - 1]
+            for neighbor_index in neighbor_indices:
+                if neighbor_index < 0 or neighbor_index >= len(choices):
+                    continue
+                mutated_value = choices[neighbor_index]
+                if mutated_value == base_value:
+                    continue
+                mutated = dict(base_params)
+                mutated[parameter_name] = mutated_value
+                direction = "alt" if mutated_value not in {choices[0], choices[-1]} else (
+                    "down" if neighbor_index < choices.index(base_value) else "up"
+                ) if base_value in choices else "alt"
+                _register_candidate(mutated, f"{parameter_name}-{direction}")
+
+    return candidates
 
 
 def scout_experiments(
@@ -168,6 +264,7 @@ def scout_experiments(
     experiment_memory: dict[str, Any],
     current_best: dict[str, Any],
     scout_limit: int,
+    exploit_delta_ratio: float = 0.15,
 ) -> list[dict[str, Any]]:
     """Build deterministic scout experiments from the controlled research surface."""
     del experiment_memory
@@ -205,13 +302,14 @@ def scout_experiments(
             )
             sequence_id += 1
 
-    exploit_candidate = _mutate_current_best(
+    exploit_candidates = _mutate_current_best(
         current_best=current_best,
         available_models=available_models,
         sequence_id=sequence_id,
+        exploit_delta_ratio=exploit_delta_ratio,
     )
-    if exploit_candidate is not None:
-        candidates.insert(0, exploit_candidate)
+    if exploit_candidates:
+        candidates = exploit_candidates + candidates
 
     return candidates[: max(1, int(scout_limit))]
 

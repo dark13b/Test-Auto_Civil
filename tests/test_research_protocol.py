@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from research_protocol import (
+    DuplicateExperimentError,
     apply_keep_to_research_surface,
     build_acceptance_decision,
     build_config_signature,
@@ -16,6 +17,7 @@ from research_protocol import (
     record_experiment_memory,
     should_skip_duplicate_proposal,
     trial_budget_status,
+    validate_lab_state_integrity,
     validate_final_artifact_consistency,
 )
 
@@ -326,6 +328,56 @@ class ResearchProtocolTests(unittest.TestCase):
 
         self.assertEqual(len(updated_state["accepted_experiments"]), 1)
         self.assertEqual(updated_state["accepted_experiments"][0]["experiment_id"], "confirm-001")
+
+    def test_apply_keep_to_research_surface_rejects_duplicate_experiment_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lab_path = Path(tmpdir) / "research_lab.py"
+            lab_path.write_text(
+                '"""editable surface"""\n'
+                "# RESEARCH_SURFACE_STATE_START\n"
+                "LAB_STATE = {\n"
+                "    'surface_version': 1,\n"
+                "    'accepted_experiments': [\n"
+                "        {'experiment_id': 'confirm-001', 'proposal_family': 'boosting', 'model_name': 'LGBMRegressor', 'composite_score': 0.91},\n"
+                "    ],\n"
+                "    'recent_kept_families': ['boosting'],\n"
+                "}\n"
+                "# RESEARCH_SURFACE_STATE_END\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(DuplicateExperimentError):
+                apply_keep_to_research_surface(
+                    research_lab_path=lab_path,
+                    accepted_entry={
+                        "experiment_id": "confirm-001",
+                        "proposal_family": "boosting",
+                        "model_name": "LGBMRegressor",
+                        "composite_score": 0.92,
+                    },
+                )
+
+    def test_validate_lab_state_integrity_rejects_conflicting_duplicate_scores(self) -> None:
+        with self.assertRaises(DuplicateExperimentError):
+            validate_lab_state_integrity(
+                {
+                    "surface_version": 1,
+                    "accepted_experiments": [
+                        {
+                            "experiment_id": "confirm-001",
+                            "proposal_family": "boosting",
+                            "model_name": "LGBMRegressor",
+                            "composite_score": 0.91,
+                        },
+                        {
+                            "experiment_id": "confirm-001",
+                            "proposal_family": "boosting",
+                            "model_name": "LGBMRegressor",
+                            "composite_score": 0.95,
+                        },
+                    ],
+                }
+            )
 
     def test_trial_budget_status(self) -> None:
         self.assertEqual(trial_budget_status(elapsed_seconds=31.0, max_trial_seconds=30.0), "budget_exceeded")

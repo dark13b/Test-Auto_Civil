@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from llm_backend import (
     HybridBackend,
@@ -48,6 +48,23 @@ class LLMBackendTests(unittest.TestCase):
         self.assertEqual(resolve_prompt_variant(llm_config, "tiny-local"), "compact")
         self.assertEqual(resolve_prompt_variant(llm_config, "larger-local"), "rich")
 
+    def test_get_llm_config_preserves_ollama_runtime_options(self) -> None:
+        llm_config = get_llm_config(
+            {
+                "llm": {
+                    "ollama": {
+                        "options": {
+                            "num_ctx": 2048,
+                            "num_gpu": 1,
+                        }
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(llm_config["ollama"]["options"]["num_ctx"], 2048)
+        self.assertEqual(llm_config["ollama"]["options"]["num_gpu"], 1)
+
     def test_resolve_backend_builds_ollama_backend_for_ollama_mode(self) -> None:
         config = {
             "llm": {
@@ -90,6 +107,65 @@ class LLMBackendTests(unittest.TestCase):
 
         self.assertIsInstance(backend, OpenAIBackend)
         self.assertFalse(backend.is_available())
+
+    def test_ollama_backend_forwards_configured_runtime_options(self) -> None:
+        config = {
+            "llm": {
+                "enabled": True,
+                "backend_mode": "ollama",
+                "ollama": {
+                    "model": "qwen3:8b",
+                    "base_url": "http://localhost:11434",
+                    "options": {
+                        "num_ctx": 2048,
+                        "num_gpu": 1,
+                    },
+                },
+            }
+        }
+        backend = OllamaBackend(config)
+        response = MagicMock()
+        response.json.return_value = {"response": "{\"ok\":true}"}
+        response.raise_for_status.return_value = None
+
+        with patch.object(backend, "_http_available", return_value=True), patch(
+            "llm_backend.requests.post",
+            return_value=response,
+        ) as mock_post:
+            backend.generate_text("hello", max_output_tokens=128, temperature=0.3)
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload["options"]["num_ctx"], 2048)
+        self.assertEqual(payload["options"]["num_gpu"], 1)
+        self.assertEqual(payload["options"]["num_predict"], 128)
+
+    def test_ollama_backend_appends_no_think_for_qwen_structured_calls(self) -> None:
+        config = {
+            "llm": {
+                "enabled": True,
+                "backend_mode": "ollama",
+                "default_local_proposal_model": "qwen3:8b",
+                "qwen_thinking_mode": False,
+                "ollama": {
+                    "model": "qwen3:8b",
+                    "base_url": "http://localhost:11434",
+                    "options": {},
+                },
+            }
+        }
+        backend = OllamaBackend(config)
+        response = MagicMock()
+        response.json.return_value = {"response": "{\"ok\":true}"}
+        response.raise_for_status.return_value = None
+
+        with patch.object(backend, "_http_available", return_value=True), patch(
+            "llm_backend.requests.post",
+            return_value=response,
+        ) as mock_post:
+            backend.generate_text("return json", system_prompt="system", response_format={"type": "object"})
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertIn("/no_think", payload["prompt"])
 
 
 if __name__ == "__main__":

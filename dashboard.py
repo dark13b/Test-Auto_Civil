@@ -2,9 +2,11 @@ import os
 import json
 import csv
 import re
+import secrets
+import html
 from pathlib import Path
-from datetime import datetime
-from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory
+from datetime import datetime, timedelta, timezone
+from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, url_for
 
 app = Flask(__name__)
 
@@ -12,7 +14,12 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 DATA_DIR = BASE_DIR / "data"
 CONFIG_PATH = BASE_DIR / "config.yaml"
+SHARED_SNAPSHOTS_FILENAME = "shared_snapshots.json"
+SHARE_EVENTS_FILENAME = "share_events.jsonl"
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+if not DASHBOARD_PASSWORD:
+    DASHBOARD_PASSWORD = secrets.token_urlsafe(18)
+    print(f"[dashboard] DASHBOARD_PASSWORD not set; generated temporary password: {DASHBOARD_PASSWORD}")
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -34,6 +41,92 @@ def safe_read_csv(path):
     except Exception:
         return None
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def to_utc_iso(dt):
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+def parse_utc_iso(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+def share_link_ttl_hours():
+    raw = os.environ.get("SHARE_LINK_TTL_HOURS", "168")
+    try:
+        ttl = int(raw)
+        return max(ttl, 1)
+    except (TypeError, ValueError):
+        return 168
+
+def get_dataset_rows():
+    try:
+        with open(DATA_DIR / "concrete_data.csv", encoding="utf-8") as data_file:
+            return max(sum(1 for _ in data_file) - 1, 0)
+    except Exception:
+        return 0
+
+def shared_snapshots_path():
+    return OUTPUTS_DIR / SHARED_SNAPSHOTS_FILENAME
+
+def share_events_path():
+    return OUTPUTS_DIR / SHARE_EVENTS_FILENAME
+
+def load_shared_snapshots_store():
+    payload = safe_read_json(shared_snapshots_path())
+    if isinstance(payload, dict) and isinstance(payload.get("links"), dict):
+        return payload
+    return {"links": {}}
+
+def save_shared_snapshots_store(store):
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    with shared_snapshots_path().open("w", encoding="utf-8") as handle:
+        json.dump(store, handle, indent=2, sort_keys=True)
+
+def log_share_event(event_name, *, token="", metadata=None):
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    event_payload = {
+        "event": str(event_name),
+        "timestamp": to_utc_iso(utc_now()),
+        "token": str(token),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+    with share_events_path().open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event_payload) + "\n")
+
+def build_share_snapshot_payload():
+    baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
+    final_raw = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
+    best_source = (
+        final_raw.get("best_search_metrics")
+        or safe_read_json(OUTPUTS_DIR / "search_state_best_result.json")
+        or safe_read_json(OUTPUTS_DIR / "best_search_result.json")
+        or {}
+    )
+    best = normalize_result_payload(best_source)
+    final = normalize_final_payload(final_raw)
+
+    return {
+        "dataset_rows": get_dataset_rows(),
+        "baseline_model": baseline.get("model_name") or "RandomForestRegressor",
+        "best_model": best.get("model_name") or "N/A",
+        "best_trial": best.get("best_trial"),
+        "baseline_composite": baseline.get("cv_composite") or baseline.get("composite"),
+        "best_composite": best.get("holdout_composite") or best.get("cv_composite") or best.get("composite"),
+        "composite_improvement_pct": final.get("composite_improvement_pct"),
+        "validation_verdict": best.get("validation_verdict") or best.get("validation"),
+    }
+
 def load_required_output_json(filename):
     path = OUTPUTS_DIR / filename
     if not path.exists():
@@ -51,6 +144,15 @@ def coerce_number(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+def sanitize_dashboard_payload(value):
+    if isinstance(value, dict):
+        return {key: sanitize_dashboard_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_dashboard_payload(item) for item in value]
+    if isinstance(value, str):
+        return html.escape(value, quote=True)
+    return value
 
 def normalize_result_payload(payload):
     if not isinstance(payload, dict):
@@ -85,9 +187,21 @@ def normalize_result_payload(payload):
     hard_failed_count = int(
         coerce_number(
             normalized.get("hard_failed_count")
+            or normalized.get("hard_constraint_count")
+            or validation_report.get("hard_constraint_count")
             or validation_report.get("hard_failed_count")
             or normalized.get("failed_count")
             or validation_report.get("failed_count")
+            or 0
+        )
+        or 0
+    )
+    engineering_caution_count = int(
+        coerce_number(
+            normalized.get("engineering_caution_count")
+            or validation_report.get("engineering_caution_count")
+            or normalized.get("durability_caution_count")
+            or validation_report.get("durability_caution_count")
             or 0
         )
         or 0
@@ -98,10 +212,10 @@ def normalize_result_payload(payload):
         )
         or 0
     )
-    durability_caution_count = int(
+    suspicious_count = int(
         coerce_number(
-            normalized.get("durability_caution_count")
-            or validation_report.get("durability_caution_count")
+            normalized.get("suspicious_count")
+            or validation_report.get("suspicious_count")
             or 0
         )
         or 0
@@ -110,6 +224,18 @@ def normalize_result_payload(payload):
         coerce_number(
             normalized.get("dataset_anomaly_count")
             or validation_report.get("dataset_anomaly_count")
+            or normalized.get("data_review_flag_count")
+            or validation_report.get("data_review_flag_count")
+            or 0
+        )
+        or 0
+    )
+    data_review_flag_count = int(
+        coerce_number(
+            normalized.get("data_review_flag_count")
+            or validation_report.get("data_review_flag_count")
+            or dataset_anomaly_count
+            or suspicious_count
             or 0
         )
         or 0
@@ -117,28 +243,52 @@ def normalize_result_payload(payload):
 
     normalized["failed_count"] = hard_failed_count
     normalized["hard_failed_count"] = hard_failed_count
+    normalized["hard_constraint_count"] = hard_failed_count
     normalized["warning_count"] = warning_count
-    normalized["durability_caution_count"] = durability_caution_count
+    normalized["engineering_caution_count"] = engineering_caution_count
+    normalized["durability_caution_count"] = engineering_caution_count
+    normalized["data_review_flag_count"] = data_review_flag_count
     normalized["dataset_anomaly_count"] = dataset_anomaly_count
     # API responses flatten list-valued artifact fields into counts where the
     # dashboard expects summary numbers.
     normalized["failed_samples"] = hard_failed_count
     normalized["warning_samples"] = warning_count
-    normalized["suspicious_samples"] = dataset_anomaly_count
-    normalized["suspicious_count"] = dataset_anomaly_count
+    normalized["suspicious_samples"] = suspicious_count
+    normalized["suspicious_count"] = suspicious_count
     normalized["warn_reasons"] = normalized.get("warn_reasons") or validation_report.get("warn_reasons") or []
-    normalized["hard_fail_reasons"] = (
-        normalized.get("hard_fail_reasons") or validation_report.get("hard_fail_reasons") or []
+    normalized["hard_constraint_reasons"] = (
+        normalized.get("hard_constraint_reasons")
+        or validation_report.get("hard_constraint_reasons")
+        or normalized.get("hard_fail_reasons")
+        or validation_report.get("hard_fail_reasons")
+        or []
     )
-    normalized["durability_caution_reasons"] = (
-        normalized.get("durability_caution_reasons")
+    normalized["hard_fail_reasons"] = normalized["hard_constraint_reasons"]
+    normalized["engineering_caution_reasons"] = (
+        normalized.get("engineering_caution_reasons")
+        or validation_report.get("engineering_caution_reasons")
+        or normalized.get("durability_caution_reasons")
         or validation_report.get("durability_caution_reasons")
         or []
     )
-    normalized["dataset_anomaly_reasons"] = (
-        normalized.get("dataset_anomaly_reasons")
+    normalized["durability_caution_reasons"] = (
+        normalized["engineering_caution_reasons"]
+    )
+    normalized["data_review_flag_reasons"] = (
+        normalized.get("data_review_flag_reasons")
+        or validation_report.get("data_review_flag_reasons")
+        or normalized.get("dataset_anomaly_reasons")
         or validation_report.get("dataset_anomaly_reasons")
         or []
+    )
+    normalized["dataset_anomaly_reasons"] = normalized["data_review_flag_reasons"]
+    normalized["contextual_summary"] = (
+        normalized.get("contextual_summary") or validation_report.get("contextual_summary") or ""
+    )
+    normalized["confidence_of_warning_assessment"] = (
+        normalized.get("confidence_of_warning_assessment")
+        or validation_report.get("confidence_of_warning_assessment")
+        or ""
     )
     normalized["validation_pass_rate"] = coerce_number(
         normalized.get("validation_pass_rate") or validation_report.get("pass_rate")
@@ -227,7 +377,7 @@ def parse_research_log(path):
 
 @app.before_request
 def require_dashboard_auth():
-    if not DASHBOARD_PASSWORD or request.path == "/health":
+    if request.path == "/health" or request.path.startswith("/shared/"):
         return None
     auth = request.authorization
     if auth and auth.username == "autocivil" and auth.password == DASHBOARD_PASSWORD:
@@ -257,24 +407,18 @@ def api_overview():
         final = normalize_final_payload(final_raw)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
-    # dataset info
-    dataset_rows = 0
-    try:
-        with open(DATA_DIR / "concrete_data.csv") as f:
-            dataset_rows = sum(1 for _ in f) - 1
-    except Exception:
-        pass
-    return jsonify({"baseline": baseline, "best": best, "final": final, "dataset_rows": dataset_rows})
+    dataset_rows = get_dataset_rows()
+    return jsonify(sanitize_dashboard_payload({"baseline": baseline, "best": best, "final": final, "dataset_rows": dataset_rows}))
 
 @app.route("/api/research_log")
 def api_research_log():
     trials = parse_research_log(OUTPUTS_DIR / "research_log.txt")
-    return jsonify(trials)
+    return jsonify(sanitize_dashboard_payload(trials))
 
 @app.route("/api/optuna_results")
 def api_optuna_results():
     rows = safe_read_csv(OUTPUTS_DIR / "optuna_results.csv")
-    return jsonify(normalize_optuna_rows(rows))
+    return jsonify(sanitize_dashboard_payload(normalize_optuna_rows(rows)))
 
 @app.route("/api/validation_details")
 def api_validation_details():
@@ -289,7 +433,7 @@ def api_validation_details():
         best = normalize_result_payload(best_source)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
-    return jsonify(best)
+    return jsonify(sanitize_dashboard_payload(best))
 
 @app.route("/api/field_validation")
 def api_field_validation():
@@ -297,7 +441,7 @@ def api_field_validation():
         records = load_required_output_json("field_validation_log.json")
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
-    return jsonify(records if isinstance(records, list) else [])
+    return jsonify(sanitize_dashboard_payload(records if isinstance(records, list) else []))
 
 @app.route("/api/design_results")
 def api_design_results():
@@ -308,7 +452,7 @@ def api_design_results():
         if d:
             d["_filename"] = f.name
             singles.append(d)
-    return jsonify({"batch": batch or [], "singles": singles})
+    return jsonify(sanitize_dashboard_payload({"batch": batch or [], "singles": singles}))
 
 @app.route("/api/plots")
 def api_plots():
@@ -323,7 +467,7 @@ def api_plots():
     plots = []
     for f in sorted(OUTPUTS_DIR.glob("*.png")):
         plots.append({"filename": f.name, "description": known.get(f.name, f.stem.replace("_", " ").title())})
-    return jsonify(plots)
+    return jsonify(sanitize_dashboard_payload(plots))
 
 @app.route("/api/status")
 def api_status():
@@ -336,6 +480,155 @@ def api_status():
         p = OUTPUTS_DIR / name
         status[name] = {"exists": p.exists(), "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat() if p.exists() else None}
     return jsonify(status)
+
+@app.route("/api/share_latest", methods=["POST"])
+def api_share_latest():
+    try:
+        snapshot = build_share_snapshot_payload()
+    except FileNotFoundError as exc:
+        return json_not_found(exc.args[0])
+
+    now = utc_now()
+    ttl_hours = share_link_ttl_hours()
+    expires_at = now + timedelta(hours=ttl_hours)
+    token = secrets.token_urlsafe(12)
+
+    store = load_shared_snapshots_store()
+    store.setdefault("links", {})[token] = {
+        "created_at": to_utc_iso(now),
+        "expires_at": to_utc_iso(expires_at),
+        "snapshot": snapshot,
+    }
+    save_shared_snapshots_store(store)
+
+    log_share_event(
+        "share_link_created",
+        token=token,
+        metadata={
+            "best_model": str(snapshot.get("best_model") or ""),
+            "composite_improvement_pct": snapshot.get("composite_improvement_pct"),
+        },
+    )
+
+    share_path = url_for("shared_snapshot", token=token)
+    share_url = request.url_root.rstrip("/") + share_path
+    return jsonify(
+        sanitize_dashboard_payload(
+            {
+                "share_url": share_url,
+                "share_path": share_path,
+                "expires_at": to_utc_iso(expires_at),
+                "ttl_hours": ttl_hours,
+            }
+        )
+    ), 201
+
+@app.route("/shared/<token>")
+def shared_snapshot(token):
+    store = load_shared_snapshots_store()
+    record = store.get("links", {}).get(token)
+    if not isinstance(record, dict):
+        return Response("Share link not found.", 404)
+
+    expires_at = parse_utc_iso(record.get("expires_at"))
+    if expires_at and utc_now() > expires_at:
+        return Response("Share link expired.", 410)
+
+    snapshot = record.get("snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    def _safe_text(value, fallback="N/A"):
+        if value in (None, ""):
+            return fallback
+        return html.escape(str(value), quote=True)
+
+    def _safe_metric(value, decimals=4, suffix=""):
+        numeric = coerce_number(value)
+        if numeric is None:
+            return "N/A"
+        return f"{numeric:.{decimals}f}{suffix}"
+
+    improvement_value = coerce_number(snapshot.get("composite_improvement_pct"))
+    improvement_text = "N/A"
+    if improvement_value is not None:
+        sign = "+" if improvement_value >= 0 else ""
+        improvement_text = f"{sign}{improvement_value:.2f}%"
+
+    created_at = parse_utc_iso(record.get("created_at"))
+    created_text = to_utc_iso(created_at) if created_at else "N/A"
+    expires_text = to_utc_iso(expires_at) if expires_at else "N/A"
+
+    log_share_event(
+        "share_link_opened",
+        token=token,
+        metadata={"best_model": str(snapshot.get("best_model") or "")},
+    )
+
+    shared_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>AutoCivil-Lab Shared Snapshot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@500;700;800&display=swap" rel="stylesheet"/>
+  <style>
+    :root{{--bg:#f4eee4;--card:#ffffff;--border:#d7cfc1;--txt:#1f2937;--muted:#667085;--accent:#0f766e;--green:#15803d;}}
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:'Syne',sans-serif;background:linear-gradient(180deg,#fbf7ef 0%,var(--bg) 100%);color:var(--txt);padding:28px}}
+    .wrap{{max-width:860px;margin:0 auto}}
+    .hero{{margin-bottom:20px}}
+    .hero h1{{font-size:30px;font-weight:800;letter-spacing:-.6px}}
+    .hero p{{font-family:'Space Mono',monospace;font-size:12px;color:var(--muted);margin-top:8px}}
+    .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}}
+    .card{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px}}
+    .label{{font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.8px}}
+    .value{{font-family:'Space Mono',monospace;font-size:24px;font-weight:700}}
+    .value.green{{color:var(--green)}}
+    .meta{{margin-top:16px;padding-top:16px;border-top:1px solid var(--border);font-family:'Space Mono',monospace;font-size:11px;color:var(--muted);line-height:1.7}}
+    .cta{{margin-top:18px;font-family:'Space Mono',monospace;font-size:11px;color:var(--muted)}}
+    .cta a{{color:var(--accent);text-decoration:none;font-weight:700}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>AutoCivil-Lab Shared Snapshot</h1>
+      <p>Read-only summary shared from the dashboard.</p>
+    </section>
+    <section class="grid">
+      <article class="card">
+        <div class="label">Best Model</div>
+        <div class="value">{_safe_text(snapshot.get("best_model"))}</div>
+      </article>
+      <article class="card">
+        <div class="label">Composite Improvement</div>
+        <div class="value green">{_safe_text(improvement_text)}</div>
+      </article>
+      <article class="card">
+        <div class="label">Best Composite Score</div>
+        <div class="value">{_safe_text(_safe_metric(snapshot.get("best_composite"), 4))}</div>
+      </article>
+      <article class="card">
+        <div class="label">Dataset Rows</div>
+        <div class="value">{_safe_text(snapshot.get("dataset_rows"))}</div>
+      </article>
+    </section>
+    <section class="meta">
+      <div>Baseline model: {_safe_text(snapshot.get("baseline_model"))}</div>
+      <div>Baseline composite score: {_safe_text(_safe_metric(snapshot.get("baseline_composite"), 4))}</div>
+      <div>Validation verdict: {_safe_text(snapshot.get("validation_verdict"))}</div>
+      <div>Created at: {_safe_text(created_text)}</div>
+      <div>Expires at: {_safe_text(expires_text)}</div>
+    </section>
+    <section class="cta">
+      Need the full research detail? Open the private dashboard at <a href="/">/</a> (requires authentication).
+    </section>
+  </main>
+</body>
+</html>"""
+    return render_template_string(shared_html)
 
 @app.route("/outputs/<path:filename>")
 def serve_output(filename):
@@ -432,6 +725,7 @@ nav a .icon{font-size:15px;width:20px;text-align:center}
 }
 .tb-left{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .tb-left span{color:var(--accent);margin-right:16px}
+.tb-right{display:flex;align-items:center;gap:8px}
 .refresh-btn{
   background:var(--card);border:1px solid var(--border);
   color:var(--txt);padding:6px 14px;border-radius:6px;
@@ -439,6 +733,14 @@ nav a .icon{font-size:15px;width:20px;text-align:center}
   transition:all .15s;box-shadow:var(--shadow-sm);
 }
 .refresh-btn:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+.refresh-btn:disabled{opacity:.65;cursor:not-allowed;transform:none}
+.share-btn{border-color:var(--accent);color:var(--accent)}
+.share-status{
+  max-width:310px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:var(--mono);font-size:10px;color:var(--muted);
+}
+.share-status.ok{color:var(--green)}
+.share-status.warn{color:var(--yellow)}
 
 /* main */
 #main{margin-left:220px;padding-top:52px;min-height:100vh}
@@ -641,6 +943,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
   .chart-row{grid-template-columns:1fr}
   .panel-grid{grid-template-columns:1fr}
   .t-entry{grid-template-columns:40px 1fr auto auto}
+  .share-status{display:none}
 }
 </style>
 </head>
@@ -673,7 +976,11 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
     <span id="tb-dataset">—</span>
     <span id="tb-time">—</span>
   </div>
-  <button class="refresh-btn" onclick="loadAll()">⟳ Refresh</button>
+  <div class="tb-right">
+    <span class="share-status" id="share-status"></span>
+    <button class="refresh-btn share-btn" id="share-btn" onclick="shareLatestRun()">Share Latest Run</button>
+    <button class="refresh-btn" onclick="loadAll()">⟳ Refresh</button>
+  </div>
 </header>
 
 <!-- Main -->
@@ -839,7 +1146,77 @@ async function loadAll() {
   ]);
 }
 
+function setShareStatus(message, level = '') {
+  const statusEl = document.getElementById('share-status');
+  statusEl.className = 'share-status' + (level ? ` ${level}` : '');
+  statusEl.textContent = message || '';
+}
+
+async function shareLatestRun() {
+  const button = document.getElementById('share-btn');
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Sharing...';
+  setShareStatus('Generating secure share link...');
+  try {
+    const response = await fetch('/api/share_latest', { method: 'POST' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const missing = payload && payload.file ? ` (${payload.file})` : '';
+      setShareStatus(`Share failed${missing}`, 'warn');
+      button.textContent = 'Share Failed';
+      return;
+    }
+
+    const sharePath = payload.share_path || '';
+    const shareUrl = (sharePath ? `${window.location.origin}${sharePath}` : '') || payload.share_url || '';
+    let copied = false;
+    if (shareUrl && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        copied = true;
+      } catch (err) {
+        copied = false;
+      }
+    }
+
+    if (copied) {
+      setShareStatus('Link copied. Opens are now tracked.', 'ok');
+      button.textContent = 'Copied Link';
+    } else if (shareUrl) {
+      window.prompt('Copy this share link', shareUrl);
+      setShareStatus('Share link created.', 'ok');
+      button.textContent = 'Link Ready';
+    } else {
+      setShareStatus('Share link created.', 'ok');
+      button.textContent = 'Link Ready';
+    }
+  } catch (error) {
+    setShareStatus('Share failed due to network error.', 'warn');
+    button.textContent = 'Share Failed';
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }, 1400);
+  }
+}
+
 // ─── status ──────────────────────────────────────────────────────────────────
+function escapeHtml(value){
+  return String(value ?? '—')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+function badgeClass(value){
+  const cleaned = String(value || 'warn').toLowerCase().replace(/[^a-z0-9_-]/g,'');
+  return ['pass','warn','fail','ok','low','moderate','high'].includes(cleaned) ? cleaned : 'warn';
+}
+
 async function loadStatus() {
   const r = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
   const all = Object.values(r).every(v=>v.exists);
@@ -860,6 +1237,7 @@ async function loadOverview() {
   const b = d.baseline || {};
   const best = d.best || {};
   const fin = d.final || {};
+  const bestMetricSource = best.holdout_composite != null ? 'Holdout' : ((best.cv_composite != null || best.composite != null) ? 'CV' : 'N/A');
   document.getElementById('tb-dataset').textContent =
     `Dataset: ${d.dataset_rows || '—'} rows`;
 
@@ -870,18 +1248,18 @@ async function loadOverview() {
   document.getElementById('overview-cards').innerHTML = `
     <div class="card">
       <div class="card-label">01 · Baseline</div>
-      <div class="card-title">${b.model_name||'RandomForestRegressor'}</div>
-      <div class="metric"><div class="metric-label">CV RMSE</div><div class="metric-value">${num(b.cv_rmse||b.rmse,4)}</div></div>
+      <div class="card-title">${escapeHtml(b.model_name||'RandomForestRegressor')}</div>
+      <div class="metric"><div class="metric-label">RMSE ?? CV</div><div class="metric-value">${num(b.cv_rmse||b.rmse,4)}</div></div>
       <div class="metric"><div class="metric-label">CV R²</div><div class="metric-value sm">${num(b.cv_r2||b.r2,4)}</div></div>
-      <div class="metric"><div class="metric-label">Composite</div><div class="metric-value sm">${num(b.cv_composite||b.composite,4)}</div></div>
+      <div class="metric"><div class="metric-label">Composite ?? CV</div><div class="metric-value sm">${num(b.cv_composite||b.composite,4)}</div></div>
       <div style="margin-top:8px">${verdictBadge(b.validation_verdict||b.validation)}</div>
     </div>
     <div class="card">
       <div class="card-label">02 · Best Model</div>
       <div class="card-title">${best.model_name||'—'}</div>
-      <div class="metric"><div class="metric-label">CV RMSE</div><div class="metric-value">${num(best.cv_rmse||best.rmse,4)}</div></div>
+      <div class="metric"><div class="metric-label">RMSE ?? CV</div><div class="metric-value">${num(best.cv_rmse||best.rmse,4)}</div></div>
       <div class="metric"><div class="metric-label">Holdout R²</div><div class="metric-value sm">${num(best.holdout_r2||best.r2,4)}</div></div>
-      <div class="metric"><div class="metric-label">Composite</div><div class="metric-value sm">${num(best.holdout_composite||best.composite,4)}</div></div>
+      <div class="metric"><div class="metric-label">Composite ?? ${bestMetricSource}</div><div class="metric-value sm">${num(best.holdout_composite||best.val_composite||best.composite,4)}</div></div>
       <div style="margin-top:8px">${verdictBadge(best.validation_verdict||best.validation)}</div>
     </div>
     <div class="card">
@@ -908,9 +1286,9 @@ async function loadOverview() {
     <div class="card">
       <div class="card-label">06 · Validation Status</div>
       <div class="card-title">Engineering Checks</div>
-      <div class="metric"><div class="metric-label">Hard Fails</div><div class="metric-value" style="color:${(best.hard_failed_count||0)>0?'var(--red)':'var(--green)'}">${best.hard_failed_count??'—'}</div></div>
-      <div class="metric"><div class="metric-label">Durability Cautions</div><div class="metric-value sm" style="color:${(best.durability_caution_count||0)>0?'var(--yellow)':'var(--green)'}">${best.durability_caution_count??'—'}</div></div>
-      <div class="metric"><div class="metric-label">Dataset Anomalies</div><div class="metric-value sm">${best.dataset_anomaly_count??'—'}</div></div>
+      <div class="metric"><div class="metric-label">Hard Constraints</div><div class="metric-value" style="color:${(best.hard_failed_count||0)>0?'var(--red)':'var(--green)'}">${best.hard_failed_count??'—'}</div></div>
+      <div class="metric"><div class="metric-label">Engineering Cautions</div><div class="metric-value sm" style="color:${(best.engineering_caution_count||best.durability_caution_count||0)>0?'var(--yellow)':'var(--green)'}">${best.engineering_caution_count??best.durability_caution_count??'—'}</div></div>
+      <div class="metric"><div class="metric-label">Data Review Flags</div><div class="metric-value sm">${best.data_review_flag_count??best.dataset_anomaly_count??'—'}</div></div>
       <div style="margin-top:8px">${verdictBadge(best.validation_verdict||best.validation)}</div>
     </div>
   `;
@@ -963,7 +1341,7 @@ function renderLog() {
         <span class="t-num">#${String(t.trial).padStart(3,'0')}</span>
         <span class="t-ts">${(t.timestamp||'').slice(11,19)}</span>
         <span class="t-model ${modelClass(t.model)}">${t.model||'—'}</span>
-        <span class="t-hp">${t.hyperparams||''}</span>
+        <span class="t-hp">${escapeHtml(t.hyperparams||'')}</span>
         <span class="t-val">${t.rmse!=null?t.rmse.toFixed(4):'—'}</span>
         <span class="t-val" style="color:var(--muted)">${t.r2!=null?t.r2.toFixed(4):'—'}</span>
         <span class="badge ${(t.validation||'').toLowerCase()}">${t.validation||'—'}</span>
@@ -1005,7 +1383,7 @@ function renderTable() {
   const modelName = row => row.params_model_name || row['params_model'] || Object.entries(row).find(([k])=>k.toLowerCase().includes('model'))?.[1] || '—';
   const hp = row => Object.entries(row)
     .filter(([k])=>k.startsWith('params_') && !k.includes('model'))
-    .map(([k,v])=>`<span class="tag">${k.replace('params_','')}: ${isNaN(v)?v:parseFloat(v).toFixed?.(3)}</span>`)
+    .map(([k,v])=>`<span class="tag">${escapeHtml(k.replace('params_',''))}: ${escapeHtml(isNaN(v)?v:parseFloat(v).toFixed?.(3))}</span>`)
     .join('');
 
   document.getElementById('model-tbody').innerHTML = slice.map((row,i)=>{
@@ -1019,13 +1397,13 @@ function renderTable() {
     const improved = row.user_attrs_improved || '';
     return `<tr class="${isBest?'highlight-best':''}">
       <td>${trial}</td>
-      <td>${modelName(row)}</td>
+      <td>${escapeHtml(modelName(row))}</td>
       <td>${hp(row)}</td>
       <td>${isNaN(rmse)?rmse:parseFloat(rmse).toFixed(4)}</td>
       <td>${isNaN(mae)?mae:parseFloat(mae).toFixed(4)}</td>
       <td>${isNaN(r2)?r2:parseFloat(r2).toFixed(4)}</td>
       <td>${isNaN(comp)?comp:parseFloat(comp).toFixed(4)}</td>
-      <td><span class="badge ${val.toLowerCase()}">${val}</span></td>
+      <td><span class="badge ${badgeClass(val)}">${escapeHtml(val)}</span></td>
       <td>${improved?'✅':'❌'}</td>
     </tr>`;
   }).join('');
@@ -1209,13 +1587,15 @@ async function loadValidation() {
   const v = d.validation_verdict || d.validation || '—';
   const fail = d.hard_failed_count ?? d.failed_samples ?? 0;
   const warn = d.warning_count ?? 0;
-  const durability = d.durability_caution_count ?? 0;
-  const anomalies = d.dataset_anomaly_count ?? d.suspicious_samples ?? 0;
+  const cautions = d.engineering_caution_count ?? d.durability_caution_count ?? 0;
+  const reviewFlags = d.data_review_flag_count ?? d.dataset_anomaly_count ?? d.suspicious_samples ?? 0;
   const passRate = d.validation_pass_rate;
   const hardFailReasons = d.hard_fail_reasons || [];
   const warns = d.warn_reasons || [];
-  const durabilityReasons = d.durability_caution_reasons || [];
-  const anomalyReasons = d.dataset_anomaly_reasons || [];
+  const cautionReasons = d.engineering_caution_reasons || d.durability_caution_reasons || [];
+  const reviewFlagReasons = d.data_review_flag_reasons || d.dataset_anomaly_reasons || [];
+  const contextualSummary = d.contextual_summary || '—';
+  const assessmentConfidence = d.confidence_of_warning_assessment || '—';
   const red = theme('--red');
   const yellow = theme('--yellow');
   const accent = theme('--accent');
@@ -1223,7 +1603,7 @@ async function loadValidation() {
     <div style="margin-bottom:16px">
       <div class="metric-label" style="margin-bottom:8px">${title}</div>
       ${items.length
-        ? `<ul class="warn-list">${items.map(w=>`<li style="background:${styles.bg};border-left-color:${styles.border};color:${styles.text}">${w}</li>`).join('')}</ul>`
+        ? `<ul class="warn-list">${items.map(w=>`<li style="background:${styles.bg};border-left-color:${styles.border};color:${styles.text}">${escapeHtml(w)}</li>`).join('')}</ul>`
         : `<div style="color:var(--muted);font-family:var(--mono);font-size:11px">${emptyText}</div>`
       }
     </div>
@@ -1232,11 +1612,12 @@ async function loadValidation() {
   document.getElementById('val-summary').innerHTML = `
     <h3>Validation Summary</h3>
     <div class="verdict-big ${v.toLowerCase()}">${v}</div>
-    <div class="metric"><div class="metric-label">Hard Failures</div><div class="metric-value sm" style="color:${fail>0?'var(--red)':'var(--green)'}">${fail}</div></div>
+    <div class="metric"><div class="metric-label">Hard Constraints</div><div class="metric-value sm" style="color:${fail>0?'var(--red)':'var(--green)'}">${fail}</div></div>
     <div class="metric"><div class="metric-label">Warning Samples</div><div class="metric-value sm" style="color:${warn>0?'var(--yellow)':'var(--green)'}">${warn}</div></div>
-    <div class="metric"><div class="metric-label">Durability Cautions</div><div class="metric-value sm" style="color:${durability>0?'var(--yellow)':'var(--green)'}">${durability}</div></div>
-    <div class="metric"><div class="metric-label">Dataset Anomalies</div><div class="metric-value sm" style="color:${anomalies>0?'var(--yellow)':'var(--green)'}">${anomalies}</div></div>
+    <div class="metric"><div class="metric-label">Engineering Cautions</div><div class="metric-value sm" style="color:${cautions>0?'var(--yellow)':'var(--green)'}">${cautions}</div></div>
+    <div class="metric"><div class="metric-label">Data Review Flags</div><div class="metric-value sm" style="color:${reviewFlags>0?'var(--yellow)':'var(--green)'}">${reviewFlags}</div></div>
     <div class="metric"><div class="metric-label">Pass Rate</div><div class="metric-value sm">${passRate!=null?(passRate*100).toFixed(2)+'%':'—'}</div></div>
+    <div class="metric"><div class="metric-label">Assessment Confidence</div><div class="metric-value sm">${assessmentConfidence}</div></div>
     <div class="metric"><div class="metric-label">Model</div><div class="metric-value sm">${d.model_name||'—'}</div></div>
   `;
 
@@ -1244,14 +1625,18 @@ async function loadValidation() {
     <h3>Validation Breakdown</h3>
     ${renderReasonGroup('Hard-Fail Reasons', hardFailReasons, 'No hard failures triggered', {bg:withAlpha(red,.08), border:red, text:red})}
     ${renderReasonGroup('Warning Reasons', warns, 'No warnings triggered', {bg:withAlpha(yellow,.08), border:yellow, text:yellow})}
-    ${renderReasonGroup('Durability Cautions', durabilityReasons, 'No durability cautions triggered', {bg:withAlpha(yellow,.08), border:yellow, text:yellow})}
-    ${renderReasonGroup('Dataset Anomalies', anomalyReasons, 'No dataset anomalies triggered', {bg:withAlpha(accent,.08), border:accent, text:accent})}
+    ${renderReasonGroup('Engineering Cautions', cautionReasons, 'No engineering cautions triggered', {bg:withAlpha(yellow,.08), border:yellow, text:yellow})}
+    ${renderReasonGroup('Data Review Flags', reviewFlagReasons, 'No data review flags triggered', {bg:withAlpha(accent,.08), border:accent, text:accent})}
+    <div style="margin-bottom:16px">
+      <div class="metric-label" style="margin-bottom:8px">Contextual Summary</div>
+      <div style="color:var(--muted);font-family:var(--mono);font-size:11px;line-height:1.6">${escapeHtml(contextualSummary)}</div>
+    </div>
     <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
       <div class="metric-label" style="margin-bottom:8px">RULE REFERENCE</div>
       ${[
-        ['w/c > 0.60','Durability caution for moderate exposure','WARN'],
-        ['w/c > 0.70 and strength > 30 MPa','Review with SCM, age, and w/b context','WARN'],
-        ['w/c > 0.70 + strength > 30 MPa + age <= 28 d + low SCM + high w/b','Implausible early-age binder context','FAIL'],
+        ['Exposure class + w/c or w/b','Durability caution uses exposure metadata when available','WARN'],
+        ['High w/c + high strength','SCM, age, binder, and w/b context decide whether review is needed','WARN'],
+        ['High-volume SCM regime','Triggers age-aware data review instead of automatic anomaly labeling','WARN'],
         ['Binder < 250 kg/m³','Low binder content','WARN'],
         ['Binder > 550 kg/m³','Shrinkage risk','WARN'],
         ['Fly ash > 40%','Exceeds ACI substitution limit','WARN'],
@@ -1314,7 +1699,7 @@ async function loadDesign() {
         <span class="badge ${(s.validation_verdict||'').toLowerCase()}">${s.validation_verdict||'—'}</span>
       </div>
       <div style="display:none;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:-8px;margin-bottom:8px;font-family:var(--mono);font-size:11px">
-        <pre style="white-space:pre-wrap;color:var(--muted)">${JSON.stringify(s,null,2)}</pre>
+        <pre style="white-space:pre-wrap;color:var(--muted)">${escapeHtml(JSON.stringify(s,null,2))}</pre>
       </div>
     `).join('')}</div>`;
   }
@@ -1395,10 +1780,10 @@ async function loadPlots() {
   document.getElementById('plot-grid').innerHTML = plots.length
     ? plots.map(p=>`
       <div class="plot-card" onclick="openModal('/outputs/${p.filename}')">
-        <img src="/outputs/${p.filename}" alt="${p.filename}" loading="lazy"/>
+        <img src="/outputs/${encodeURIComponent(p.filename)}" alt="${escapeHtml(p.filename)}" loading="lazy"/>
         <div class="plot-caption">
-          <strong>${p.filename}</strong>
-          <span>${p.description}</span>
+          <strong>${escapeHtml(p.filename)}</strong>
+          <span>${escapeHtml(p.description)}</span>
         </div>
       </div>`).join('')
     : '<div style="color:var(--muted);font-family:var(--mono);font-size:12px;padding:20px">No plots found in outputs/ yet. Run the pipeline first.</div>';

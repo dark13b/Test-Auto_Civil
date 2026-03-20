@@ -9,12 +9,17 @@ from pathlib import Path
 from typing import Any
 
 from llm_backend import LLMBackend, extract_text_channels, resolve_prompt_variant
+from model_routing import resolve_model_for_backend
 from research_protocol import build_family_state_summary, gate_proposal
 
 
 LOGGER = logging.getLogger("proposal_engine")
 JSON_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 INVALID_PARAM = object()
+
+
+class ProposalExtractionError(RuntimeError):
+    """Raised when the visible model response does not contain valid structured output."""
 
 
 class ProposalEngine:
@@ -40,6 +45,10 @@ class ProposalEngine:
     def is_available(self) -> bool:
         return self.backend.is_available()
 
+    def _resolve_model_hint(self, model_hint: str | None) -> str | None:
+        backend_mode = str(self.llm_config.get("backend_mode", self.backend_name)).lower()
+        return resolve_model_for_backend(model_hint, backend_mode, {"llm": self.llm_config})
+
     def generate_hypotheses(
         self,
         *,
@@ -49,6 +58,7 @@ class ProposalEngine:
         limit: int = 5,
         model_hint: str | None = None,
     ) -> list[str]:
+        resolved_model_hint = self._resolve_model_hint(model_hint)
         prompt = "\n".join(
             [
                 "Generate concise ML research hypotheses as a JSON array of strings.",
@@ -67,8 +77,8 @@ class ProposalEngine:
                 "minItems": 1,
                 "maxItems": max(1, int(limit)),
             },
-            model_hint=model_hint,
-            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            model_hint=resolved_model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, resolved_model_hint),
             expect_array=True,
         )
         parsed = interaction.get("parsed_json")
@@ -85,6 +95,7 @@ class ProposalEngine:
         limit: int = 5,
         model_hint: str | None = None,
     ) -> list[str]:
+        resolved_model_hint = self._resolve_model_hint(model_hint)
         prompt = "\n".join(
             [
                 "Suggest feature-engineering ideas as a JSON array of strings.",
@@ -103,8 +114,8 @@ class ProposalEngine:
                 "minItems": 1,
                 "maxItems": max(1, int(limit)),
             },
-            model_hint=model_hint,
-            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            model_hint=resolved_model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, resolved_model_hint),
             expect_array=True,
         )
         parsed = interaction.get("parsed_json")
@@ -121,6 +132,7 @@ class ProposalEngine:
         limit: int = 5,
         model_hint: str | None = None,
     ) -> list[dict[str, Any]]:
+        resolved_model_hint = self._resolve_model_hint(model_hint)
         prompt_lines = [
             "Suggest search-space refinements as a JSON array of objects.",
             "Each object must include model_name, parameter, and rationale.",
@@ -147,8 +159,8 @@ class ProposalEngine:
                 "minItems": 1,
                 "maxItems": max(1, int(limit)),
             },
-            model_hint=model_hint,
-            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            model_hint=resolved_model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, resolved_model_hint),
             expect_array=True,
         )
         parsed = interaction.get("parsed_json")
@@ -175,7 +187,8 @@ class ProposalEngine:
 
         trial_history = trial_history or []
         expected_array = max(1, int(proposal_count)) > 1
-        prompt_variant = resolve_prompt_variant(self.llm_config, model_hint)
+        resolved_model_hint = self._resolve_model_hint(model_hint)
+        prompt_variant = resolve_prompt_variant(self.llm_config, resolved_model_hint)
         family_state = build_family_state_summary(
             available_models=available_models,
             current_best=current_best,
@@ -210,7 +223,7 @@ class ProposalEngine:
                 task="experiment_proposals",
                 prompt=prompt,
                 response_format=schema,
-                model_hint=model_hint,
+                model_hint=resolved_model_hint,
                 prompt_variant=prompt_variant,
                 expect_array=expected_array,
             )
@@ -270,6 +283,7 @@ class ProposalEngine:
     ) -> list[dict[str, Any]]:
         if not self.is_available():
             return []
+        resolved_model_hint = self._resolve_model_hint(model_hint)
         prompt_lines = [
             "Choose the best base models for a stacking ensemble.",
             "Return only a JSON array of validated model_name and params objects.",
@@ -296,8 +310,8 @@ class ProposalEngine:
                 "minItems": 1,
                 "maxItems": max(1, int(max_items)),
             },
-            model_hint=model_hint,
-            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            model_hint=resolved_model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, resolved_model_hint),
             expect_array=True,
         )
         parsed = interaction.get("parsed_json")
@@ -325,6 +339,7 @@ class ProposalEngine:
                 "available": False,
                 "summary": "",
             }
+        resolved_model_hint = self._resolve_model_hint(model_hint)
         prompt = "\n".join(
             [
                 "Summarize this ML research run in concise JSON.",
@@ -344,8 +359,8 @@ class ProposalEngine:
                 "required": ["summary"],
                 "additionalProperties": False,
             },
-            model_hint=model_hint,
-            prompt_variant=resolve_prompt_variant(self.llm_config, model_hint),
+            model_hint=resolved_model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, resolved_model_hint),
             expect_array=False,
         )
         parsed = interaction.get("parsed_json")
@@ -423,12 +438,21 @@ class ProposalEngine:
         channels = extract_text_channels(payload)
         interaction["raw_response_text"] = channels["response_text"]
         interaction["raw_thinking_text"] = channels["thinking_text"]
-        final_text, extracted_from, parsed_json, repair_used = self._extract_structured_output(
-            channels=channels,
-            expect_array=expect_array,
-        )
-        if not channels["response_text"] and extracted_from == "thinking" and "qwen3" in str(interaction["model"]).lower():
-            LOGGER.warning("qwen3 response was empty; extracted from thinking_text")
+        try:
+            final_text, extracted_from, parsed_json, repair_used = self._extract_structured_output(
+                channels=channels,
+                expect_array=expect_array,
+            )
+        except ProposalExtractionError as exc:
+            LOGGER.warning("visible response did not contain valid structured JSON: %s", exc)
+            interaction["error"] = str(exc)
+            self.last_interaction_summary = {
+                "backend": interaction["backend"],
+                "model": interaction["model"],
+                "prompt_variant": prompt_variant,
+                "parse_success": False,
+            }
+            raise
 
         interaction["final_extracted_text"] = final_text
         interaction["extracted_from_channel"] = extracted_from
@@ -507,7 +531,7 @@ class ProposalEngine:
             "Schema example: {\"model_name\":\"MODEL\",\"params\":{}}",
         ]
         if prompt_variant == "compact":
-            lines.append("Think step by step internally, then output ONLY the final JSON object.")
+            lines.append("Output ONLY the final JSON object.")
         if single_proposal_mode:
             lines.extend(
                 [
@@ -766,30 +790,23 @@ class ProposalEngine:
         channels: dict[str, str],
         expect_array: bool,
     ) -> tuple[str, str, Any, bool]:
-        ordered_channels = [
-            ("response", channels.get("response_text", "")),
-            ("thinking", channels.get("thinking_text", "")),
-            ("backend_raw", channels.get("backend_raw_text", "")),
-        ]
-        for channel_name, raw_text in ordered_channels:
-            parsed = self._extract_json(raw_text, expect_array=expect_array)
-            if parsed is not None:
-                return raw_text.strip(), channel_name, parsed, False
+        response_text = channels.get("response_text", "")
+        parsed = self._extract_json(response_text, expect_array=expect_array)
+        if parsed is not None:
+            return response_text.strip(), "response", parsed, False
 
-        for _, raw_text in ordered_channels:
-            repaired = self._repair_json_text(raw_text, expect_array=expect_array)
-            if repaired is None:
-                continue
+        repaired = self._repair_json_text(response_text, expect_array=expect_array)
+        if repaired is not None:
             try:
                 parsed = json.loads(repaired)
             except Exception:
-                continue
-            if (expect_array and not isinstance(parsed, list)) or (not expect_array and not isinstance(parsed, dict)):
-                continue
-            return repaired, "repaired_json", parsed, True
+                parsed = None
+            if parsed is not None and (
+                (expect_array and isinstance(parsed, list)) or (not expect_array and isinstance(parsed, dict))
+            ):
+                return repaired, "repaired_json", parsed, True
 
-        fallback_text = next((text for _, text in ordered_channels if text.strip()), "")
-        return fallback_text.strip(), "response", None, False
+        raise ProposalExtractionError("Visible response was empty or did not contain valid JSON.")
 
     def _extract_json(self, raw_text: str, *, expect_array: bool) -> Any:
         cleaned = self._clean_json_candidate(raw_text)
