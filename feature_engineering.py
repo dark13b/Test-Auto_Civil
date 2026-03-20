@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -11,18 +11,35 @@ import pandas as pd
 ENGINEERED_FEATURE_COLUMNS = [
     "water_cement_ratio",
     "water_binder_ratio",
+    "water_effective_binder_ratio",
+    "binder_to_water_ratio",
+    "effective_binder_to_water_ratio",
     "slag_replacement_ratio",
     "fly_ash_replacement_ratio",
-    "aggregate_paste_ratio",
-    "fine_to_coarse_ratio",
     "total_binder",
+    "effective_binder",
     "supplementary_replacement_ratio",
+    "effective_scm_replacement_ratio",
+    "aggregate_paste_ratio",
+    "paste_to_aggregate_ratio",
+    "fine_to_coarse_ratio",
     "superplasticizer_binder_ratio",
+    "superplasticizer_effective_binder_ratio",
     "paste_volume_proxy",
     "log_age",
     "cement_age_interaction",
     "binder_age_interaction",
+    "effective_binder_age_interaction",
     "water_binder_age",
+    "water_effective_binder_age",
+]
+
+ENGINEERING_DIAGNOSTIC_COLUMNS = [
+    "effective_scm_content",
+    "binder_efficiency_gap",
+    "cement_fraction_of_binder",
+    "cement_fraction_of_effective_binder",
+    "scm_fraction_of_effective_binder",
 ]
 
 _REQUIRED_BASE_COLUMNS = [
@@ -37,6 +54,10 @@ _REQUIRED_BASE_COLUMNS = [
 ]
 
 _EPSILON = 1e-12
+_DEFAULT_BINDER_EFFICIENCY = {
+    "fly_ash_k": 0.35,
+    "slag_k": 0.80,
+}
 
 
 def log_status(message: str) -> None:
@@ -70,7 +91,29 @@ def _missing_columns(columns: Iterable[str], frame: pd.DataFrame) -> list[str]:
     return [column for column in columns if column not in frame.columns]
 
 
-def build_engineering_features(df: pd.DataFrame) -> pd.DataFrame:
+def resolve_feature_engineering_options(config: dict[str, Any] | None = None) -> dict[str, float]:
+    """Resolve semi-empirical SCM efficiency coefficients from config."""
+    options = dict(_DEFAULT_BINDER_EFFICIENCY)
+    if not config:
+        return options
+
+    engineering = config.get("engineering", {})
+    binder_efficiency = engineering.get("binder_efficiency", {})
+    if not isinstance(binder_efficiency, dict):
+        return options
+
+    for key in options:
+        raw_value = binder_efficiency.get(key)
+        if raw_value is None:
+            continue
+        options[key] = float(raw_value)
+    return options
+
+
+def build_engineering_features(
+    df: pd.DataFrame,
+    config: dict[str, Any] | None = None,
+) -> pd.DataFrame:
     """Append civil-engineering-derived features to a normalized concrete dataframe."""
     missing_columns = _missing_columns(_REQUIRED_BASE_COLUMNS, df)
     if missing_columns:
@@ -90,39 +133,60 @@ def build_engineering_features(df: pd.DataFrame) -> pd.DataFrame:
     coarse_aggregate = numeric_frame["coarse_aggregate"].to_numpy(dtype=float)
     fine_aggregate = numeric_frame["fine_aggregate"].to_numpy(dtype=float)
     age = numeric_frame["age"].to_numpy(dtype=float)
+    options = resolve_feature_engineering_options(config)
+    slag_k = float(options["slag_k"])
+    fly_ash_k = float(options["fly_ash_k"])
 
     total_binder = cement + slag + fly_ash
+    effective_scm_content = (slag * slag_k) + (fly_ash * fly_ash_k)
+    effective_binder = cement + effective_scm_content
     binder_plus_water = total_binder + water
+    total_aggregate = coarse_aggregate + fine_aggregate
     log_age = np.log(np.maximum(age, 0.0) + 1.0)
 
     frame["water_cement_ratio"] = _safe_divide(water, cement)
     frame["water_binder_ratio"] = _safe_divide(water, total_binder)
+    frame["water_effective_binder_ratio"] = _safe_divide(water, effective_binder)
+    frame["binder_to_water_ratio"] = _safe_divide(total_binder, water)
+    frame["effective_binder_to_water_ratio"] = _safe_divide(effective_binder, water)
     frame["slag_replacement_ratio"] = _safe_divide(slag, total_binder)
     frame["fly_ash_replacement_ratio"] = _safe_divide(fly_ash, total_binder)
-    frame["aggregate_paste_ratio"] = _safe_divide(
-        coarse_aggregate + fine_aggregate,
-        binder_plus_water,
-    )
+    frame["aggregate_paste_ratio"] = _safe_divide(total_aggregate, binder_plus_water)
+    frame["paste_to_aggregate_ratio"] = _safe_divide(binder_plus_water, total_aggregate)
     frame["fine_to_coarse_ratio"] = _safe_divide(fine_aggregate, coarse_aggregate)
     frame["total_binder"] = total_binder
+    frame["effective_binder"] = effective_binder
     frame["supplementary_replacement_ratio"] = _safe_divide(slag + fly_ash, total_binder)
+    frame["effective_scm_replacement_ratio"] = _safe_divide(effective_scm_content, effective_binder)
     frame["superplasticizer_binder_ratio"] = _safe_divide(superplasticizer, total_binder)
+    frame["superplasticizer_effective_binder_ratio"] = _safe_divide(
+        superplasticizer,
+        effective_binder,
+    )
     frame["paste_volume_proxy"] = total_binder + water + superplasticizer
     frame["log_age"] = log_age
     frame["cement_age_interaction"] = cement * log_age
     frame["binder_age_interaction"] = total_binder * log_age
+    frame["effective_binder_age_interaction"] = effective_binder * log_age
     frame["water_binder_age"] = _safe_divide(frame["water_binder_ratio"], log_age)
+    frame["water_effective_binder_age"] = _safe_divide(frame["water_effective_binder_ratio"], log_age)
+    frame["effective_scm_content"] = effective_scm_content
+    frame["binder_efficiency_gap"] = total_binder - effective_binder
+    frame["cement_fraction_of_binder"] = _safe_divide(cement, total_binder)
+    frame["cement_fraction_of_effective_binder"] = _safe_divide(cement, effective_binder)
+    frame["scm_fraction_of_effective_binder"] = _safe_divide(effective_scm_content, effective_binder)
     return frame
 
 
 def validate_features(df: pd.DataFrame) -> bool:
     """Validate engineered features and print a compact summary."""
-    missing_columns = _missing_columns(ENGINEERED_FEATURE_COLUMNS, df)
+    expected_columns = ENGINEERED_FEATURE_COLUMNS + ENGINEERING_DIAGNOSTIC_COLUMNS
+    missing_columns = _missing_columns(expected_columns, df)
     if missing_columns:
         log_status(f"Feature validation failed. Missing engineered columns: {missing_columns}")
         return False
 
-    feature_frame = df[ENGINEERED_FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    feature_frame = df[expected_columns].apply(pd.to_numeric, errors="coerce")
     invalid_mask = ~np.isfinite(feature_frame.to_numpy(dtype=float))
     if invalid_mask.any():
         invalid_columns = feature_frame.columns[np.any(invalid_mask, axis=0)].tolist()

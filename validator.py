@@ -32,6 +32,16 @@ DEFAULT_DURABILITY_WATER_CEMENT_LIMITS = {
     "sulfate": 0.45,
 }
 
+DEFAULT_DURABILITY_EFFECTIVE_BINDER_LIMITS = {
+    "general": 0.60,
+    "structural": 0.50,
+    "exposed": 0.45,
+    "severe": 0.45,
+    "marine": 0.40,
+    "freeze_thaw": 0.45,
+    "sulfate": 0.45,
+}
+
 EXPOSURE_CLASS_ALIASES = {
     "general": "general",
     "mild": "general",
@@ -158,6 +168,9 @@ class EngineeringValidator:
     durability_water_cement_limits: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_DURABILITY_WATER_CEMENT_LIMITS)
     )
+    durability_effective_binder_limits: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_DURABILITY_EFFECTIVE_BINDER_LIMITS)
+    )
     scm_meaningful_replacement_threshold: float = 0.15
     high_volume_scm_replacement_threshold: float = 0.45
     age_regime_early_max_days: float = 7.0
@@ -167,6 +180,10 @@ class EngineeringValidator:
     shrinkage_low_water_binder_threshold: float = 0.38
     shrinkage_strength_threshold: float = 50.0
     scm_durability_preferred_water_binder_ratio: float = 0.45
+    low_target_strength_upper_bound_mpa: float = 35.0
+    low_target_cement_factor_warn: float = 9.0
+    low_target_cement_minimum_warn: float = 320.0
+    feature_engineering_config: dict[str, Any] | None = None
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "EngineeringValidator":
@@ -181,6 +198,14 @@ class EngineeringValidator:
                 coerced_limit = _safe_float(limit)
                 if coerced_limit is not None:
                     durability_limits[normalized_name] = coerced_limit
+        effective_binder_limits = dict(DEFAULT_DURABILITY_EFFECTIVE_BINDER_LIMITS)
+        configured_effective_limits = rules.get("durability_effective_binder_limits", {})
+        if isinstance(configured_effective_limits, dict):
+            for exposure_name, limit in configured_effective_limits.items():
+                normalized_name = _normalize_token(exposure_name)
+                coerced_limit = _safe_float(limit)
+                if coerced_limit is not None:
+                    effective_binder_limits[normalized_name] = coerced_limit
 
         return cls(
             min_strength_mpa=float(bounds["min"]),
@@ -206,6 +231,7 @@ class EngineeringValidator:
                 rules.get("high_water_cement_strength_unfavorable_water_binder_ratio", 0.50)
             ),
             durability_water_cement_limits=durability_limits,
+            durability_effective_binder_limits=effective_binder_limits,
             scm_meaningful_replacement_threshold=float(
                 rules.get("scm_meaningful_replacement_threshold", 0.15)
             ),
@@ -227,6 +253,14 @@ class EngineeringValidator:
             scm_durability_preferred_water_binder_ratio=float(
                 rules.get("scm_durability_preferred_water_binder_ratio", 0.45)
             ),
+            low_target_strength_upper_bound_mpa=float(
+                rules.get("low_target_strength_upper_bound_mpa", 35.0)
+            ),
+            low_target_cement_factor_warn=float(rules.get("low_target_cement_factor_warn", 9.0)),
+            low_target_cement_minimum_warn=float(
+                rules.get("low_target_cement_minimum_warn", 320.0)
+            ),
+            feature_engineering_config=config,
         )
 
     def __post_init__(self) -> None:
@@ -241,7 +275,7 @@ class EngineeringValidator:
             raise ValueError(
                 f"Required columns '{self.water_column}' and '{self.cement_column}' are missing."
             )
-        return build_engineering_features(x_frame)
+        return build_engineering_features(x_frame, config=self.feature_engineering_config)
 
     def _build_evidence_summary(self, factors: dict[str, Any]) -> str:
         """Convert triggering factors into a compact evidence summary."""
@@ -301,6 +335,7 @@ class EngineeringValidator:
                 "label": normalized,
                 "source": column_name,
                 "water_cement_limit": float(self.durability_water_cement_limits[normalized]),
+                "effective_binder_limit": float(self.durability_effective_binder_limits[normalized]),
                 "confidence": CONFIDENCE_HIGH,
                 "metadata_available": True,
             }
@@ -310,6 +345,12 @@ class EngineeringValidator:
             "source": "config_default",
             "water_cement_limit": float(
                 self.durability_water_cement_limits.get(self.context_type, self.durability_water_cement_warn)
+            ),
+            "effective_binder_limit": float(
+                self.durability_effective_binder_limits.get(
+                    self.context_type,
+                    self.durability_water_cement_warn,
+                )
             ),
             "confidence": CONFIDENCE_MODERATE,
             "metadata_available": False,
@@ -401,7 +442,9 @@ class EngineeringValidator:
         """Build the context bundle used by the rule engine."""
         water_cement_ratio = _safe_float(sample.get("water_cement_ratio"))
         water_binder_ratio = _safe_float(sample.get("water_binder_ratio"))
+        water_effective_binder_ratio = _safe_float(sample.get("water_effective_binder_ratio"))
         total_binder = _safe_float(sample.get("total_binder"))
+        effective_binder = _safe_float(sample.get("effective_binder"))
         supplementary_replacement_ratio = _safe_float(sample.get("supplementary_replacement_ratio"))
         fly_ash_replacement_ratio = _safe_float(sample.get("fly_ash_replacement_ratio"))
         slag_replacement_ratio = _safe_float(sample.get("slag_replacement_ratio"))
@@ -412,6 +455,7 @@ class EngineeringValidator:
         fly_ash_content = _safe_float(sample.get("fly_ash"))
         age_days = _safe_float(sample.get("age"))
         superplasticizer = _safe_float(sample.get("superplasticizer"))
+        target_strength = _safe_float(sample.get("target_strength"))
 
         age_regime_code, age_regime_label = self._age_regime(age_days)
         scm_regime_code, scm_regime_label = self._scm_regime(
@@ -433,13 +477,16 @@ class EngineeringValidator:
             else float((slag_content or 0.0) + (fly_ash_content or 0.0)),
             "water_cement_ratio": water_cement_ratio,
             "water_binder_ratio": water_binder_ratio,
+            "water_effective_binder_ratio": water_effective_binder_ratio,
             "total_binder": total_binder,
+            "effective_binder": effective_binder,
             "supplementary_replacement_ratio": supplementary_replacement_ratio,
             "fly_ash_replacement_ratio": fly_ash_replacement_ratio,
             "slag_replacement_ratio": slag_replacement_ratio,
             "aggregate_paste_ratio": aggregate_paste_ratio,
             "superplasticizer": superplasticizer,
             "age_days": age_days,
+            "target_strength": target_strength,
             "age_regime_code": age_regime_code,
             "age_regime_label": age_regime_label,
             "scm_regime_code": scm_regime_code,
@@ -712,11 +759,13 @@ class EngineeringValidator:
 
         water_cement_ratio = context["water_cement_ratio"]
         water_binder_ratio = context["water_binder_ratio"]
+        water_effective_binder_ratio = context["water_effective_binder_ratio"]
         total_binder = context["total_binder"]
         supplementary_replacement_ratio = context["supplementary_replacement_ratio"]
         age_days = context["age_days"]
         exposure_context = context["exposure_context"]
         workability_support = context["workability_support"]
+        target_strength = context["target_strength"]
 
         high_strength = prediction_value > self.suspicious_strength_mpa
         high_water_cement = (water_cement_ratio or 0.0) > self.suspicious_water_cement_ratio
@@ -880,21 +929,35 @@ class EngineeringValidator:
         durability_factors = {
             "water_cement_ratio": water_cement_ratio,
             "water_binder_ratio": water_binder_ratio,
+            "water_effective_binder_ratio": water_effective_binder_ratio,
             "durability_limit": exposure_context["water_cement_limit"],
+            "effective_binder_limit": exposure_context["effective_binder_limit"],
             "exposure_class": exposure_context["label"],
             "scm_regime": context["scm_regime_label"],
             "age_regime": context["age_regime_label"],
         }
-        if water_cement_ratio is not None and water_cement_ratio > exposure_context["water_cement_limit"]:
+        durability_ratio_value = water_cement_ratio
+        durability_limit = exposure_context["water_cement_limit"]
+        durability_ratio_type = "water_cement_ratio"
+        if meaningful_scm and water_effective_binder_ratio is not None:
+            durability_ratio_value = water_effective_binder_ratio
+            durability_limit = exposure_context["effective_binder_limit"]
+            durability_ratio_type = "water_effective_binder_ratio"
+        durability_factors["screening_ratio_type"] = durability_ratio_type
+        durability_factors["screening_ratio_value"] = durability_ratio_value
+        durability_factors["screening_ratio_limit"] = durability_limit
+        if durability_ratio_value is not None and durability_ratio_value > durability_limit:
             severity = SEVERITY_MEDIUM
             message = "Water ratio exceeds exposure-based durability guidance."
             confidence = exposure_context["confidence"]
             if not exposure_context["metadata_available"]:
                 message = "Water ratio exceeds fallback general guidance for durability."
+            if durability_ratio_type == "water_effective_binder_ratio":
+                message = "Effective water/binder ratio exceeds durability guidance for the SCM-bearing mix."
             emit_durability_caution = True
             if (
                 meaningful_scm
-                and (water_binder_ratio or 0.0) <= self.scm_durability_preferred_water_binder_ratio
+                and (water_effective_binder_ratio or 0.0) <= self.scm_durability_preferred_water_binder_ratio
                 and not early_age
             ):
                 severity = SEVERITY_LOW
@@ -938,6 +1001,41 @@ class EngineeringValidator:
                         else "Add exposure metadata before treating this screen as a definitive durability decision."
                     ),
                     assessment_confidence=confidence,
+                )
+
+        if (
+            target_strength is not None
+            and target_strength <= self.low_target_strength_upper_bound_mpa
+            and context["cement_content"] is not None
+        ):
+            cement_warn_threshold = max(
+                self.low_target_cement_minimum_warn,
+                target_strength * self.low_target_cement_factor_warn,
+            )
+            if context["cement_content"] > cement_warn_threshold and prediction_value <= target_strength + 5.0:
+                add_warning(
+                    engineering_cautions_by_code,
+                    warning_code="low_target_overcemented_mix_warning",
+                    warning_category=WARNING_CATEGORY_ENGINEERING_CAUTION,
+                    severity=SEVERITY_MEDIUM,
+                    message="Low-strength target is being met with unusually high cement demand.",
+                    triggering_factors={
+                        "target_strength": target_strength,
+                        "prediction_mpa": prediction_value,
+                        "cement_content": context["cement_content"],
+                        "cement_warn_threshold": cement_warn_threshold,
+                        "water_effective_binder_ratio": water_effective_binder_ratio,
+                    },
+                    academic_note=(
+                        "Low-strength mixes should not routinely require high cement contents when binder "
+                        "replacement, water ratio, and aggregate balance are reasonable. This is a "
+                        "configurable economy-and-plausibility screen, not a universal law."
+                    ),
+                    recommended_review_action=(
+                        "Review whether a lower-cement or SCM-bearing mix can meet the same target with "
+                        "better engineering economy."
+                    ),
+                    assessment_confidence=CONFIDENCE_MODERATE,
                 )
 
         if total_binder is not None and total_binder < self.total_binder_low_warn:
@@ -1080,15 +1178,21 @@ class EngineeringValidator:
             "context_type": self.context_type,
             "water_cement_ratio": context["water_cement_ratio"],
             "water_binder_ratio": context["water_binder_ratio"],
+            "water_effective_binder_ratio": context["water_effective_binder_ratio"],
             "total_binder": context["total_binder"],
+            "effective_binder": context["effective_binder"],
             "cement_content": context["cement_content"],
             "scm_content": context["scm_content"],
             "supplementary_replacement_ratio": context["supplementary_replacement_ratio"],
             "fly_ash_replacement_ratio": context["fly_ash_replacement_ratio"],
             "slag_replacement_ratio": context["slag_replacement_ratio"],
             "age_days": context["age_days"],
+            "target_strength": context["target_strength"],
             "exposure_class": context["exposure_context"]["label"],
             "workability_support": context["workability_support"]["status"],
+            "hard_fails": hard_constraints,
+            "engineering_warnings": engineering_cautions,
+            "dataset_anomalies": data_review_flags,
             "hard_constraints": hard_constraints,
             "engineering_cautions": engineering_cautions,
             "data_review_flags": data_review_flags,
@@ -1112,7 +1216,9 @@ class EngineeringValidator:
             "contextual_summary": contextual_summary,
             "confidence_of_warning_assessment": context["assessment_confidence"],
             "hard_constraint_count": len(hard_constraints),
+            "hard_fail_count": len(hard_constraints),
             "engineering_caution_count": len(engineering_cautions),
+            "engineering_warning_count": len(engineering_cautions),
             "data_review_flag_count": len(data_review_flags),
             "warning_count": len(engineering_cautions) + len(data_review_flags),
             "failure_count": len(hard_constraints),
@@ -1236,21 +1342,26 @@ class EngineeringValidator:
         return {
             "context_type": self.context_type,
             "pass_rate": pass_rate,
+            "hard_fail_samples": hard_constraint_samples,
             "failed_samples": hard_constraint_samples,
             "hard_constraint_samples": hard_constraint_samples,
             "warning_samples": warning_samples,
             "suspicious_samples": data_review_flag_samples,
             "statistical_error_samples": data_review_flag_samples,
+            "engineering_warning_samples": engineering_caution_samples,
             "engineering_caution_samples": engineering_caution_samples,
             "durability_caution_samples": engineering_caution_samples,
             "durability_warning_samples": engineering_caution_samples,
+            "dataset_anomaly_samples_v2": data_review_flag_samples,
             "data_review_flag_samples": data_review_flag_samples,
             "dataset_anomaly_samples": data_review_flag_samples,
             "sample_reports": sample_reports,
             "hard_constraint_count": len(hard_constraint_samples),
+            "hard_fail_count": len(hard_constraint_samples),
             "failed_count": len(hard_constraint_samples),
             "hard_failed_count": len(hard_constraint_samples),
             "engineering_caution_count": len(engineering_caution_samples),
+            "engineering_warning_count": len(engineering_caution_samples),
             "warning_count": len(warning_samples),
             "data_review_flag_count": len(data_review_flag_samples),
             "suspicious_count": len(data_review_flag_samples),

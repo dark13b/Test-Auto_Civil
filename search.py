@@ -1060,9 +1060,10 @@ def build_post_search_ensemble(
     return current_best_result
 
 
-def run_autocivil_loop(n_trials: int) -> dict[str, Any]:
+def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute the visible propose-run-compare-keep research loop."""
-    config = load_config()
+    if config is None:
+        config = load_config()
     set_global_seed(int(config["experiment"]["random_seed"]))
     outputs_dir = get_outputs_dir(config)
     project_root = Path(__file__).resolve().parent
@@ -1577,6 +1578,18 @@ def main() -> int:
     """Run the full model search loop."""
     parser = argparse.ArgumentParser(description="Optuna-driven research loop for AutoCivil-Lab.")
     parser.add_argument(
+        "--trials",
+        type=int,
+        default=None,
+        help="Override experiment.optuna_trials for this run only.",
+    )
+    parser.add_argument(
+        "--min-runtime-minutes",
+        type=float,
+        default=None,
+        help="Override search.min_runtime_minutes for this run only.",
+    )
+    parser.add_argument(
         "--repair",
         action="store_true",
         help="Repair a stale optuna_results.csv from outputs/research_log.txt and exit.",
@@ -1585,6 +1598,10 @@ def main() -> int:
 
     try:
         config = load_config()
+        if args.trials is not None:
+            config["experiment"]["optuna_trials"] = int(args.trials)
+        if args.min_runtime_minutes is not None:
+            config["search"]["min_runtime_minutes"] = float(args.min_runtime_minutes)
         outputs_dir = get_outputs_dir(config)
         available_models = get_available_model_configs(config)
         if args.repair:
@@ -1595,7 +1612,7 @@ def main() -> int:
             return 0
 
         n_trials = int(config["experiment"]["optuna_trials"])
-        best_result = run_autocivil_loop(n_trials=n_trials)
+        best_result = run_autocivil_loop(n_trials=n_trials, config=config)
         log_status(
             f"Search complete. Best model: {best_result['model_name']} | "
             f"Composite={best_result['composite_score']:.4f} | "

@@ -77,6 +77,14 @@ validator:
     marine: 0.40
     freeze_thaw: 0.45
     sulfate: 0.45
+  durability_effective_binder_limits:
+    general: 0.60
+    structural: 0.50
+    exposed: 0.45
+    severe: 0.45
+    marine: 0.40
+    freeze_thaw: 0.45
+    sulfate: 0.45
   # Keep very high w/c + high strength as a hard reject only when the
   # binder context also looks implausible for early-age concrete.
   high_water_cement_strength_hard_fail_max_age_days: 28.0
@@ -90,6 +98,9 @@ validator:
   shrinkage_low_water_binder_threshold: 0.38
   shrinkage_strength_threshold: 50.0
   scm_durability_preferred_water_binder_ratio: 0.45
+  low_target_strength_upper_bound_mpa: 35.0
+  low_target_cement_factor_warn: 9.0
+  low_target_cement_minimum_warn: 320.0
   fly_ash_replacement_warn: 0.4
   slag_replacement_warn: 0.7
   early_age_days_warn: 3.0
@@ -98,10 +109,16 @@ validator:
 engineering:
   feature_engineering: true
   uncertainty_method: conformal  # options: conformal, quantile, both
+  binder_efficiency:
+    # Semi-empirical defaults for this repository. These are configurable and
+    # should be treated as dataset-calibrated priors, not universal constants.
+    fly_ash_k: 0.35
+    slag_k: 0.80
   design_tool:
     default_age_days: 28
     target_tolerance_mpa: 2.0
     cost_proxy: cement_content
+    top_ranked_candidates: 5
     reference_mix:
       water_cement_ratio: 0.5
     search:
@@ -146,6 +163,7 @@ uncertainty:
   calibration_fraction: 0.28
   coverage_level: 0.92
   reliability_bins: 10
+  strength_bins_mpa: [0.0, 20.0, 35.0, 50.0]
   lower_alpha: 0.05
   median_alpha: 0.5
   upper_alpha: 0.95

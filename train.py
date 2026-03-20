@@ -122,6 +122,27 @@ def get_base_input_columns(config: dict[str, Any]) -> list[str]:
     return list(config["task"]["input_columns"])
 
 
+def resolve_model_feature_columns(model: Any, config: dict[str, Any]) -> list[str]:
+    """Return the feature schema expected by a fitted model artifact."""
+    configured_columns = get_input_columns(config)
+    feature_names = getattr(model, "feature_names_in_", None)
+    if feature_names is not None:
+        return [str(name) for name in feature_names]
+
+    feature_count = getattr(model, "n_features_in_", None)
+    if feature_count is None:
+        return configured_columns
+    if int(feature_count) == len(configured_columns):
+        return configured_columns
+
+    base_columns = get_base_input_columns(config)
+    if len(base_columns) <= int(feature_count) <= len(configured_columns):
+        return configured_columns[: int(feature_count)]
+    raise ValueError(
+        "Model artifact feature schema is incompatible with the configured dataset columns."
+    )
+
+
 def feature_engineering_enabled(config: dict[str, Any]) -> bool:
     """Return whether engineering features should be applied."""
     return bool(config.get("engineering", {}).get("feature_engineering", False))
@@ -153,7 +174,7 @@ def ensure_engineered_dataset(frame: pd.DataFrame, config: dict[str, Any]) -> pd
     """Ensure configured engineered features are present and refreshed."""
     if not feature_engineering_enabled(config):
         return frame.copy()
-    return build_engineering_features(frame)
+    return build_engineering_features(frame, config=config)
 
 
 def load_dataset(config: dict[str, Any]) -> pd.DataFrame:

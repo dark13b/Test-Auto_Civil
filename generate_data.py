@@ -522,7 +522,7 @@ def main() -> int:
 
         if bool(config.get("engineering", {}).get("feature_engineering", False)):
             log_status("Applying engineering feature generation to normalized dataset.")
-            dataset = build_engineering_features(dataset)
+            dataset = build_engineering_features(dataset, config=config)
             if not validate_features(dataset):
                 raise ValueError("Engineered feature validation failed during data generation.")
 

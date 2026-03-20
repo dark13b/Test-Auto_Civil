@@ -15,7 +15,6 @@ import pandas as pd
 from feature_engineering import build_engineering_features
 from train import (
     get_base_input_columns,
-    get_input_columns,
     get_outputs_dir,
     get_project_root,
     get_target_column,
@@ -23,9 +22,11 @@ from train import (
     load_dataset,
     load_pickle_artifact,
     log_status,
+    resolve_model_feature_columns,
     save_json_artifact,
     set_global_seed,
 )
+from uncertainty import UncertaintyEstimator
 from validator import EngineeringValidator
 
 
@@ -46,13 +47,20 @@ class MixDesignOptimizer:
         self.seed = int(self.config["experiment"]["random_seed"])
         set_global_seed(self.seed)
         self.base_columns = get_base_input_columns(self.config)
-        self.feature_columns = get_input_columns(self.config)
         self.target_column = get_target_column(self.config)
         self.design_config = self.config["engineering"]["design_tool"]
         self.validator = EngineeringValidator.from_config(self.config)
         self.model = load_pickle_artifact(self.model_path)
+        self.feature_columns = resolve_model_feature_columns(self.model, self.config)
         dataset = load_dataset(self.config)
         self.reference_dataset = dataset[self.base_columns + [self.target_column]].copy()
+        self.uncertainty_estimator = UncertaintyEstimator(
+            model=self.model,
+            report_model=self.model,
+            config_path=config_path,
+            outputs_dir=self.outputs_dir,
+            report_filename="design_uncertainty_calibration.json",
+        )
 
     def _load_config(self, config_path: str | Path | None) -> dict[str, Any]:
         """Load the project configuration from disk."""
@@ -110,9 +118,13 @@ class MixDesignOptimizer:
         """Overlay target-dependent cement, water, and water/cement bounds."""
         bounded = deepcopy(constraints)
         if target_strength < 30.0:
-            cement_bounds = (120.0, 280.0)
-            water_bounds = (140.0, 200.0)
-            water_cement_max = 0.65
+            cement_bounds = (100.0, 260.0)
+            water_bounds = (150.0, 210.0)
+            water_cement_max = 1.45
+        elif target_strength <= 35.0:
+            cement_bounds = (110.0, 280.0)
+            water_bounds = (145.0, 210.0)
+            water_cement_max = 1.25
         elif target_strength <= 45.0:
             cement_bounds = (140.0, 300.0)
             water_bounds = (140.0, 210.0)
@@ -129,9 +141,13 @@ class MixDesignOptimizer:
         bounded["cement"]["max"] = min(float(bounded["cement"].get("max", cement_bounds[1])), cement_bounds[1])
         bounded["water"]["min"] = max(float(bounded["water"].get("min", water_bounds[0])), water_bounds[0])
         bounded["water"]["max"] = min(float(bounded["water"].get("max", water_bounds[1])), water_bounds[1])
-        bounded["water_cement_ratio"]["max"] = min(
-            float(bounded["water_cement_ratio"].get("max", water_cement_max)),
-            water_cement_max,
+        existing_water_cement_max = float(
+            bounded["water_cement_ratio"].get("max", water_cement_max)
+        )
+        bounded["water_cement_ratio"]["max"] = (
+            max(existing_water_cement_max, water_cement_max)
+            if target_strength <= 35.0
+            else min(existing_water_cement_max, water_cement_max)
         )
         if float(bounded["cement"]["min"]) > float(bounded["cement"]["max"]):
             raise ValueError("Target-dependent cement bounds conflict with the configured constraints.")
@@ -144,6 +160,14 @@ class MixDesignOptimizer:
         if "tolerance_mpa" in constraints:
             return float(constraints["tolerance_mpa"])
         return float(self.design_config["target_tolerance_mpa"])
+
+    def _target_regime(self, target_strength: float) -> str:
+        """Classify the target strength into a design regime."""
+        if target_strength <= 35.0:
+            return "low_strength"
+        if target_strength <= 50.0:
+            return "medium_strength"
+        return "high_strength"
 
     def _cost_value(self, mix_design: dict[str, float]) -> float:
         """Return the configured cost proxy for a candidate mix."""
@@ -181,6 +205,150 @@ class MixDesignOptimizer:
                 normalized_mix[column] = 0.0
         return pd.DataFrame([normalized_mix])
 
+    def _target_conditioned_reference_rows(self, target_strength: float) -> pd.DataFrame:
+        """Return a dataset subset centered on the requested target strength."""
+        candidate_rows = self.reference_dataset.copy()
+        windows = [2.0, 4.0, 6.0, 8.0]
+        filtered = candidate_rows.iloc[0:0].copy()
+        for window in windows:
+            filtered = candidate_rows[
+                candidate_rows[self.target_column].between(target_strength - window, target_strength + window)
+            ].copy()
+            if len(filtered) >= 8:
+                break
+        if filtered.empty:
+            target_regime = self._target_regime(target_strength)
+            if target_regime == "low_strength":
+                filtered = candidate_rows[candidate_rows[self.target_column] <= 35.0].copy()
+            elif target_regime == "medium_strength":
+                filtered = candidate_rows[
+                    candidate_rows[self.target_column].between(30.0, 50.0)
+                ].copy()
+            else:
+                filtered = candidate_rows[candidate_rows[self.target_column] >= 45.0].copy()
+        return filtered if not filtered.empty else candidate_rows
+
+    def _engineering_prior_mixes(
+        self,
+        target_strength: float,
+        constraints: dict[str, Any],
+    ) -> list[dict[str, float]]:
+        """Build dataset-conditioned engineering priors for the target regime."""
+        candidate_rows = self._target_conditioned_reference_rows(target_strength).copy()
+        if candidate_rows.empty:
+            return []
+
+        target_regime = self._target_regime(target_strength)
+        sort_columns = ["cement", self.target_column]
+        if target_regime == "low_strength":
+            sort_columns = ["cement", self.target_column]
+        elif target_regime == "medium_strength":
+            sort_columns = [self.target_column, "cement"]
+        else:
+            sort_columns = [self.target_column, "cement"]
+        candidate_rows["target_gap"] = (candidate_rows[self.target_column] - target_strength).abs()
+        candidate_rows = candidate_rows.sort_values(["target_gap", *sort_columns]).head(24)
+
+        priors: list[dict[str, float]] = []
+        seen_signatures: set[tuple[float, ...]] = set()
+        water_cement_max = float(constraints.get("water_cement_ratio", {}).get("max", np.inf))
+        water_constraints = constraints.get("water", {})
+        water_minimum = float(water_constraints.get("fixed", water_constraints.get("min", 0.0)))
+        for _, row in candidate_rows.iterrows():
+            prior = {column: float(row[column]) for column in self.base_columns}
+            for column in self.base_columns:
+                column_constraints = constraints.get(column, {})
+                if "fixed" in column_constraints:
+                    prior[column] = float(column_constraints["fixed"])
+                else:
+                    prior[column] = float(
+                        np.clip(prior[column], float(column_constraints["min"]), float(column_constraints["max"]))
+                    )
+            if np.isfinite(water_cement_max) and water_cement_max > 0.0:
+                prior["cement"] = max(prior["cement"], water_minimum / water_cement_max)
+                cement_constraints = constraints.get("cement", {})
+                if "max" in cement_constraints:
+                    prior["cement"] = min(prior["cement"], float(cement_constraints["max"]))
+                prior["water"] = min(prior["water"], prior["cement"] * water_cement_max)
+                prior["water"] = max(prior["water"], water_minimum)
+            signature = tuple(round(prior[column], 4) for column in self.base_columns)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            priors.append(prior)
+            if len(priors) >= 6:
+                break
+        return priors
+
+    def _uncertainty_interval_summary(
+        self,
+        candidate_frame: pd.DataFrame,
+        target_strength: float,
+        tolerance: float,
+    ) -> dict[str, Any]:
+        """Predict a candidate interval and summarize target-window overlap."""
+        if self.uncertainty_estimator is None:
+            predicted = float(self.model.predict(build_engineering_features(candidate_frame, config=self.config)[self.feature_columns])[0])
+            lower = predicted - tolerance
+            upper = predicted + tolerance
+            width = upper - lower
+            confidence_label = "UNKNOWN"
+        else:
+            interval_frame = self.uncertainty_estimator.predict_with_interval(candidate_frame)
+            lower = float(interval_frame.iloc[0]["lower_90"])
+            upper = float(interval_frame.iloc[0]["upper_90"])
+            predicted = float(interval_frame.iloc[0]["predicted"])
+            width = float(interval_frame.iloc[0]["interval_width"])
+            confidence_label = str(interval_frame.iloc[0].get("confidence_label", "UNKNOWN"))
+
+        target_lower = target_strength - tolerance
+        target_upper = target_strength + tolerance
+        overlap = max(0.0, min(upper, target_upper) - max(lower, target_lower))
+        target_window_width = max(target_upper - target_lower, 1e-6)
+        return {
+            "predicted": predicted,
+            "lower_90": lower,
+            "upper_90": upper,
+            "interval_width": width,
+            "confidence_label": confidence_label,
+            "target_window_overlap": overlap / target_window_width,
+        }
+
+    def _plausibility_penalty(
+        self,
+        engineered_row: pd.Series,
+        target_strength: float,
+        mix_design: dict[str, float],
+    ) -> float:
+        """Penalize candidates that drift far from dataset-conditioned engineering ranges."""
+        reference_rows = self._target_conditioned_reference_rows(target_strength)
+        reference_engineered = build_engineering_features(reference_rows[self.base_columns], config=self.config)
+        comparison_columns = [
+            "cement",
+            "total_binder",
+            "effective_binder",
+            "water_effective_binder_ratio",
+            "supplementary_replacement_ratio",
+        ]
+        penalties: list[float] = []
+        for column in comparison_columns:
+            if column in mix_design:
+                candidate_value = float(mix_design[column])
+            else:
+                candidate_value = float(engineered_row[column])
+            series = (
+                reference_rows[column].astype(float)
+                if column in reference_rows.columns
+                else reference_engineered[column].astype(float)
+            )
+            mean = float(series.mean())
+            std = float(series.std(ddof=0))
+            if std <= 1e-6:
+                penalties.append(0.0)
+                continue
+            penalties.append(abs(candidate_value - mean) / std)
+        return float(np.mean(penalties) * 15.0)
+
     def _sample_trial_mix(
         self,
         trial: optuna.trial.Trial,
@@ -216,20 +384,30 @@ class MixDesignOptimizer:
     ) -> dict[str, Any]:
         """Predict and score a candidate mix design."""
         candidate_frame = self._frame_from_mix(mix_design)
-        engineered = build_engineering_features(candidate_frame)
+        engineered = build_engineering_features(candidate_frame, config=self.config)
         predicted_strength = float(self.model.predict(engineered[self.feature_columns])[0])
+        validation_frame = candidate_frame.copy()
+        validation_frame["target_strength"] = float(target_strength)
         sample_report = self.validator.evaluate_samples(
             np.asarray([predicted_strength], dtype=float),
-            engineered[self.feature_columns],
+            validation_frame,
         )[0]
         engineered_row = engineered.iloc[0]
         design_constraint_violations = self._check_design_constraints(engineered_row, constraints)
-
-        progressive_penalty = max(0.0, mix_design["cement"] - target_strength * 8.0) ** 2 * 0.01
+        uncertainty_interval = self._uncertainty_interval_summary(candidate_frame, target_strength, tolerance)
+        plausibility_penalty = self._plausibility_penalty(engineered_row, target_strength, mix_design)
+        target_regime = self._target_regime(target_strength)
+        if target_regime == "low_strength":
+            progressive_penalty = max(0.0, mix_design["cement"] - target_strength * 7.0) ** 2 * 0.05
+        else:
+            progressive_penalty = max(0.0, mix_design["cement"] - target_strength * 8.0) ** 2 * 0.01
         over_strength_penalty = 0.0
         if predicted_strength > target_strength * 1.10:
             over_strength_penalty = (predicted_strength - target_strength) * 0.5
-        warning_penalty = float(sample_report["warning_count"]) * 5000.0
+        warning_penalty = float(sample_report["warning_count"]) * 4000.0
+        interval_penalty = 0.0
+        if float(uncertainty_interval["target_window_overlap"]) <= 0.0:
+            interval_penalty += float(uncertainty_interval["interval_width"]) * 150.0
 
         deviation = abs(predicted_strength - target_strength)
         objective = (
@@ -238,6 +416,8 @@ class MixDesignOptimizer:
             + progressive_penalty
             + over_strength_penalty
             + warning_penalty
+            + plausibility_penalty
+            + interval_penalty
         )
         if predicted_strength < target_strength - tolerance:
             objective += ((target_strength - tolerance) - predicted_strength) ** 2 * 1500.0
@@ -252,6 +432,7 @@ class MixDesignOptimizer:
             sample_report["overall_verdict"] != "FAIL"
             and not design_constraint_violations
             and deviation <= tolerance
+            and float(uncertainty_interval["target_window_overlap"]) > 0.0
         )
         return {
             "objective": float(objective),
@@ -274,6 +455,17 @@ class MixDesignOptimizer:
             "validation_warning_reasons": list(sample_report["warning_reasons"]),
             "validation_failure_reasons": list(sample_report["failure_reasons"]),
             "design_constraint_violations": design_constraint_violations,
+            "uncertainty_interval": uncertainty_interval,
+            "plausibility_penalty": float(plausibility_penalty),
+            "ranking_breakdown": {
+                "cost_value": float(self._cost_value(mix_design)),
+                "deviation_penalty": float(deviation * 12.0),
+                "progressive_cement_penalty": float(progressive_penalty),
+                "over_strength_penalty": float(over_strength_penalty),
+                "warning_penalty": float(warning_penalty),
+                "interval_penalty": float(interval_penalty),
+                "plausibility_penalty": float(plausibility_penalty),
+            },
             "progressive_cement_penalty": float(progressive_penalty),
             "over_strength_penalty": float(over_strength_penalty),
             "warning_penalty": float(warning_penalty),
@@ -382,7 +574,7 @@ class MixDesignOptimizer:
                 "cement_saving_percent": None,
             }
 
-        reference_frame = build_engineering_features(pd.DataFrame(reference_rows))
+        reference_frame = build_engineering_features(pd.DataFrame(reference_rows), config=self.config)
         reference_predictions = np.asarray(
             self.model.predict(reference_frame[self.feature_columns]),
             dtype=float,
@@ -435,10 +627,21 @@ class MixDesignOptimizer:
         study = optuna.create_study(direction="minimize", sampler=sampler)
         evaluated_candidates: list[dict[str, Any]] = []
 
+        for prior_mix in self._engineering_prior_mixes(target_strength, merged_constraints):
+            evaluated_candidates.append(
+                self._evaluate_mix(prior_mix, target_strength, tolerance, merged_constraints)
+            )
         for warm_start_mix in self._warm_start_mixes(target_strength, merged_constraints):
             enqueued_params = {
                 column: value
                 for column, value in warm_start_mix.items()
+                if "fixed" not in merged_constraints.get(column, {})
+            }
+            study.enqueue_trial(enqueued_params)
+        for prior_mix in self._engineering_prior_mixes(target_strength, merged_constraints):
+            enqueued_params = {
+                column: value
+                for column, value in prior_mix.items()
                 if "fixed" not in merged_constraints.get(column, {})
             }
             study.enqueue_trial(enqueued_params)
@@ -453,7 +656,9 @@ class MixDesignOptimizer:
         if not evaluated_candidates:
             raise RuntimeError("No candidate mixes were evaluated during Optuna optimization.")
 
-        best_candidate = min(evaluated_candidates, key=self._ranking_key)
+        ranked_candidates = sorted(evaluated_candidates, key=self._ranking_key)
+        best_candidate = ranked_candidates[0]
+        top_ranked_candidates = int(self.design_config.get("top_ranked_candidates", 5))
         result = {
             "success": bool(best_candidate["success"]),
             "target_strength": target_strength,
@@ -470,6 +675,10 @@ class MixDesignOptimizer:
             "validation_warning_reasons": best_candidate["validation_warning_reasons"],
             "validation_failure_reasons": best_candidate["validation_failure_reasons"],
             "design_constraint_violations": best_candidate["design_constraint_violations"],
+            "uncertainty_interval": best_candidate["uncertainty_interval"],
+            "ranking_breakdown": best_candidate["ranking_breakdown"],
+            "plausibility_penalty": best_candidate["plausibility_penalty"],
+            "ranked_candidates": ranked_candidates[:top_ranked_candidates],
         }
         result["estimated_cement_saving_vs_reference"] = self._estimate_reference_mix(result, merged_constraints)
         return result

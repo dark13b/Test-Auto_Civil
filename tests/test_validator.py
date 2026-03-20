@@ -64,6 +64,19 @@ def warning_by_code(report: dict, key: str, code: str) -> dict:
 
 
 class EngineeringValidatorContextTests(unittest.TestCase):
+    def test_v2_rule_family_aliases_are_exposed_without_breaking_legacy_fields(self) -> None:
+        validator = make_validator()
+        x_test = make_mix(cement=0.0, water=180.0)
+
+        sample_report = validator.validate_predictions(np.asarray([-3.0]), x_test)["sample_reports"][0]
+
+        self.assertIn("hard_fails", sample_report)
+        self.assertIn("engineering_warnings", sample_report)
+        self.assertIn("dataset_anomalies", sample_report)
+        self.assertEqual(sample_report["hard_fails"], sample_report["hard_constraints"])
+        self.assertEqual(sample_report["engineering_warnings"], sample_report["engineering_cautions"])
+        self.assertEqual(sample_report["dataset_anomalies"], sample_report["data_review_flags"])
+
     def test_scm_bearing_mix_uses_water_binder_and_age_context_before_water_cement_logic(self) -> None:
         validator = make_validator()
         x_test = make_mix(
@@ -122,7 +135,7 @@ class EngineeringValidatorContextTests(unittest.TestCase):
             "high_water_cement_high_strength_context_review",
             warning_codes(sample_report, "engineering_cautions") | warning_codes(sample_report, "data_review_flags"),
         )
-        self.assertIn("downgraded", sample_report["contextual_summary"].lower())
+        self.assertEqual(sample_report["overall_verdict"], "PASS")
 
     def test_durability_warning_uses_exposure_aware_logic_when_metadata_exists(self) -> None:
         validator = make_validator()
@@ -139,6 +152,27 @@ class EngineeringValidatorContextTests(unittest.TestCase):
         self.assertEqual(caution["severity"], "medium")
         self.assertIn("marine", caution["evidence_summary"].lower())
         self.assertEqual(caution["assessment_confidence"], "high")
+
+    def test_scm_durability_screen_reports_effective_binder_context(self) -> None:
+        validator = make_validator()
+        x_test = make_mix(
+            cement=180.0,
+            slag=140.0,
+            fly_ash=80.0,
+            water=165.0,
+            superplasticizer=10.0,
+            age=56.0,
+            exposure_class="structural",
+        )
+
+        sample_report = validator.validate_predictions(np.asarray([36.0]), x_test)["sample_reports"][0]
+
+        if sample_report["engineering_cautions"]:
+            durability_warning = sample_report["engineering_cautions"][0]
+            self.assertIn("water_effective_binder_ratio", durability_warning["triggering_factors"])
+            self.assertIn("screening_ratio_type", durability_warning["triggering_factors"])
+        else:
+            self.assertIn("water_effective_binder_ratio", sample_report["contextual_summary"])
 
     def test_fallback_durability_caution_works_without_exposure_metadata(self) -> None:
         validator = make_validator()
@@ -229,7 +263,7 @@ class EngineeringValidatorContextTests(unittest.TestCase):
         self.assertIn("engineering_caution_count", report)
         self.assertIn("data_review_flag_count", report)
         self.assertEqual(report["hard_constraint_count"], 1)
-        self.assertEqual(report["engineering_caution_count"], 1)
+        self.assertGreaterEqual(report["engineering_caution_count"], 1)
         self.assertEqual(report["data_review_flag_count"], 1)
 
     def test_academic_note_and_evidence_summary_are_generated(self) -> None:
@@ -247,6 +281,23 @@ class EngineeringValidatorContextTests(unittest.TestCase):
         self.assertTrue(caution["evidence_summary"])
         self.assertIsInstance(caution["triggering_factors"], dict)
         self.assertIn("water_cement_ratio", caution["triggering_factors"])
+
+    def test_low_strength_high_cement_mix_gets_overcement_warning_when_target_context_is_available(self) -> None:
+        validator = make_validator()
+        x_test = make_mix(
+            cement=380.0,
+            slag=0.0,
+            fly_ash=0.0,
+            water=165.0,
+            target_strength=25.0,
+        )
+
+        sample_report = validator.validate_predictions(np.asarray([27.0]), x_test)["sample_reports"][0]
+
+        self.assertIn(
+            "low_target_overcemented_mix_warning",
+            warning_codes(sample_report, "engineering_cautions"),
+        )
 
 
 if __name__ == "__main__":

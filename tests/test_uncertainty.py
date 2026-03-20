@@ -21,6 +21,7 @@ def make_config() -> dict:
             "tight_threshold_mpa": 5.0,
             "wide_threshold_mpa": 10.0,
             "reliability_bins": 4,
+            "strength_bins_mpa": [0.0, 20.0, 35.0, 50.0],
             "lower_alpha": 0.05,
             "median_alpha": 0.5,
             "upper_alpha": 0.95,
@@ -30,6 +31,40 @@ def make_config() -> dict:
 
 
 class UncertaintyTests(unittest.TestCase):
+    def _make_heteroscedastic_data(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+        x_train = pd.DataFrame(
+            {
+                "cement": np.linspace(120, 320, 36),
+                "water": np.linspace(230, 150, 36),
+            }
+        )
+        x_val = pd.DataFrame(
+            {
+                "cement": np.linspace(130, 310, 18),
+                "water": np.linspace(225, 155, 18),
+            }
+        )
+        x_test = pd.DataFrame(
+            {
+                "cement": np.linspace(140, 300, 8),
+                "water": np.linspace(220, 160, 8),
+            }
+        )
+
+        def build_target(frame: pd.DataFrame) -> pd.Series:
+            base = 0.12 * frame["cement"] - 0.04 * frame["water"] + 4.0
+            heteroscedastic_noise = np.linspace(0.25, 3.5, len(frame))
+            return pd.Series(base + heteroscedastic_noise, index=frame.index)
+
+        return (
+            x_train,
+            x_val,
+            x_test,
+            build_target(x_train),
+            build_target(x_val),
+            build_target(x_test),
+        )
+
     def _build_estimator(self) -> tuple[UncertaintyEstimator, LinearRegression, pd.DataFrame, pd.Series]:
         config = make_config()
         x_train = pd.DataFrame({"cement": np.linspace(100, 180, 24), "water": np.linspace(160, 210, 24)})
@@ -54,6 +89,25 @@ class UncertaintyTests(unittest.TestCase):
 
         return estimator, model, x_test, y_test
 
+    def _build_heteroscedastic_estimator(self) -> tuple[UncertaintyEstimator, LinearRegression, pd.DataFrame]:
+        config = make_config()
+        x_train, x_val, x_test, y_train, y_val, y_test = self._make_heteroscedastic_data()
+        model = LinearRegression().fit(x_train, y_train)
+
+        with TemporaryDirectory() as tmpdir, patch("uncertainty.load_config", return_value=config), patch(
+            "uncertainty.load_dataset",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "uncertainty.split_dataset",
+            return_value=(x_train, x_val, x_test, y_train, y_val, y_test),
+        ), patch("uncertainty.set_global_seed"), patch(
+            "uncertainty.get_project_root",
+            return_value=Path(tmpdir),
+        ):
+            estimator = UncertaintyEstimator(model=model, report_model=model, outputs_dir=Path(tmpdir) / "outputs")
+
+        return estimator, model, x_test
+
     def test_interval_centers_match_report_model_predictions(self) -> None:
         estimator, model, x_test, _ = self._build_estimator()
 
@@ -68,6 +122,40 @@ class UncertaintyTests(unittest.TestCase):
         report = estimator.calibration_report()
 
         self.assertGreaterEqual(report["coverage"], 0.90)
+
+    def test_strength_dependent_scale_is_reported_for_intervals(self) -> None:
+        estimator, _, x_test = self._build_heteroscedastic_estimator()
+
+        interval_frame = estimator.predict_with_interval(x_test)
+
+        self.assertIn("bin_scale", interval_frame.columns)
+        self.assertIn("estimated_cv", interval_frame.columns)
+        low_width = float(interval_frame.iloc[0]["interval_width"])
+        high_width = float(interval_frame.iloc[-1]["interval_width"])
+        self.assertGreater(high_width, low_width)
+        self.assertGreater(float(interval_frame.iloc[-1]["bin_scale"]), float(interval_frame.iloc[0]["bin_scale"]))
+
+    def test_calibration_report_includes_strength_bin_coverage_audit(self) -> None:
+        estimator, _, _ = self._build_heteroscedastic_estimator()
+
+        report = estimator.calibration_report()
+
+        self.assertIn("coverage_by_strength_bin", report)
+        self.assertIn("strength_bin_audit", report)
+        low_strength_bins = report["strength_bin_audit"].get("low_strength_bins", [])
+        self.assertTrue(low_strength_bins)
+        self.assertIn("coverage_gap_low_minus_global", report["strength_bin_audit"])
+        self.assertTrue(
+            all("actual_strength_min" in bin_row and "predicted_min" in bin_row for bin_row in low_strength_bins)
+        )
+        self.assertEqual(len(report["coverage_by_strength_bin"]), len(report["reliability_plot_data"]))
+
+    def test_explicit_strength_bins_are_used_when_configured(self) -> None:
+        estimator, _, _ = self._build_heteroscedastic_estimator()
+
+        report = estimator.calibration_report()
+
+        self.assertEqual(report["strength_bin_audit"]["bin_edges"], [0.0, 20.0, 35.0, 50.0])
 
     def test_refit_request_is_rejected(self) -> None:
         config = make_config()

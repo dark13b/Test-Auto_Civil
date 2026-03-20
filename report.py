@@ -16,12 +16,12 @@ from sklearn.inspection import permutation_importance
 from train import (
     compute_regression_metrics,
     EngineeringValidator,
-    get_input_columns,
     get_outputs_dir,
     load_pickle_artifact,
     load_config,
     load_dataset,
     log_status,
+    resolve_model_feature_columns,
     save_json_artifact,
     set_global_seed,
     split_dataset,
@@ -129,7 +129,7 @@ def compute_feature_importance(
     best_search_result: dict[str, Any],
 ) -> pd.Series:
     """Compute feature importance, using permutation importance when required."""
-    feature_names = get_input_columns(config)
+    feature_names = resolve_model_feature_columns(model, config)
     model_name = str(best_search_result["model_name"])
 
     if model_name in {"SVR", "Ridge", "LinearRegression", "ElasticNet", "KNeighborsRegressor"}:
@@ -279,10 +279,16 @@ def main() -> int:
         )
         ctx._test_set_used_in_report = True
         validator = EngineeringValidator.from_config(config)
-        baseline_pred = np.asarray(baseline_model.predict(x_test), dtype=float)
-        y_pred = np.asarray(best_model.predict(x_test), dtype=float)
+        baseline_feature_columns = resolve_model_feature_columns(baseline_model, config)
+        best_feature_columns = resolve_model_feature_columns(best_model, config)
+        baseline_features = (
+            x_test if list(x_test.columns) == baseline_feature_columns else x_test[baseline_feature_columns]
+        )
+        best_features = x_test if list(x_test.columns) == best_feature_columns else x_test[best_feature_columns]
+        baseline_pred = np.asarray(baseline_model.predict(baseline_features), dtype=float)
+        y_pred = np.asarray(best_model.predict(best_features), dtype=float)
         holdout_metrics = compute_regression_metrics(y_test, y_pred, config, float(y_train.mean()))
-        validation_report = validator.validate_model(best_model, x_test, y_test)
+        validation_report = validator.validate_model(best_model, best_features, y_test)
         validation_result = dict(best_search_result)
         validation_result["validation_verdict"] = validation_report["verdict"]
         validation_result["validation_report"] = validation_report
@@ -291,7 +297,13 @@ def main() -> int:
         create_search_progress_plot(optuna_results, float(baseline_metrics["composite_score"]), outputs_dir)
         create_actual_vs_predicted_plot(y_test, y_pred, outputs_dir)
         create_residuals_plot(y_test, y_pred, outputs_dir)
-        feature_importance = compute_feature_importance(best_model, x_test, y_test, config, best_search_result)
+        feature_importance = compute_feature_importance(
+            best_model,
+            best_features,
+            y_test,
+            config,
+            best_search_result,
+        )
         create_feature_importance_plot(feature_importance, outputs_dir)
         rmse_by_range = create_performance_by_range_plot(y_test, y_pred, outputs_dir)
         uncertainty_estimator = UncertaintyEstimator(
@@ -301,7 +313,7 @@ def main() -> int:
             outputs_dir=outputs_dir,
         )
         uncertainty_audit = uncertainty_estimator.calibration_report()
-        interval_frame = uncertainty_estimator.predict_with_interval(x_test)
+        interval_frame = uncertainty_estimator.predict_with_interval(best_features)
         audit_coverages = {
             int(row["bin_id"]): float(row["observed_coverage"])
             for row in uncertainty_audit.get("reliability_plot_data", [])
