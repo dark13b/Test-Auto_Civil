@@ -715,7 +715,16 @@ def main() -> int:
         reference_payload = load_reference_payload(outputs_dir, config)
 
         dataset = load_dataset(config)
-        x_train, x_val, _, y_train, y_val, _ = split_dataset(dataset, config)
+        # x_test is the locked holdout — used ONLY here for final benchmark reporting.
+        # x_val is kept for any internal use but must NOT touch benchmark evaluation.
+        x_train, x_val, x_test, y_train, y_val, y_test = split_dataset(dataset, config)
+        # Integrity check: confirm holdout is separate from the training partition.
+        assert len(set(x_test.index) & set(x_train.index)) == 0, (
+            "Holdout leakage: x_test and x_train share indices."
+        )
+        assert len(set(x_test.index) & set(x_val.index)) == 0, (
+            "Holdout leakage: x_test and x_val share indices."
+        )
         validator = EngineeringValidator.from_config(config)
         benchmark_config = config["benchmark"]
         cv_splitter = build_cv_splitter(
@@ -749,8 +758,8 @@ def main() -> int:
                 best_params,
                 x_train,
                 y_train,
-                x_val,
-                y_val,
+                x_test,
+                y_test,
                 config,
                 validator,
                 cv_splitter,

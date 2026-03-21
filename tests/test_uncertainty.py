@@ -123,6 +123,29 @@ class UncertaintyTests(unittest.TestCase):
 
         self.assertGreaterEqual(report["coverage"], 0.90)
 
+    def test_calibration_and_validation_partitions_are_disjoint(self) -> None:
+        estimator, _, _, _ = self._build_estimator()
+        cal_indices = set(estimator.x_calibration.index.tolist())
+        val_indices = set(estimator.x_validation.index.tolist())
+        self.assertEqual(
+            len(cal_indices & val_indices),
+            0,
+            "Calibration and coverage-audit partitions must be fully disjoint."
+        )
+        self.assertGreater(len(cal_indices), 0, "Calibration partition must be non-empty.")
+        self.assertGreater(len(val_indices), 0, "Coverage audit partition must be non-empty.")
+
+    def test_coverage_is_measured_on_audit_partition_not_calibration(self) -> None:
+        estimator, _, _, _ = self._build_estimator()
+        # The validation set used for coverage reporting must not overlap
+        # with the calibration set used to fit the conformal quantile.
+        cal_idx = set(estimator.x_calibration.index.tolist())
+        val_idx = set(estimator.x_validation.index.tolist())
+        self.assertTrue(
+            val_idx.isdisjoint(cal_idx),
+            "Coverage audit must use a partition disjoint from conformal calibration data."
+        )
+
     def test_strength_dependent_scale_is_reported_for_intervals(self) -> None:
         estimator, _, x_test = self._build_heteroscedastic_estimator()
 

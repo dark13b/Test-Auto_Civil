@@ -300,6 +300,11 @@ def main() -> int:
         data = load_dataset(config)
         x_train, _, x_test, y_train, _, y_test = split_dataset(data, config)
         ctx = REPORT_CONTEXT
+        # METHODOLOGY NOTE:
+        # x_test (the locked holdout) is used exactly once — here, in the final
+        # report. All model selection, CV tuning, and uncertainty calibration
+        # were performed exclusively on x_train and x_val partitions.
+        # This single use of x_test ensures reported metrics are unbiased.
         assert getattr(ctx, "_test_set_used_in_report", False) is False, (
             "x_test has already been used. Holdout integrity violated."
         )

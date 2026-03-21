@@ -112,14 +112,26 @@ class UncertaintyEstimator:
             "Uncertainty model and report model must be the same fitted object."
         )
         dataset = load_dataset(self.config)
-        self.x_train, self.x_calibration, _, self.y_train, self.y_calibration, _ = split_dataset(
+        self.x_train, x_val_full, _, self.y_train, y_val_full, _ = split_dataset(
             dataset,
             self.config,
         )
         self.x_train = self.x_train[self.feature_columns].copy()
-        self.x_calibration = self.x_calibration[self.feature_columns].copy()
-        self.x_validation = self.x_calibration
-        self.y_validation = self.y_calibration
+
+        # Split x_val into calibration (70%) and coverage audit (30%).
+        # The calibration subset fits the conformal quantile.
+        # The audit subset evaluates empirical coverage on unseen data.
+        from sklearn.model_selection import train_test_split as _tts
+        _cal_size = int(len(x_val_full) * 0.70)
+        x_cal_raw   = x_val_full.iloc[:_cal_size]
+        x_audit_raw = x_val_full.iloc[_cal_size:]
+        y_cal_raw   = y_val_full.iloc[:_cal_size]
+        y_audit_raw = y_val_full.iloc[_cal_size:]
+
+        self.x_calibration = x_cal_raw[self.feature_columns].copy()
+        self.y_calibration = y_cal_raw.copy()
+        self.x_validation  = x_audit_raw[self.feature_columns].copy()
+        self.y_validation  = y_audit_raw.copy()
         self._fit_estimators()
 
     @staticmethod

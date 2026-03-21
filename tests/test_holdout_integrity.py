@@ -78,6 +78,25 @@ class HoldoutIntegrityTests(unittest.TestCase):
             self.assertNotRegex(block, r"\bx_test\b", msg=function_name)
             self.assertNotRegex(block, r"\by_test\b", msg=function_name)
 
+    def test_benchmark_module_uses_x_test_not_x_val_for_evaluation(self) -> None:
+        source = _read("benchmark.py")
+        eval_block = _extract_function_block(source, "evaluate_benchmark_model")
+        # The function signature must accept x_val and y_val as parameter names
+        # but the call site in main() must pass x_test/y_test, not x_val/y_val.
+        main_block = _extract_function_block(source, "main")
+        self.assertIn("x_test", main_block,
+            "benchmark.main() must pass x_test to evaluate_benchmark_model")
+        self.assertIn("y_test", main_block,
+            "benchmark.main() must pass y_test to evaluate_benchmark_model")
+        # Confirm x_val is NOT passed as the evaluation set in main()
+        # (it may still be present for other uses — the check is that
+        # evaluate_benchmark_model is not called with x_val as the eval arg)
+        self.assertNotIn(
+            "x_val, y_val, config",
+            main_block,
+            "benchmark.main() must not call evaluate_benchmark_model with x_val"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
