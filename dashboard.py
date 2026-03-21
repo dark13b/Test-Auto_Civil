@@ -20,6 +20,7 @@ DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 if not DASHBOARD_PASSWORD:
     DASHBOARD_PASSWORD = secrets.token_urlsafe(18)
     print(f"[dashboard] DASHBOARD_PASSWORD not set; generated temporary password: {DASHBOARD_PASSWORD}")
+MixDesignOptimizer = None
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -106,12 +107,12 @@ def log_share_event(event_name, *, token="", metadata=None):
 
 def build_share_snapshot_payload():
     baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
-    final_raw = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-    best_source = (
-        final_raw.get("best_search_metrics")
-        or safe_read_json(OUTPUTS_DIR / "search_state_best_result.json")
-        or safe_read_json(OUTPUTS_DIR / "best_search_result.json")
-        or {}
+    final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
+    final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
+    best_source = first_fresh_payload(
+        final_raw.get("best_search_metrics"),
+        safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
+        safe_read_json(OUTPUTS_DIR / "best_search_result.json"),
     )
     best = normalize_result_payload(best_source)
     final = normalize_final_payload(final_raw)
@@ -153,6 +154,20 @@ def sanitize_dashboard_payload(value):
     if isinstance(value, str):
         return html.escape(value, quote=True)
     return value
+
+def artifact_payload_is_stale(payload):
+    if not isinstance(payload, dict):
+        return False
+    metadata = payload.get("artifact_metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("stale"):
+        return True
+    return bool(payload.get("stale"))
+
+def first_fresh_payload(*payloads):
+    for payload in payloads:
+        if isinstance(payload, dict) and payload and not artifact_payload_is_stale(payload):
+            return payload
+    return {}
 
 def normalize_result_payload(payload):
     if not isinstance(payload, dict):
@@ -396,12 +411,12 @@ def health():
 def api_overview():
     try:
         baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
-        final_raw = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-        best_source = (
-            final_raw.get("best_search_metrics")
-            or safe_read_json(OUTPUTS_DIR / "search_state_best_result.json")
-            or safe_read_json(OUTPUTS_DIR / "best_search_result.json")
-            or {}
+        final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
+        final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
+        best_source = first_fresh_payload(
+            final_raw.get("best_search_metrics"),
+            safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
+            safe_read_json(OUTPUTS_DIR / "best_search_result.json"),
         )
         best = normalize_result_payload(best_source)
         final = normalize_final_payload(final_raw)
@@ -423,12 +438,12 @@ def api_optuna_results():
 @app.route("/api/validation_details")
 def api_validation_details():
     try:
-        final_raw = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-        best_source = (
-            final_raw.get("best_search_metrics")
-            or safe_read_json(OUTPUTS_DIR / "search_state_best_result.json")
-            or load_required_output_json("best_search_result.json")
-            or {}
+        final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
+        final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
+        best_source = first_fresh_payload(
+            final_raw.get("best_search_metrics"),
+            safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
+            load_required_output_json("best_search_result.json"),
         )
         best = normalize_result_payload(best_source)
     except FileNotFoundError as exc:
@@ -453,6 +468,28 @@ def api_design_results():
             d["_filename"] = f.name
             singles.append(d)
     return jsonify(sanitize_dashboard_payload({"batch": batch or [], "singles": singles}))
+
+@app.route("/api/design_generate", methods=["POST"])
+def api_design_generate():
+    payload = request.get_json(silent=True) or {}
+    try:
+        target_strength = float(payload["target_strength"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "invalid_target_strength"}), 400
+
+    context = {
+        "exposure_class": payload.get("exposure_class"),
+        "structural_application": payload.get("structural_application"),
+    }
+    try:
+        optimizer_cls = MixDesignOptimizer
+        if optimizer_cls is None:
+            from design_tool import MixDesignOptimizer as optimizer_cls
+        optimizer = optimizer_cls()
+        result = optimizer.optimize(target_strength, context=context)
+    except Exception as exc:
+        return jsonify({"error": "design_generation_failed", "message": str(exc)}), 500
+    return jsonify(sanitize_dashboard_payload(result))
 
 @app.route("/api/plots")
 def api_plots():
@@ -1658,8 +1695,85 @@ async function loadValidation() {
 async function loadDesign() {
   const d = await fetch('/api/design_results').then(r=>r.json()).catch(()=>({batch:[],singles:[]}));
   const el = document.getElementById('design-content');
+  const renderDesignGenerator = () => `
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-label">Live Design Context</div>
+      <div class="grid cols-3" style="margin-top:12px">
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Target MPa</span>
+          <input id="design-target-strength" type="number" min="5" max="120" step="0.5" value="35" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Exposure Class</span>
+          <select id="design-exposure-class" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px">
+            <option value="general">General</option>
+            <option value="structural">Structural</option>
+            <option value="exposed">Exposed</option>
+            <option value="severe">Severe</option>
+            <option value="marine">Marine</option>
+            <option value="freeze_thaw">Freeze-Thaw</option>
+            <option value="sulfate">Sulfate</option>
+          </select>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Structural Application</span>
+          <select id="design-structural-application" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px">
+            <option value="column">Column</option>
+            <option value="beam">Beam</option>
+            <option value="slab">Slab</option>
+            <option value="footing">Footing</option>
+            <option value="wall">Wall</option>
+            <option value="pavement">Pavement</option>
+          </select>
+        </label>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;margin-top:14px">
+        <button onclick="runLiveDesign()" style="background:var(--accent);color:#08131d;border:none;border-radius:999px;padding:10px 16px;font-weight:700;cursor:pointer">Generate Design</button>
+        <div id="design-generator-status" style="font-size:12px;color:var(--muted)">Context flows into optimizer + validator.</div>
+      </div>
+      <div id="design-generator-result" style="margin-top:16px"></div>
+    </div>`;
+  if(!window.runLiveDesign){
+    window.runLiveDesign = async function runLiveDesign(){
+      const statusEl = document.getElementById('design-generator-status');
+      const resultEl = document.getElementById('design-generator-result');
+      statusEl.textContent = 'Generating design...';
+      resultEl.innerHTML = '';
+      const payload = {
+        target_strength: parseFloat(document.getElementById('design-target-strength').value || '35'),
+        exposure_class: document.getElementById('design-exposure-class').value,
+        structural_application: document.getElementById('design-structural-application').value,
+      };
+      const response = await fetch('/api/design_generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(()=>null);
+      if(!response){
+        statusEl.textContent = 'Design request failed.';
+        return;
+      }
+      const result = await response.json().catch(()=>({}));
+      if(!response.ok){
+        statusEl.textContent = result.message || 'Design request failed.';
+        return;
+      }
+      statusEl.textContent = `Design generated with ${result.validation_verdict || result.sample_validation?.overall_verdict || 'UNKNOWN'} validator status.`;
+      resultEl.innerHTML = `
+        <div class="card-grid">
+          <div class="card"><div class="card-label">Predicted</div><div class="metric-value sm">${result.predicted_strength!=null?parseFloat(result.predicted_strength).toFixed(2):'—'} MPa</div></div>
+          <div class="card"><div class="card-label">Exposure</div><div class="metric-value sm">${escapeHtml(result.design_context?.exposure_class || '—')}</div></div>
+          <div class="card"><div class="card-label">Application</div><div class="metric-value sm">${escapeHtml(result.design_context?.structural_application || '—')}</div></div>
+          <div class="card"><div class="card-label">Validator</div><div class="metric-value sm">${escapeHtml(result.sample_validation?.overall_verdict || result.validation_verdict || '—')}</div></div>
+        </div>
+        <div style="margin-top:12px;background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;padding:12px">
+          <pre style="white-space:pre-wrap;color:var(--muted);font-family:var(--mono);font-size:11px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
+        </div>`;
+    }
+  }
   if(!d.batch.length && !d.singles.length){
     el.innerHTML = `
+      ${renderDesignGenerator()}
       <div class="design-placeholder">
         <div style="font-size:32px;margin-bottom:12px">⬡</div>
         <div style="font-size:14px;font-weight:700;margin-bottom:6px">No Design Tool Results Yet</div>
@@ -1670,7 +1784,7 @@ async function loadDesign() {
       </div>`;
     return;
   }
-  let html = '';
+  let html = renderDesignGenerator();
   if(d.batch.length){
     html += `<div class="table-wrap" style="margin-bottom:24px">
       <table>

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -201,6 +202,92 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         page = response.get_data(as_text=True)
         self.assertIn("const bestMetricSource =", page)
+
+    def test_api_overview_ignores_stale_final_metrics(self) -> None:
+        dashboard = importlib.import_module("dashboard")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "baseline_metrics.json").write_text(
+                json.dumps({"model_name": "RandomForestRegressor", "composite_score": 0.9}),
+                encoding="utf-8",
+            )
+            (outputs_dir / "final_metrics.json").write_text(
+                json.dumps(
+                    {
+                        "stale": True,
+                        "best_search_metrics": {"model_name": "OldModel", "composite_score": 0.7},
+                        "composite_improvement_pct": -3.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "search_state_best_result.json").write_text(
+                json.dumps({"model_name": "FreshModel", "composite_score": 0.95}),
+                encoding="utf-8",
+            )
+
+            with patch.object(dashboard, "OUTPUTS_DIR", outputs_dir), patch.object(
+                dashboard,
+                "DASHBOARD_PASSWORD",
+                "dummy",
+            ):
+                client = dashboard.app.test_client()
+                response = client.get(
+                    "/api/overview",
+                    headers={"Authorization": "Basic YXV0b2NpdmlsOmR1bW15"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["best"]["model_name"], "FreshModel")
+        self.assertIsNone(payload["final"].get("composite_improvement_pct"))
+
+    def test_design_generate_flows_exposure_and_structural_context_into_backend(self) -> None:
+        dashboard = importlib.import_module("dashboard")
+        captured: dict = {}
+
+        class _StubOptimizer:
+            def optimize(self, target_strength, constraints=None, context=None):
+                captured["target_strength"] = target_strength
+                captured["constraints"] = constraints
+                captured["context"] = context
+                return {
+                    "success": True,
+                    "target_strength": target_strength,
+                    "predicted_strength": 34.8,
+                    "validation_verdict": "WARN",
+                    "design_context": dict(context or {}),
+                    "sample_validation": {
+                        "exposure_class": context.get("exposure_class"),
+                        "structural_application": context.get("structural_application"),
+                        "overall_verdict": "WARN",
+                    },
+                }
+
+        with patch.object(dashboard, "DASHBOARD_PASSWORD", "dummy"), patch.object(
+            dashboard,
+            "MixDesignOptimizer",
+            return_value=_StubOptimizer(),
+            create=True,
+        ):
+            client = dashboard.app.test_client()
+            response = client.post(
+                "/api/design_generate",
+                headers={"Authorization": "Basic YXV0b2NpdmlsOmR1bW15"},
+                json={
+                    "target_strength": 35,
+                    "exposure_class": "marine",
+                    "structural_application": "column",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(captured["target_strength"], 35.0)
+        self.assertEqual(captured["context"]["exposure_class"], "marine")
+        self.assertEqual(captured["context"]["structural_application"], "column")
+        self.assertEqual(payload["design_context"]["exposure_class"], "marine")
+        self.assertEqual(payload["sample_validation"]["structural_application"], "column")
 
 
 if __name__ == "__main__":

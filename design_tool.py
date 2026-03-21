@@ -227,12 +227,30 @@ class MixDesignOptimizer:
                 violations.append(f"{column} falls below configured minimum.")
         return violations
 
-    def _frame_from_mix(self, mix_design: dict[str, float]) -> pd.DataFrame:
+    def _normalize_design_context(self, context: dict[str, Any] | None) -> dict[str, Any]:
+        """Normalize optional UI/CLI design context."""
+        if not isinstance(context, dict):
+            return {}
+        normalized: dict[str, Any] = {}
+        for key in ("exposure_class", "structural_application"):
+            value = context.get(key)
+            if value in (None, ""):
+                continue
+            normalized[key] = str(value).strip().lower().replace(" ", "_")
+        return normalized
+
+    def _frame_from_mix(
+        self,
+        mix_design: dict[str, float],
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> pd.DataFrame:
         """Convert a mix-design dictionary into a one-row dataframe."""
         normalized_mix = {column: float(mix_design[column]) for column in self.base_columns}
         for column in ("slag", "fly_ash"):
             if abs(normalized_mix[column]) < 1.0:
                 normalized_mix[column] = 0.0
+        normalized_mix.update(self._normalize_design_context(context))
         return pd.DataFrame([normalized_mix])
 
     def _target_conditioned_reference_rows(self, target_strength: float) -> pd.DataFrame:
@@ -491,9 +509,11 @@ class MixDesignOptimizer:
         target_strength: float,
         tolerance: float,
         constraints: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Predict and score a candidate mix design."""
-        candidate_frame = self._frame_from_mix(mix_design)
+        design_context = self._normalize_design_context(context)
+        candidate_frame = self._frame_from_mix(mix_design, context=design_context)
         engineered = build_engineering_features(candidate_frame, config=self.config)
         predicted_strength = float(self.model.predict(engineered[self.feature_columns])[0])
         validation_frame = candidate_frame.copy()
@@ -554,8 +574,10 @@ class MixDesignOptimizer:
             "engineered_ratios": {
                 column: float(engineered_row[column])
                 for column in engineered.columns
-                if column not in self.base_columns
+                if column not in self.base_columns and np.issubdtype(type(engineered_row[column]), np.number)
             },
+            "design_context": design_context,
+            "sample_validation": dict(sample_report),
             "validation_verdict": sample_report["overall_verdict"],
             "hard_constraints": list(sample_report["hard_constraints"]),
             "engineering_cautions": list(sample_report["engineering_cautions"]),
@@ -716,9 +738,11 @@ class MixDesignOptimizer:
         self,
         target_strength_mpa: float,
         constraints: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Search for a mix design that meets the target strength with minimum cement."""
         target_strength = float(target_strength_mpa)
+        design_context = self._normalize_design_context(context)
         merged_constraints = self._normalize_constraints(constraints)
         merged_constraints = self._apply_target_dependent_bounds(target_strength, merged_constraints)
         tolerance = self._target_tolerance(merged_constraints)
@@ -739,7 +763,13 @@ class MixDesignOptimizer:
 
         for prior_mix in self._engineering_prior_mixes(target_strength, merged_constraints):
             evaluated_candidates.append(
-                self._evaluate_mix(prior_mix, target_strength, tolerance, merged_constraints)
+                self._evaluate_mix(
+                    prior_mix,
+                    target_strength,
+                    tolerance,
+                    merged_constraints,
+                    context=design_context,
+                )
             )
         for warm_start_mix in self._warm_start_mixes(target_strength, merged_constraints):
             enqueued_params = {
@@ -758,7 +788,13 @@ class MixDesignOptimizer:
 
         def objective(trial: optuna.trial.Trial) -> float:
             mix_design = self._sample_trial_mix(trial, merged_constraints)
-            candidate = self._evaluate_mix(mix_design, target_strength, tolerance, merged_constraints)
+            candidate = self._evaluate_mix(
+                mix_design,
+                target_strength,
+                tolerance,
+                merged_constraints,
+                context=design_context,
+            )
             evaluated_candidates.append(candidate)
             return float(candidate["objective"])
 
@@ -788,6 +824,8 @@ class MixDesignOptimizer:
             "uncertainty_interval": best_candidate["uncertainty_interval"],
             "ranking_breakdown": best_candidate["ranking_breakdown"],
             "plausibility_penalty": best_candidate["plausibility_penalty"],
+            "design_context": design_context,
+            "sample_validation": best_candidate["sample_validation"],
             "ranked_candidates": ranked_candidates[:top_ranked_candidates],
         }
         result["estimated_cement_saving_vs_reference"] = self._estimate_reference_mix(result, merged_constraints)

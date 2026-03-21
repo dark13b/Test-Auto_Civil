@@ -179,6 +179,26 @@ def make_optimizer() -> MixDesignOptimizer:
 
 
 class DesignToolTests(unittest.TestCase):
+    def test_frame_from_mix_preserves_selected_design_context(self) -> None:
+        optimizer = make_optimizer()
+
+        frame = optimizer._frame_from_mix(
+            {
+                "cement": 170.0,
+                "slag": 110.0,
+                "fly_ash": 35.0,
+                "water": 168.0,
+                "superplasticizer": 7.0,
+                "coarse_aggregate": 1015.0,
+                "fine_aggregate": 770.0,
+                "age": 28.0,
+            },
+            context={"exposure_class": "marine", "structural_application": "column"},
+        )
+
+        self.assertEqual(frame.loc[0, "exposure_class"], "marine")
+        self.assertEqual(frame.loc[0, "structural_application"], "column")
+
     def test_low_strength_engineering_priors_are_dataset_conditioned(self) -> None:
         optimizer = make_optimizer()
         constraints = optimizer._normalize_constraints(None)
@@ -208,12 +228,16 @@ class DesignToolTests(unittest.TestCase):
             target_strength=25.0,
             tolerance=2.0,
             constraints=constraints,
+            context={"exposure_class": "marine", "structural_application": "column"},
         )
 
         self.assertIn("uncertainty_interval", candidate)
         self.assertIn("plausibility_penalty", candidate)
         self.assertIn("ranking_breakdown", candidate)
         self.assertIn("target_window_overlap", candidate["uncertainty_interval"])
+        self.assertEqual(candidate["design_context"]["exposure_class"], "marine")
+        self.assertEqual(candidate["design_context"]["structural_application"], "column")
+        self.assertEqual(candidate["sample_validation"]["exposure_class"], "marine")
 
     def test_optimize_returns_ranked_candidates_and_legacy_winner_fields(self) -> None:
         optimizer = make_optimizer()
@@ -226,6 +250,7 @@ class DesignToolTests(unittest.TestCase):
         self.assertIn("predicted_strength", result)
         self.assertIn("uncertainty_interval", result)
         self.assertIn("ranking_breakdown", result)
+        self.assertIn("design_context", result)
 
     def test_uncertainty_summary_matches_official_estimator_output(self) -> None:
         optimizer = make_optimizer()

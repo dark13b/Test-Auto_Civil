@@ -37,6 +37,9 @@ from validator import summarize_validation_report
 
 
 REPORT_CONTEXT = SimpleNamespace()
+REGIME_LOW_MAX_MPA = 25.0
+REGIME_MID_MAX_MPA = 60.0
+DEFAULT_TRANSITION_WINDOW_MPA = 2.0
 
 
 def load_json_artifact(path: Path) -> dict[str, Any]:
@@ -45,6 +48,15 @@ def load_json_artifact(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"Required artifact not found: {path}")
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_optuna_results_frame(path: Path) -> pd.DataFrame:
+    """Load Optuna results, tolerating malformed appended rows in generated CSV artifacts."""
+    try:
+        return pd.read_csv(path)
+    except Exception as exc:
+        log_status(f"WARNING optuna_results_read_fallback | path={path} | reason={exc}")
+        return pd.read_csv(path, engine="python", on_bad_lines="skip")
 
 
 def save_figure(path: Path) -> None:
@@ -179,21 +191,139 @@ def create_feature_importance_plot(feature_importance: pd.Series, outputs_dir: P
     save_figure(outputs_dir / "feature_importance.png")
 
 
-def compute_rmse_by_range(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
-    """Compute RMSE across low, mid, and high target ranges without plotting."""
-    lower_bound = float(y_true.quantile(0.2))
-    upper_bound = float(y_true.quantile(0.8))
+def compute_regime_rmse_by_range(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
+    """Compute RMSE across the fixed low/mid/high regime thresholds."""
     ranges = {
-        "low": y_true <= lower_bound,
-        "mid": (y_true > lower_bound) & (y_true < upper_bound),
-        "high": y_true >= upper_bound,
+        "low": y_true <= REGIME_LOW_MAX_MPA,
+        "mid": (y_true > REGIME_LOW_MAX_MPA) & (y_true <= REGIME_MID_MAX_MPA),
+        "high": y_true > REGIME_MID_MAX_MPA,
     }
     rmse_by_range: dict[str, float] = {}
     for label, mask in ranges.items():
         group_true = y_true[mask]
         group_pred = y_pred[mask]
+        if group_true.empty:
+            rmse_by_range[label] = float("nan")
+            continue
         rmse_by_range[label] = float(np.sqrt(np.mean((np.asarray(group_true) - np.asarray(group_pred)) ** 2)))
     return rmse_by_range
+
+
+def compute_rmse_by_range(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
+    """Backward-compatible alias for fixed regime RMSE buckets."""
+    return compute_regime_rmse_by_range(y_true, y_pred)
+
+
+def evaluate_regime_transition_stability(
+    *,
+    y_true: pd.Series,
+    hard_predictions: np.ndarray,
+    soft_predictions: np.ndarray,
+    transition_window_mpa: float = DEFAULT_TRANSITION_WINDOW_MPA,
+) -> dict[str, Any]:
+    """Compare hard routing to soft blending for samples near regime boundaries."""
+    window = max(float(transition_window_mpa), 1e-6)
+    boundary_mask = (
+        (y_true - REGIME_LOW_MAX_MPA).abs() <= window
+    ) | (
+        (y_true - REGIME_MID_MAX_MPA).abs() <= window
+    )
+    boundary_true = y_true[boundary_mask]
+    if boundary_true.empty:
+        return {
+            "boundary_sample_count": 0,
+            "hard_boundary_rmse": float("nan"),
+            "soft_boundary_rmse": float("nan"),
+            "boundary_rmse_delta": float("nan"),
+            "soft_blending_improves_transitions": False,
+            "boundary_instability": "insufficient_boundary_samples",
+        }
+
+    hard_boundary = np.asarray(hard_predictions, dtype=float)[boundary_mask.to_numpy()]
+    soft_boundary = np.asarray(soft_predictions, dtype=float)[boundary_mask.to_numpy()]
+    boundary_true_values = np.asarray(boundary_true, dtype=float)
+    hard_rmse = float(np.sqrt(np.mean((boundary_true_values - hard_boundary) ** 2)))
+    soft_rmse = float(np.sqrt(np.mean((boundary_true_values - soft_boundary) ** 2)))
+    delta = hard_rmse - soft_rmse
+    return {
+        "boundary_sample_count": int(boundary_mask.sum()),
+        "hard_boundary_rmse": hard_rmse,
+        "soft_boundary_rmse": soft_rmse,
+        "boundary_rmse_delta": delta,
+        "soft_blending_improves_transitions": bool(delta > 0.0),
+        "boundary_instability": "reduced" if delta > 0.0 else "unchanged_or_worse",
+    }
+
+
+def build_regime_specific_modeling_summary(
+    *,
+    model: Any,
+    x_features: pd.DataFrame,
+    y_true: pd.Series,
+    soft_predictions: np.ndarray,
+    config: dict[str, Any],
+    target_mean: float,
+) -> dict[str, Any]:
+    """Summarize holdout impact of regime-specific modeling and soft blending."""
+    hard_predict = getattr(model, "predict_hard", None)
+    if not callable(hard_predict):
+        unavailable = {
+            "overall_rmse_impact": None,
+            "overall_r2_impact": None,
+            "low_strength_rmse_impact": None,
+            "boundary_instability": "not_available",
+            "soft_blending_improves_transitions": None,
+        }
+        return {
+            "status": "not_available",
+            "structured_metrics_summary": unavailable,
+            "pass_fail": "UNRESOLVED",
+            "remaining_issues": ["Hard-routing comparator is unavailable for this model artifact."],
+        }
+
+    hard_predictions = np.asarray(hard_predict(x_features), dtype=float)
+    hard_metrics = compute_regression_metrics(y_true, hard_predictions, config, target_mean)
+    soft_metrics = compute_regression_metrics(y_true, soft_predictions, config, target_mean)
+    hard_rmse_by_range = compute_regime_rmse_by_range(y_true, hard_predictions)
+    soft_rmse_by_range = compute_regime_rmse_by_range(y_true, soft_predictions)
+    transition_summary = evaluate_regime_transition_stability(
+        y_true=y_true,
+        hard_predictions=hard_predictions,
+        soft_predictions=soft_predictions,
+        transition_window_mpa=DEFAULT_TRANSITION_WINDOW_MPA,
+    )
+    structured_summary = {
+        "overall_rmse_impact": float(soft_metrics["rmse"] - hard_metrics["rmse"]),
+        "overall_r2_impact": float(soft_metrics["r2"] - hard_metrics["r2"]),
+        "low_strength_rmse_impact": float(soft_rmse_by_range["low"] - hard_rmse_by_range["low"]),
+        "boundary_instability": transition_summary["boundary_instability"],
+        "soft_blending_improves_transitions": transition_summary["soft_blending_improves_transitions"],
+        "soft_boundary_rmse": transition_summary["soft_boundary_rmse"],
+        "hard_boundary_rmse": transition_summary["hard_boundary_rmse"],
+    }
+    passes_direction = (
+        structured_summary["overall_rmse_impact"] <= 0.0
+        and structured_summary["low_strength_rmse_impact"] <= 0.0
+        and bool(structured_summary["soft_blending_improves_transitions"])
+    )
+    remaining_issues: list[str] = []
+    if structured_summary["overall_rmse_impact"] > 0.0:
+        remaining_issues.append("Soft blending increased overall holdout RMSE.")
+    if structured_summary["low_strength_rmse_impact"] > 0.0:
+        remaining_issues.append("Low-strength RMSE did not improve.")
+    if not structured_summary["soft_blending_improves_transitions"]:
+        remaining_issues.append("Boundary transitions remain unstable or unchanged.")
+    return {
+        "status": "evaluated",
+        "structured_metrics_summary": structured_summary,
+        "pass_fail": "PASS" if passes_direction else "FAIL",
+        "remaining_issues": remaining_issues,
+        "hard_routing_metrics": hard_metrics,
+        "soft_blending_metrics": soft_metrics,
+        "hard_rmse_by_range": hard_rmse_by_range,
+        "soft_rmse_by_range": soft_rmse_by_range,
+        "boundary_transition_summary": transition_summary,
+    }
 
 
 def create_performance_by_range_plot(
@@ -295,7 +425,7 @@ def main() -> int:
             reason="stale ensemble artifact from a different run",
         )
         best_model = load_pickle_artifact(outputs_dir / "best_search_model.pkl")
-        optuna_results = pd.read_csv(outputs_dir / "optuna_results.csv")
+        optuna_results = load_optuna_results_frame(outputs_dir / "optuna_results.csv")
 
         data = load_dataset(config)
         x_train, _, x_test, y_train, _, y_test = split_dataset(data, config)
@@ -319,6 +449,14 @@ def main() -> int:
         baseline_pred = np.asarray(baseline_model.predict(baseline_features), dtype=float)
         y_pred = np.asarray(best_model.predict(best_features), dtype=float)
         holdout_metrics = compute_regression_metrics(y_test, y_pred, config, float(y_train.mean()))
+        regime_specific_modeling = build_regime_specific_modeling_summary(
+            model=best_model,
+            x_features=best_features,
+            y_true=y_test,
+            soft_predictions=y_pred,
+            config=config,
+            target_mean=float(y_train.mean()),
+        )
         validation_report = validator.validate_model(best_model, best_features, y_test)
         validation_result = dict(best_search_result)
         validation_result["validation_verdict"] = validation_report["verdict"]
@@ -342,6 +480,7 @@ def main() -> int:
             report_model=best_model,
             method=str(config["engineering"]["uncertainty_method"]),
             outputs_dir=outputs_dir,
+            audit_partition="holdout",
         )
         uncertainty_audit = uncertainty_estimator.calibration_report()
         interval_frame = uncertainty_estimator.predict_with_interval(best_features)
@@ -380,6 +519,7 @@ def main() -> int:
                 "baseline_rmse_by_range": baseline_rmse_by_range,
                 "uncertainty_summary": uncertainty_summary,
                 "uncertainty_audit": uncertainty_audit.get("coverage_audit", {}),
+                "regime_specific_modeling": regime_specific_modeling,
             }
         )
         write_run_scoped_json_artifact(

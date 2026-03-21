@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.ensemble import (
     ExtraTreesRegressor,
     GradientBoostingRegressor,
@@ -68,6 +68,9 @@ ARTIFACT_VERSION_MODULES = {
 }
 
 RUN_ARTIFACTS_DIRNAME = "runs"
+REGIME_NAMES = ("low", "mid", "high")
+REGIME_BOUNDARIES_MPA = (25.0, 60.0)
+DEFAULT_REGIME_BLEND_WIDTH_MPA = 2.0
 
 
 def log_status(message: str) -> None:
@@ -79,6 +82,207 @@ def log_status(message: str) -> None:
 def get_project_root() -> Path:
     """Return the project root directory."""
     return Path(__file__).resolve().parent
+
+
+def identify_strength_regime(target_value: float) -> str:
+    """Classify a strength value into the configured low/mid/high regime."""
+    value = float(target_value)
+    if value <= REGIME_BOUNDARIES_MPA[0]:
+        return "low"
+    if value <= REGIME_BOUNDARIES_MPA[1]:
+        return "mid"
+    return "high"
+
+
+def regime_modeling_enabled(config: dict[str, Any] | None) -> bool:
+    """Return whether regime-specific modeling should be used."""
+    if not isinstance(config, dict):
+        return True
+    engineering = config.get("engineering", {})
+    regime_config = engineering.get("regime_modeling", {})
+    if not isinstance(regime_config, dict):
+        return True
+    return bool(regime_config.get("enabled", True))
+
+
+def regime_transition_width_mpa(config: dict[str, Any] | None) -> float:
+    """Return the soft-blending transition width around regime boundaries."""
+    if not isinstance(config, dict):
+        return DEFAULT_REGIME_BLEND_WIDTH_MPA
+    regime_config = config.get("engineering", {}).get("regime_modeling", {})
+    if not isinstance(regime_config, dict):
+        return DEFAULT_REGIME_BLEND_WIDTH_MPA
+    return float(regime_config.get("transition_width_mpa", DEFAULT_REGIME_BLEND_WIDTH_MPA))
+
+
+def build_regime_blend_weights(
+    routing_predictions: np.ndarray,
+    *,
+    transition_width_mpa: float = DEFAULT_REGIME_BLEND_WIDTH_MPA,
+) -> list[dict[str, float]]:
+    """Build soft regime-membership weights from routing predictions."""
+    width = max(float(transition_width_mpa), 1e-6)
+    lower_boundary, upper_boundary = REGIME_BOUNDARIES_MPA
+    weights: list[dict[str, float]] = []
+    for raw_prediction in np.asarray(routing_predictions, dtype=float):
+        prediction = float(raw_prediction)
+        if prediction <= lower_boundary - width:
+            weights.append({"low": 1.0, "mid": 0.0, "high": 0.0})
+            continue
+        if prediction < lower_boundary + width:
+            mid_weight = (prediction - (lower_boundary - width)) / (2.0 * width)
+            weights.append({"low": float(1.0 - mid_weight), "mid": float(mid_weight), "high": 0.0})
+            continue
+        if prediction <= upper_boundary - width:
+            weights.append({"low": 0.0, "mid": 1.0, "high": 0.0})
+            continue
+        if prediction < upper_boundary + width:
+            high_weight = (prediction - (upper_boundary - width)) / (2.0 * width)
+            weights.append({"low": 0.0, "mid": float(1.0 - high_weight), "high": float(high_weight)})
+            continue
+        weights.append({"low": 0.0, "mid": 0.0, "high": 1.0})
+    return weights
+
+
+def _regime_mask(target_values: pd.Series, regime_name: str) -> pd.Series:
+    values = pd.Series(target_values, copy=False)
+    if regime_name == "low":
+        return values <= REGIME_BOUNDARIES_MPA[0]
+    if regime_name == "mid":
+        return (values > REGIME_BOUNDARIES_MPA[0]) & (values <= REGIME_BOUNDARIES_MPA[1])
+    return values > REGIME_BOUNDARIES_MPA[1]
+
+
+def fit_regime_models(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    *,
+    model_factory: Any,
+) -> dict[str, Any]:
+    """Fit one model per target-strength regime using the training partition only."""
+    regime_models: dict[str, Any] = {}
+    for regime_name in REGIME_NAMES:
+        regime_mask = _regime_mask(y_train, regime_name)
+        x_regime = x_train.loc[regime_mask]
+        y_regime = y_train.loc[regime_mask]
+        if x_regime.empty:
+            x_regime = x_train
+            y_regime = y_train
+        model = model_factory()
+        model.fit(x_regime, y_regime)
+        regime_models[regime_name] = model
+    return regime_models
+
+
+class RegimeEnsembleRegressor(BaseEstimator, RegressorMixin):
+    """Train separate low/mid/high models and blend them near regime boundaries."""
+
+    def __init__(
+        self,
+        *,
+        base_estimator: Any | None = None,
+        transition_width_mpa: float = DEFAULT_REGIME_BLEND_WIDTH_MPA,
+        regime_models: dict[str, Any] | None = None,
+        router_model: Any | None = None,
+    ) -> None:
+        self.base_estimator = base_estimator
+        self.transition_width_mpa = float(transition_width_mpa)
+        self.regime_models = regime_models
+        self.router_model = router_model
+
+    def fit(self, x_frame: pd.DataFrame, y_values: pd.Series) -> "RegimeEnsembleRegressor":
+        if self.base_estimator is None:
+            raise ValueError("RegimeEnsembleRegressor requires a base_estimator.")
+
+        self.router_model_ = clone(self.base_estimator)
+        self.router_model_.fit(x_frame, y_values)
+        self.regime_models_ = fit_regime_models(
+            x_frame,
+            y_values,
+            model_factory=lambda: clone(self.base_estimator),
+        )
+        feature_names = getattr(self.router_model_, "feature_names_in_", None)
+        if feature_names is not None:
+            self.feature_names_in_ = feature_names
+        feature_count = getattr(self.router_model_, "n_features_in_", None)
+        if feature_count is not None:
+            self.n_features_in_ = int(feature_count)
+        return self
+
+    def _fitted_router_model(self) -> Any:
+        if hasattr(self, "router_model_"):
+            return self.router_model_
+        if self.router_model is not None:
+            return self.router_model
+        raise AttributeError("RegimeEnsembleRegressor is not fitted.")
+
+    def _fitted_regime_models(self) -> dict[str, Any]:
+        if hasattr(self, "regime_models_"):
+            return self.regime_models_
+        if self.regime_models:
+            return self.regime_models
+        raise AttributeError("RegimeEnsembleRegressor is not fitted.")
+
+    def predict_hard(
+        self,
+        x_frame: pd.DataFrame,
+        *,
+        base_predictions: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Predict by hard-routing each sample to a single regime model."""
+        router_predictions = (
+            np.asarray(base_predictions, dtype=float)
+            if base_predictions is not None
+            else np.asarray(self._fitted_router_model().predict(x_frame), dtype=float)
+        )
+        regime_predictions = {
+            regime_name: np.asarray(model.predict(x_frame), dtype=float)
+            for regime_name, model in self._fitted_regime_models().items()
+        }
+        hard_predictions = np.empty(len(x_frame), dtype=float)
+        for index, routing_prediction in enumerate(router_predictions):
+            regime_name = identify_strength_regime(float(routing_prediction))
+            hard_predictions[index] = float(regime_predictions[regime_name][index])
+        return hard_predictions
+
+    def predict(
+        self,
+        x_frame: pd.DataFrame,
+        *,
+        base_predictions: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Predict with soft blending near the 25 MPa and 60 MPa regime boundaries."""
+        router_predictions = (
+            np.asarray(base_predictions, dtype=float)
+            if base_predictions is not None
+            else np.asarray(self._fitted_router_model().predict(x_frame), dtype=float)
+        )
+        weights = build_regime_blend_weights(
+            router_predictions,
+            transition_width_mpa=self.transition_width_mpa,
+        )
+        regime_predictions = {
+            regime_name: np.asarray(model.predict(x_frame), dtype=float)
+            for regime_name, model in self._fitted_regime_models().items()
+        }
+        blended = np.zeros(len(x_frame), dtype=float)
+        for index, row_weights in enumerate(weights):
+            blended[index] = float(
+                sum(row_weights.get(regime_name, 0.0) * regime_predictions[regime_name][index] for regime_name in REGIME_NAMES)
+            )
+        return blended
+
+
+def maybe_wrap_with_regime_modeling(model: Any, config: dict[str, Any]) -> Any:
+    """Wrap a base estimator with regime-specific routing when enabled."""
+    if isinstance(model, RegimeEnsembleRegressor):
+        return model
+    if not regime_modeling_enabled(config):
+        return model
+    return RegimeEnsembleRegressor(
+        base_estimator=model,
+        transition_width_mpa=regime_transition_width_mpa(config),
+    )
 
 
 def load_config() -> dict[str, Any]:
@@ -428,41 +632,36 @@ def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str,
     """Create a model instance for the requested family and parameters."""
     seed = int(config["experiment"]["random_seed"])
     clean_params = dict(params)
+    model: Any
 
     if model_name == "LinearRegression":
-        return Pipeline(
+        model = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
                 ("model", LinearRegression(**clean_params)),
             ]
         )
-
-    if model_name == "RandomForestRegressor":
+    elif model_name == "RandomForestRegressor":
         default_params = {"random_state": seed, "n_jobs": -1}
         default_params.update(clean_params)
-        return RandomForestRegressor(**default_params)
-
-    if model_name == "ExtraTreesRegressor":
+        model = RandomForestRegressor(**default_params)
+    elif model_name == "ExtraTreesRegressor":
         default_params = {"random_state": seed, "n_jobs": -1}
         default_params.update(clean_params)
-        return ExtraTreesRegressor(**default_params)
-
-    if model_name == "DecisionTreeRegressor":
+        model = ExtraTreesRegressor(**default_params)
+    elif model_name == "DecisionTreeRegressor":
         default_params = {"random_state": seed}
         default_params.update(clean_params)
-        return DecisionTreeRegressor(**default_params)
-
-    if model_name == "GradientBoostingRegressor":
+        model = DecisionTreeRegressor(**default_params)
+    elif model_name == "GradientBoostingRegressor":
         default_params = {"random_state": seed}
         default_params.update(clean_params)
-        return GradientBoostingRegressor(**default_params)
-
-    if model_name == "HistGradientBoostingRegressor":
+        model = GradientBoostingRegressor(**default_params)
+    elif model_name == "HistGradientBoostingRegressor":
         default_params = {"random_state": seed}
         default_params.update(clean_params)
-        return HistGradientBoostingRegressor(**default_params)
-
-    if model_name == "XGBRegressor":
+        model = HistGradientBoostingRegressor(**default_params)
+    elif model_name == "XGBRegressor":
         if XGBRegressor is None:
             raise ImportError("xgboost is not installed. Install requirements.txt before running search.")
         default_params = {
@@ -472,9 +671,8 @@ def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str,
             "verbosity": 0,
         }
         default_params.update(clean_params)
-        return XGBRegressor(**default_params)
-
-    if model_name == "LGBMRegressor":
+        model = XGBRegressor(**default_params)
+    elif model_name == "LGBMRegressor":
         if LGBMRegressor is None:
             raise ImportError("lightgbm is not installed. Install requirements.txt before running search.")
         default_params = {
@@ -483,9 +681,8 @@ def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str,
             "verbosity": -1,
         }
         default_params.update(clean_params)
-        return LGBMRegressor(**default_params)
-
-    if model_name == "CatBoostRegressor":
+        model = LGBMRegressor(**default_params)
+    elif model_name == "CatBoostRegressor":
         if CatBoostRegressor is None:
             raise ImportError("catboost is not installed. Install requirements.txt before running benchmark.")
         default_params = {
@@ -495,48 +692,45 @@ def instantiate_model(model_name: str, params: dict[str, Any], config: dict[str,
             "allow_writing_files": False,
         }
         default_params.update(clean_params)
-        return CatBoostRegressor(**default_params)
-
-    if model_name == "SVR":
-        return Pipeline(
+        model = CatBoostRegressor(**default_params)
+    elif model_name == "SVR":
+        model = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
                 ("model", SVR(**clean_params)),
             ]
         )
-
-    if model_name == "Ridge":
+    elif model_name == "Ridge":
         ridge_params = {"random_state": seed}
         ridge_params.update(clean_params)
-        return Pipeline(
+        model = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
                 ("model", Ridge(**ridge_params)),
             ]
         )
-
-    if model_name == "ElasticNet":
+    elif model_name == "ElasticNet":
         elastic_net_params = {
             "random_state": seed,
             "max_iter": 20000,
         }
         elastic_net_params.update(clean_params)
-        return Pipeline(
+        model = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
                 ("model", ElasticNet(**elastic_net_params)),
             ]
         )
-
-    if model_name == "KNeighborsRegressor":
-        return Pipeline(
+    elif model_name == "KNeighborsRegressor":
+        model = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
                 ("model", KNeighborsRegressor(**clean_params)),
             ]
         )
-
-    raise ValueError(f"Unsupported model family: {model_name}")
+    else:
+        raise ValueError(f"Unsupported model family: {model_name}")
+    return maybe_wrap_with_regime_modeling(model, config)
 
 
 def evaluate_candidate(
@@ -628,11 +822,18 @@ def build_stacking_ensemble(
     if not configs:
         raise ValueError("At least one base-model configuration is required to build a stacking ensemble.")
 
+    stacking_base_config = dict(config)
+    engineering_config = dict(config.get("engineering", {}))
+    regime_config = dict(engineering_config.get("regime_modeling", {}))
+    regime_config["enabled"] = False
+    engineering_config["regime_modeling"] = regime_config
+    stacking_base_config["engineering"] = engineering_config
+
     estimators: list[tuple[str, Any]] = []
     base_model_specs: list[dict[str, Any]] = []
     for index, (model_name, hyperparams) in enumerate(configs, start=1):
         estimator_name = f"{model_name.lower()}_{index}"
-        estimators.append((estimator_name, instantiate_model(model_name, hyperparams, config)))
+        estimators.append((estimator_name, instantiate_model(model_name, hyperparams, stacking_base_config)))
         base_model_specs.append(
             {
                 "model_name": model_name,
@@ -648,6 +849,7 @@ def build_stacking_ensemble(
         cv=build_cv_splitter(config),
         n_jobs=-1,
     )
+    stacking_model = maybe_wrap_with_regime_modeling(stacking_model, config)
 
     cv_splitter = build_cv_splitter(config, n_splits=5, repeats=1, random_state=42)
     cv_r2 = float(np.mean(cross_val_score(stacking_model, x_train, y_train, cv=cv_splitter, scoring="r2")))

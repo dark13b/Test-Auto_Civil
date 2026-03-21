@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -73,9 +73,12 @@ class SearchTests(unittest.TestCase):
                     },
                 ),
             ), patch("search.save_pickle_artifact") as save_pickle_mock, patch(
-                "search.append_optuna_trial_record"
-            ), patch("search.append_research_log"), patch("search.log_status"):
+                "search.append_research_log"
+            ), patch("search.log_status"), patch(
+                "uncertainty.recalibrate_uncertainty_artifacts"
+            ) as recalibrate_mock:
                 save_pickle_mock.return_value = {"artifact_id": "ensemble-model-artifact"}
+                sync_writer = Mock()
                 result = build_post_search_ensemble(
                     outputs_dir=outputs_dir,
                     config=config,
@@ -85,10 +88,13 @@ class SearchTests(unittest.TestCase):
                     x_val=pd.DataFrame({"cement": [3.0, 4.0]}),
                     y_val=pd.Series([6.0, 8.0]),
                     validator=object(),
+                    sync_writer=sync_writer,
                 )
 
         self.assertEqual(result["status"], "new_best")
         save_pickle_mock.assert_called_once()
+        sync_writer.record_new_best.assert_called_once()
+        recalibrate_mock.assert_called_once()
 
     def test_finalize_search_artifacts_rewrites_current_ensemble_metrics_for_ensemble_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

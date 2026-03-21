@@ -113,6 +113,9 @@ validator:
 engineering:
   feature_engineering: true
   uncertainty_method: conformal  # options: conformal, quantile, both
+  regime_modeling:
+    enabled: true
+    transition_width_mpa: 2.0
   binder_efficiency:
     # Semi-empirical defaults for this repository. These are configurable and
     # should be treated as dataset-calibrated priors, not universal constants.

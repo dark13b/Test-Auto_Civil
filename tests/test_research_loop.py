@@ -2,14 +2,20 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
 import research_loop
 from proposal_engine import ProposalEngine
-from research_loop import _initialize_research_log, _initialize_results_csv, _select_scout_candidates
+from research_loop import (
+    _append_synchronized_results,
+    _initialize_research_log,
+    _initialize_results_csv,
+    _select_scout_candidates,
+)
 
 
 class StubProposalEngine:
@@ -47,6 +53,26 @@ class AmbiguousBackend:
 
 
 class ResearchLoopPersistenceTests(unittest.TestCase):
+    def test_append_synchronized_results_writes_one_aligned_row_to_both_csvs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            writer = research_loop._build_results_sync_writer(outputs_dir)
+            record = {
+                "trial_number": 5,
+                "experiment_id": "confirm-005",
+                "selection_status": "kept",
+            }
+
+            _append_synchronized_results(writer, record)
+            _append_synchronized_results(writer, record)
+
+            results_rows = pd.read_csv(outputs_dir / research_loop.RESEARCH_RESULTS_FILENAME)
+            compat_rows = pd.read_csv(outputs_dir / "optuna_results.csv")
+
+        self.assertEqual(len(results_rows), 1)
+        self.assertTrue(results_rows.equals(compat_rows))
+        self.assertEqual(str(results_rows.loc[0, "experiment_id"]), "confirm-005")
+
     def test_initialize_results_csv_preserves_existing_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "research_results.csv"
@@ -274,61 +300,97 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 },
             }
 
-            with (
-                patch.object(research_loop, "load_config", return_value=config),
-                patch.object(research_loop, "get_outputs_dir", return_value=outputs_dir),
-                patch.object(research_loop, "set_global_seed"),
-                patch.object(research_loop, "_read_baseline_metrics", return_value=baseline_metrics),
-                patch.object(research_loop, "load_human_research_brief", return_value={
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(research_loop, "load_config", return_value=config))
+                stack.enter_context(patch.object(research_loop, "get_outputs_dir", return_value=outputs_dir))
+                stack.enter_context(patch.object(research_loop, "set_global_seed"))
+                stack.enter_context(patch.object(research_loop, "_read_baseline_metrics", return_value=baseline_metrics))
+                stack.enter_context(patch.object(research_loop, "load_human_research_brief", return_value={
                     "goal": "Improve composite_score",
                     "acceptance_metric": "composite_score",
                     "min_improvement_pct": 0.0,
                     "required_model_families": [],
                     "scout_candidates_per_cycle": 1,
                     "confirm_top_k": 1,
-                }),
-                patch.object(research_loop, "get_available_model_configs", return_value=available_models),
-                patch.object(research_loop, "load_dataset", return_value="dataset"),
-                patch.object(
-                    research_loop,
-                    "split_dataset",
-                    return_value=("x_train", "x_val", "x_test", "y_train", "y_val", "y_test"),
-                ),
-                patch.object(research_loop.EngineeringValidator, "from_config", return_value=object()),
-                patch.object(research_loop, "read_research_surface_state", return_value={"accepted_experiments": []}),
-                patch.object(research_loop, "_build_proposal_engine", return_value=StubProposalEngine([
-                    {
-                        "model_name": "ModelFamilyA",
-                        "display_name": "Model A",
-                        "proposal_family": "llm-family-a",
-                        "hypothesis": "Try a slightly deeper model.",
-                        "params": {"depth": 3},
-                    }
-                ])),
-                patch.object(research_loop, "_evaluate_stage_candidate", side_effect=[(object(), scout_result), (object(), confirm_result)]),
-                patch.object(research_loop.research_lab, "confirm_experiments", return_value=[
-                    {
-                        "experiment_id": "confirm-001",
-                        "stage": "confirm",
-                        "model_name": "ModelFamilyA",
-                        "display_name": "Model A",
-                        "proposal_family": "llm-family-a",
-                        "hypothesis": "Confirm the deeper model.",
-                        "params": {"depth": 3},
-                    }
-                ]),
-                patch.object(research_loop, "_evaluate_reference_if_possible", return_value=baseline_metrics),
-                patch.object(research_loop, "save_pickle_artifact", side_effect=fake_save_pickle_artifact),
-                patch.object(research_loop, "_sync_final_artifacts_from_source_of_truth", side_effect=fake_sync_final_artifacts_from_source_of_truth),
-                patch.object(research_loop, "apply_keep_to_research_surface"),
-                patch.object(research_loop, "validate_final_artifact_consistency", return_value={"consistent": True, "mismatches": []}),
-                patch.object(research_loop, "log_status"),
-            ):
+                }))
+                stack.enter_context(patch.object(research_loop, "get_available_model_configs", return_value=available_models))
+                stack.enter_context(patch.object(research_loop, "load_dataset", return_value="dataset"))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "split_dataset",
+                        return_value=("x_train", "x_val", "x_test", "y_train", "y_val", "y_test"),
+                    )
+                )
+                stack.enter_context(patch.object(research_loop.EngineeringValidator, "from_config", return_value=object()))
+                stack.enter_context(
+                    patch.object(research_loop, "read_research_surface_state", return_value={"accepted_experiments": []})
+                )
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "_build_proposal_engine",
+                        return_value=StubProposalEngine([
+                            {
+                                "model_name": "ModelFamilyA",
+                                "display_name": "Model A",
+                                "proposal_family": "llm-family-a",
+                                "hypothesis": "Try a slightly deeper model.",
+                                "params": {"depth": 3},
+                            }
+                        ]),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "_evaluate_stage_candidate",
+                        side_effect=[(object(), scout_result), (object(), confirm_result)],
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        research_loop.research_lab,
+                        "confirm_experiments",
+                        return_value=[
+                            {
+                                "experiment_id": "confirm-001",
+                                "stage": "confirm",
+                                "model_name": "ModelFamilyA",
+                                "display_name": "Model A",
+                                "proposal_family": "llm-family-a",
+                                "hypothesis": "Confirm the deeper model.",
+                                "params": {"depth": 3},
+                            }
+                        ],
+                    )
+                )
+                stack.enter_context(patch.object(research_loop, "_evaluate_reference_if_possible", return_value=baseline_metrics))
+                stack.enter_context(patch.object(research_loop, "save_pickle_artifact", side_effect=fake_save_pickle_artifact))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "_sync_final_artifacts_from_source_of_truth",
+                        side_effect=fake_sync_final_artifacts_from_source_of_truth,
+                    )
+                )
+                stack.enter_context(patch.object(research_loop, "apply_keep_to_research_surface"))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "validate_final_artifact_consistency",
+                        return_value={"consistent": True, "mismatches": []},
+                    )
+                )
+                stack.enter_context(patch.object(research_loop, "_build_results_sync_writer", return_value=Mock()))
+                stack.enter_context(patch.object(research_loop, "log_status"))
+                recalibrate_mock = stack.enter_context(patch("uncertainty.recalibrate_uncertainty_artifacts"))
                 best_result = research_loop.run_engineering_research_loop(cycles_override=1, with_report=False)
 
             final_metrics = json.loads((outputs_dir / research_loop.FINAL_METRICS_FILENAME).read_text(encoding="utf-8"))
             self.assertEqual(best_result["composite_score"], 0.86)
             self.assertEqual(final_metrics["best_search_metrics"]["composite_score"], 0.86)
+            recalibrate_mock.assert_called_once()
 
     def test_validate_only_path_still_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

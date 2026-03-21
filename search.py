@@ -16,6 +16,7 @@ from typing import Any
 import optuna
 import pandas as pd
 
+from artifact_sync import AtomicArtifactWriter, repair_on_startup as repair_synced_artifacts_on_startup
 from llm_backend import get_llm_config
 from research_protocol import (
     build_acceptance_decision,
@@ -476,6 +477,15 @@ def append_optuna_trial_record(csv_path: Path, record: dict[str, Any]) -> None:
         mode="a",
         header=not csv_path.exists() or csv_path.stat().st_size == 0,
         index=False,
+    )
+
+
+def build_search_sync_writer(outputs_dir: Path) -> AtomicArtifactWriter:
+    """Create the synchronized writer used by the search loop."""
+    return AtomicArtifactWriter(
+        outputs_dir=outputs_dir,
+        csv_targets=[("optuna_results.csv", OPTUNA_RESULTS_COLUMNS)],
+        best_result_filename=SEARCH_STATE_BEST_RESULT_FILENAME,
     )
 
 
@@ -1026,6 +1036,7 @@ def build_post_search_ensemble(
     x_val: pd.DataFrame,
     y_val: pd.Series,
     validator: EngineeringValidator,
+    sync_writer: AtomicArtifactWriter | None = None,
 ) -> dict[str, Any]:
     """Build and evaluate a stacking ensemble from the best unique model families in the Optuna CSV."""
     ensemble_metrics_path = outputs_dir / "ensemble_metrics.json"
@@ -1231,17 +1242,6 @@ def build_post_search_ensemble(
             model_id="StackingRegressor",
             parent_artifact_ids=[artifact_id(current_best_result)] if artifact_id(current_best_result) else [],
         )
-        write_run_scoped_json_artifact(
-            outputs_dir=outputs_dir,
-            filename=SEARCH_STATE_BEST_RESULT_FILENAME,
-            payload=ensemble_result,
-            run_id=run_id,
-            source_mode="ensemble",
-            config=config,
-            model_artifact_id=ensemble_model_metadata["artifact_id"],
-            model_id="StackingRegressor",
-        )
-
         ensemble_record = build_trial_record(
             next_trial_number,
             "StackingRegressor",
@@ -1250,7 +1250,8 @@ def build_post_search_ensemble(
             ensemble_result,
             "new_best",
         )
-        append_optuna_trial_record(optuna_results_path, ensemble_record)
+        active_sync_writer = sync_writer or build_search_sync_writer(outputs_dir)
+        active_sync_writer.record_new_best(trial_record=ensemble_record, best_result=ensemble_result)
 
         research_log_path = outputs_dir / "research_log.txt"
         timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
@@ -1267,12 +1268,19 @@ def build_post_search_ensemble(
         log_status(
             f"INFO ensemble_beats_best_cv_r2 | ensemble={ensemble_score:.4f} | previous_best={previous_best_score:.4f}"
         )
+        mark_json_artifact_stale(
+            outputs_dir / FINAL_METRICS_FILENAME,
+            active_run_id=run_id,
+            reason="new best ensemble saved before final report refresh",
+        )
         try:
             from uncertainty import recalibrate_uncertainty_artifacts
 
             recalibrate_uncertainty_artifacts(
                 model_path=outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
                 method=str(config["engineering"]["uncertainty_method"]),
+                outputs_dir=outputs_dir,
+                audit_partition="validation_audit",
             )
         except Exception as recalibration_exc:
             log_status(f"WARNING uncertainty_recalibration_failed | trial={next_trial_number} | {recalibration_exc}")
@@ -1298,6 +1306,11 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
         config = load_config()
     set_global_seed(int(config["experiment"]["random_seed"]))
     outputs_dir = get_outputs_dir(config)
+    repair_synced_artifacts_on_startup(
+        outputs_dir,
+        csv_targets=[("optuna_results.csv", OPTUNA_RESULTS_COLUMNS)],
+        best_result_filename=SEARCH_STATE_BEST_RESULT_FILENAME,
+    )
     project_root = Path(__file__).resolve().parent
     brief_relative_path = str(config.get("search", {}).get("research_brief_path", "program.md"))
     brief_path = project_root / brief_relative_path
@@ -1349,6 +1362,7 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
     initialize_research_log(research_log_path, baseline_metrics)
     optuna_results_path = outputs_dir / "optuna_results.csv"
     initialize_optuna_results_csv(optuna_results_path)
+    sync_writer = build_search_sync_writer(outputs_dir)
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize", study_name="autocivil_search")
@@ -1638,7 +1652,7 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
                     budget_status=budget_state,
                 )
                 trial_records.append(trial_record)
-                append_optuna_trial_record(optuna_results_path, trial_record)
+                sync_writer.append_trial(trial_record)
                 record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
                 timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                 append_research_log(
@@ -1664,7 +1678,7 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
                     budget_status=budget_state,
                 )
                 trial_records.append(trial_record)
-                append_optuna_trial_record(optuna_results_path, trial_record)
+                sync_writer.append_trial(trial_record)
                 record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
                 timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                 append_research_log(
@@ -1709,12 +1723,19 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
                         model_artifact_id=best_model_metadata["artifact_id"],
                         model_id=model_name,
                     )
+                    mark_json_artifact_stale(
+                        outputs_dir / FINAL_METRICS_FILENAME,
+                        active_run_id=run_id,
+                        reason="new best search-state model saved before final report refresh",
+                    )
                     try:
                         from uncertainty import recalibrate_uncertainty_artifacts
 
                         recalibrate_uncertainty_artifacts(
                             model_path=outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
                             method=str(config["engineering"]["uncertainty_method"]),
+                            outputs_dir=outputs_dir,
+                            audit_partition="validation_audit",
                         )
                     except Exception as recalibration_exc:
                         log_status(
@@ -1733,7 +1754,10 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
                     budget_status=budget_state,
                 )
                 trial_records.append(trial_record)
-                append_optuna_trial_record(optuna_results_path, trial_record)
+                if improved:
+                    sync_writer.record_new_best(trial_record=trial_record, best_result=best_result)
+                else:
+                    sync_writer.append_trial(trial_record)
                 record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
                 timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                 status_label = "New best" if improved else "No improvement"
@@ -1767,7 +1791,7 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
                 budget_status=budget_state,
             )
             trial_records.append(trial_record)
-            append_optuna_trial_record(optuna_results_path, trial_record)
+            sync_writer.append_trial(trial_record)
             record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
             timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
             append_research_log(
@@ -1809,6 +1833,7 @@ def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> d
             x_val,
             y_val,
             validator,
+            sync_writer=sync_writer,
         )
     final_best_result = finalize_search_artifacts(outputs_dir, baseline_metrics, config=config, run_id=run_id)
     acceptance = write_final_acceptance_artifact(outputs_dir, brief, config=config, run_id=run_id)

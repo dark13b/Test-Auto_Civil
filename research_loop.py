@@ -12,6 +12,7 @@ from typing import Any
 
 import pandas as pd
 
+from artifact_sync import AtomicArtifactWriter
 import research_lab
 from llm_backend import get_llm_config, resolve_backend
 from proposal_engine import ProposalEngine, ProposalExtractionError
@@ -84,6 +85,20 @@ def _append_results_row(path: Path, record: dict[str, Any]) -> None:
         header=not path.exists() or path.stat().st_size == 0,
         index=False,
     )
+
+
+def _build_results_sync_writer(outputs_dir: Path) -> AtomicArtifactWriter:
+    return AtomicArtifactWriter(
+        outputs_dir=outputs_dir,
+        csv_targets=[
+            (RESEARCH_RESULTS_FILENAME, RESEARCH_RESULTS_COLUMNS),
+            ("optuna_results.csv", RESEARCH_RESULTS_COLUMNS),
+        ],
+    )
+
+
+def _append_synchronized_results(sync_writer: AtomicArtifactWriter, record: dict[str, Any]) -> None:
+    sync_writer.append_trial(record)
 
 
 def _initialize_research_log(path: Path, baseline_metrics: dict[str, Any]) -> None:
@@ -544,6 +559,7 @@ def run_engineering_research_loop(
     memory_payload = load_or_initialize_experiment_memory(memory_path)
     _initialize_results_csv(results_path)
     _initialize_results_csv(compatibility_results_path)
+    results_sync_writer = _build_results_sync_writer(outputs_dir)
     _initialize_research_log(log_path, baseline_metrics)
 
     run_id = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
@@ -660,8 +676,7 @@ def run_engineering_research_loop(
                     scout_improvement_pct=scout_improvement_pct,
                     confirm_improvement_pct=None,
                 )
-                _append_results_row(results_path, record)
-                _append_results_row(compatibility_results_path, record)
+                _append_synchronized_results(results_sync_writer, record)
                 record_experiment_memory(memory_path, run_id, record)
                 timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                 _append_research_log(
@@ -689,8 +704,7 @@ def run_engineering_research_loop(
                     scout_improvement_pct=None,
                     confirm_improvement_pct=None,
                 )
-                _append_results_row(results_path, record)
-                _append_results_row(compatibility_results_path, record)
+                _append_synchronized_results(results_sync_writer, record)
                 record_experiment_memory(memory_path, run_id, record)
 
         confirm_candidates = research_lab.confirm_experiments(
@@ -778,14 +792,17 @@ def run_engineering_research_loop(
                             "confirm_improvement_pct": confirm_improvement_pct,
                         },
                     )
+                    from uncertainty import recalibrate_uncertainty_artifacts
+
+                    recalibrate_uncertainty_artifacts(
+                        model_path=outputs_dir / BEST_MODEL_FILENAME,
+                        method=str(config["engineering"]["uncertainty_method"]),
+                        outputs_dir=outputs_dir,
+                        audit_partition="validation_audit",
+                    )
                     if rebuild_reports_on_keep:
-                        from uncertainty import recalibrate_uncertainty_artifacts
                         import report
 
-                        recalibrate_uncertainty_artifacts(
-                            model_path=outputs_dir / BEST_MODEL_FILENAME,
-                            method=str(config["engineering"]["uncertainty_method"]),
-                        )
                         if report.main() != 0:
                             raise RuntimeError("Report generation failed after a kept confirm experiment.")
                         validation_report = validate_final_artifact_consistency(outputs_dir)
@@ -808,8 +825,7 @@ def run_engineering_research_loop(
                     scout_improvement_pct=None,
                     confirm_improvement_pct=confirm_improvement_pct,
                 )
-                _append_results_row(results_path, record)
-                _append_results_row(compatibility_results_path, record)
+                _append_synchronized_results(results_sync_writer, record)
                 record_experiment_memory(memory_path, run_id, record)
                 timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                 _append_research_log(
@@ -837,8 +853,7 @@ def run_engineering_research_loop(
                     scout_improvement_pct=None,
                     confirm_improvement_pct=None,
                 )
-                _append_results_row(results_path, record)
-                _append_results_row(compatibility_results_path, record)
+                _append_synchronized_results(results_sync_writer, record)
                 record_experiment_memory(memory_path, run_id, record)
 
         memory_payload = load_or_initialize_experiment_memory(memory_path)
@@ -868,6 +883,8 @@ def run_engineering_research_loop(
         recalibrate_uncertainty_artifacts(
             model_path=outputs_dir / BEST_MODEL_FILENAME,
             method=str(config["engineering"]["uncertainty_method"]),
+            outputs_dir=outputs_dir,
+            audit_partition="validation_audit",
         )
         if report.main() != 0:
             raise RuntimeError("Report generation failed at end of research loop.")

@@ -25,14 +25,18 @@ class _RecordingModel:
 
 
 class _FakeUncertaintyEstimator:
+    last_kwargs: dict | None = None
+
     def __init__(self, *_args, **_kwargs) -> None:
-        pass
+        type(self).last_kwargs = dict(_kwargs)
 
     def calibration_report(self) -> dict:
         return {
             "coverage": 0.93,
             "coverage_target": 0.90,
-            "coverage_audit": {"expected_partition": "validation"},
+            "coverage_audit": {"expected_partition": "holdout", "partitions_disjoint": True},
+            "audit_partition": "holdout",
+            "audit_sample_count": 3,
             "reliability_plot_data": [
                 {"bin_id": 0, "observed_coverage": 0.95},
                 {"bin_id": 1, "observed_coverage": 0.90},
@@ -179,6 +183,11 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(final_metrics["holdout_metrics"]["r2"], 0.8)
         self.assertEqual(final_metrics["holdout_metrics"]["composite_score"], 0.84)
         self.assertEqual(final_metrics["best_model_name"], "Ridge")
+        self.assertEqual(_FakeUncertaintyEstimator.last_kwargs["audit_partition"], "holdout")
+        self.assertEqual(final_metrics["uncertainty_summary"]["coverage_audit"]["expected_partition"], "holdout")
+        self.assertIn("regime_specific_modeling", final_metrics)
+        self.assertIn("structured_metrics_summary", final_metrics["regime_specific_modeling"])
+        self.assertIn("pass_fail", final_metrics["regime_specific_modeling"])
 
     def test_report_context_blocks_second_holdout_use(self) -> None:
         report.REPORT_CONTEXT = SimpleNamespace(_test_set_used_in_report=True)

@@ -473,6 +473,11 @@ class EngineeringValidator:
         age_days = _safe_float(sample.get("age"))
         superplasticizer = _safe_float(sample.get("superplasticizer"))
         target_strength = _safe_float(sample.get("target_strength"))
+        structural_application = sample.get("structural_application")
+        if structural_application in ("", None):
+            structural_application = None
+        elif isinstance(structural_application, str):
+            structural_application = structural_application.strip().lower().replace(" ", "_")
 
         age_regime_code, age_regime_label = self._age_regime(age_days)
         scm_regime_code, scm_regime_label = self._scm_regime(
@@ -505,6 +510,7 @@ class EngineeringValidator:
             "superplasticizer_binder_ratio": superplasticizer_binder_ratio,
             "age_days": age_days,
             "target_strength": target_strength,
+            "structural_application": structural_application,
             "age_regime_code": age_regime_code,
             "age_regime_label": age_regime_label,
             "scm_regime_code": scm_regime_code,
@@ -566,6 +572,8 @@ class EngineeringValidator:
             context["age_regime_label"],
             f"durability context={context['exposure_context']['label']}",
         ]
+        if context.get("structural_application"):
+            summary_parts.append(f"application={context['structural_application']}")
         if hard_constraints:
             summary_parts.append(f"{len(hard_constraints)} hard constraint(s)")
         if engineering_cautions:
@@ -1239,6 +1247,7 @@ class EngineeringValidator:
             "age_days": context["age_days"],
             "target_strength": context["target_strength"],
             "exposure_class": context["exposure_context"]["label"],
+            "structural_application": context.get("structural_application"),
             "workability_support": context["workability_support"]["status"],
             "hard_fails": hard_constraints,
             "engineering_warnings": engineering_cautions,

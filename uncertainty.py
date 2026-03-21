@@ -56,6 +56,7 @@ class UncertaintyEstimator:
         outputs_dir: str | Path | None = None,
         report_filename: str = "uncertainty_calibration.json",
         refit_model: bool = False,
+        audit_partition: str = "validation_audit",
     ) -> None:
         """Load configuration, data, and interval estimators."""
         self.project_root = get_project_root()
@@ -67,6 +68,7 @@ class UncertaintyEstimator:
             method or self.config.get("engineering", {}).get("uncertainty_method", "conformal")
         ).strip().lower()
         self.report_filename = str(report_filename)
+        self.audit_partition = str(audit_partition).strip().lower()
         self.seed = int(self.config["experiment"]["random_seed"])
         self.coverage_level = max(0.92, float(self.config["uncertainty"]["coverage_level"]))
         self.base_columns = get_base_input_columns(self.config)
@@ -88,6 +90,8 @@ class UncertaintyEstimator:
             raise ValueError(
                 "engineering.uncertainty_method must be one of: conformal, quantile, both."
             )
+        if self.audit_partition not in {"validation_audit", "holdout"}:
+            raise ValueError("audit_partition must be one of: validation_audit, holdout.")
         if refit_model:
             raise ValueError("UncertaintyEstimator does not support refitting the model.")
         if model is None and not self.model_path.exists():
@@ -112,27 +116,75 @@ class UncertaintyEstimator:
             "Uncertainty model and report model must be the same fitted object."
         )
         dataset = load_dataset(self.config)
-        self.x_train, x_val_full, _, self.y_train, y_val_full, _ = split_dataset(
+        self.x_train, x_val_full, x_test_full, self.y_train, y_val_full, y_test_full = split_dataset(
             dataset,
             self.config,
         )
         self.x_train = self.x_train[self.feature_columns].copy()
-
-        # Split x_val into calibration (70%) and coverage audit (30%).
-        # The calibration subset fits the conformal quantile.
-        # The audit subset evaluates empirical coverage on unseen data.
-        from sklearn.model_selection import train_test_split as _tts
-        _cal_size = int(len(x_val_full) * 0.70)
-        x_cal_raw   = x_val_full.iloc[:_cal_size]
-        x_audit_raw = x_val_full.iloc[_cal_size:]
-        y_cal_raw   = y_val_full.iloc[:_cal_size]
-        y_audit_raw = y_val_full.iloc[_cal_size:]
-
-        self.x_calibration = x_cal_raw[self.feature_columns].copy()
-        self.y_calibration = y_cal_raw.copy()
-        self.x_validation  = x_audit_raw[self.feature_columns].copy()
-        self.y_validation  = y_audit_raw.copy()
+        self.x_calibration, self.y_calibration, self.x_audit, self.y_audit = self._build_audit_partitions(
+            x_val_full=x_val_full,
+            y_val_full=y_val_full,
+            x_test_full=x_test_full,
+            y_test_full=y_test_full,
+        )
+        self.x_validation = self.x_audit
+        self.y_validation = self.y_audit
+        calibration_index = set(self.x_calibration.index.tolist())
+        audit_index = set(self.x_audit.index.tolist())
+        self.partitions_disjoint = calibration_index.isdisjoint(audit_index)
+        if not self.partitions_disjoint:
+            raise RuntimeError(
+                "Calibration and audit partitions overlap. Conformal coverage would be optimistic."
+            )
+        if self.x_calibration.empty:
+            raise RuntimeError("Calibration partition is empty; cannot fit conformal quantiles.")
+        if self.x_audit.empty:
+            raise RuntimeError("Audit partition is empty; cannot evaluate conformal coverage.")
         self._fit_estimators()
+
+    def _build_audit_partitions(
+        self,
+        *,
+        x_val_full: pd.DataFrame,
+        y_val_full: pd.Series,
+        x_test_full: pd.DataFrame,
+        y_test_full: pd.Series,
+    ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+        if self.audit_partition == "holdout":
+            return (
+                self._tag_partition_frame(x_val_full[self.feature_columns].copy(), "calibration"),
+                self._tag_partition_series(y_val_full.copy(), "calibration"),
+                self._tag_partition_frame(x_test_full[self.feature_columns].copy(), "audit_holdout"),
+                self._tag_partition_series(y_test_full.copy(), "audit_holdout"),
+            )
+
+        from sklearn.model_selection import train_test_split
+
+        x_cal_raw, x_audit_raw, y_cal_raw, y_audit_raw = train_test_split(
+            x_val_full,
+            y_val_full,
+            test_size=0.30,
+            random_state=self.seed,
+            shuffle=True,
+        )
+        return (
+            self._tag_partition_frame(x_cal_raw[self.feature_columns].copy(), "calibration"),
+            self._tag_partition_series(y_cal_raw.copy(), "calibration"),
+            self._tag_partition_frame(x_audit_raw[self.feature_columns].copy(), "audit_validation"),
+            self._tag_partition_series(y_audit_raw.copy(), "audit_validation"),
+        )
+
+    @staticmethod
+    def _tag_partition_frame(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        tagged = frame.copy()
+        tagged.index = pd.Index([f"{prefix}:{index}" for index in frame.index], dtype="object")
+        return tagged
+
+    @staticmethod
+    def _tag_partition_series(series: pd.Series, prefix: str) -> pd.Series:
+        tagged = series.copy()
+        tagged.index = pd.Index([f"{prefix}:{index}" for index in series.index], dtype="object")
+        return tagged
 
     @staticmethod
     def _load_json_payload(path: Path) -> dict[str, Any]:
@@ -231,15 +283,16 @@ class UncertaintyEstimator:
                 ],
                 dtype=float,
             )
-            self.conformal_global_quantile = self._quantile(standardized_scores, quantile_level)
+            self.conformal_global_quantile = max(self._quantile(standardized_scores, quantile_level), 1.0)
             for bin_id in unique_bins:
                 bin_mask = calibration_bins == bin_id
                 bin_scores = nonconformity_scores[bin_mask]
                 bin_scale = float(self.conformal_bin_scales.get(int(bin_id), global_scale))
-                bin_width = float(self.conformal_global_quantile * bin_scale)
+                bin_width = float(max(self.conformal_global_quantile * bin_scale, 1e-6))
                 observed_coverage = float(np.mean(bin_scores <= bin_width)) if len(bin_scores) else float(self.coverage_level)
                 self.conformal_bin_quantiles[int(bin_id)] = bin_width
                 self.conformal_bin_calibration_coverage[int(bin_id)] = observed_coverage
+            self._enforce_monotonic_bin_scales()
 
         if self.method in {"quantile", "both"}:
             if LGBMRegressor is None:
@@ -306,6 +359,14 @@ class UncertaintyEstimator:
             center = float(array[0])
             clean_edges = np.asarray([center - 1e-6, center + 1e-6], dtype=float)
         return np.asarray(pd.Series(bin_codes).fillna(0), dtype=int), clean_edges
+
+    def _enforce_monotonic_bin_scales(self) -> None:
+        """Keep strength-bin scales from collapsing as predicted strength increases."""
+        running_scale = 0.0
+        for bin_id in sorted(self.conformal_bin_scales):
+            running_scale = max(running_scale, float(self.conformal_bin_scales[bin_id]))
+            self.conformal_bin_scales[bin_id] = running_scale
+            self.conformal_bin_quantiles[bin_id] = float((self.conformal_global_quantile or 1.0) * running_scale)
 
     def _assign_strength_bins(self, values: np.ndarray) -> np.ndarray:
         """Assign predicted strengths to the fitted calibration bins."""
@@ -454,17 +515,17 @@ class UncertaintyEstimator:
 
     def calibration_report(self) -> dict[str, Any]:
         """Calculate and save calibration statistics for the configured interval method."""
-        interval_frame = self.predict_with_interval(self.x_validation)
+        interval_frame = self.predict_with_interval(self.x_audit)
         covered = (
-            (self.y_validation.to_numpy(dtype=float) >= interval_frame["lower_90"].to_numpy(dtype=float))
-            & (self.y_validation.to_numpy(dtype=float) <= interval_frame["upper_90"].to_numpy(dtype=float))
+            (self.y_audit.to_numpy(dtype=float) >= interval_frame["lower_90"].to_numpy(dtype=float))
+            & (self.y_audit.to_numpy(dtype=float) <= interval_frame["upper_90"].to_numpy(dtype=float))
         )
         coverage = float(np.mean(covered))
         mean_interval_width = float(interval_frame["interval_width"].mean())
-        observed_bins, observed_bin_edges = self._build_strength_bins(np.asarray(self.y_validation, dtype=float))
+        observed_bins, observed_bin_edges = self._build_strength_bins(np.asarray(self.y_audit, dtype=float))
         reliability_frame = pd.DataFrame(
             {
-                "actual_strength": np.asarray(self.y_validation, dtype=float),
+                "actual_strength": np.asarray(self.y_audit, dtype=float),
                 "predicted": interval_frame["predicted"],
                 "interval_width": interval_frame["interval_width"],
                 "covered": covered.astype(float),
@@ -513,8 +574,10 @@ class UncertaintyEstimator:
             "mean_interval_width": mean_interval_width,
             "sharpness": mean_interval_width,
             "model_artifact_id": self.model_artifact_id,
+            "audit_partition": self.audit_partition,
             "calibration_sample_count": int(len(self.y_calibration)),
-            "validation_sample_count": int(len(self.y_validation)),
+            "validation_sample_count": int(len(self.y_audit)),
+            "audit_sample_count": int(len(self.y_audit)),
             "reliability_plot_data": grouped.to_dict(orient="records"),
             "coverage_by_strength_bin": grouped.to_dict(orient="records"),
             "strength_bin_audit": {
@@ -526,6 +589,8 @@ class UncertaintyEstimator:
                 ),
             },
             "coverage_audit": {
+                "expected_partition": self.audit_partition,
+                "partitions_disjoint": self.partitions_disjoint,
                 "global_status": audit_status,
                 "global_coverage_pass_threshold": 0.88,
                 "bin_coverage_pass_threshold": 0.80,
@@ -584,6 +649,7 @@ def recalibrate_uncertainty_artifacts(
     method: str | None = None,
     outputs_dir: str | Path | None = None,
     report_filename: str = "uncertainty_calibration.json",
+    audit_partition: str = "validation_audit",
 ) -> dict[str, Any]:
     """Recompute and save uncertainty calibration artifacts for the current best model."""
     estimator = UncertaintyEstimator(
@@ -592,6 +658,7 @@ def recalibrate_uncertainty_artifacts(
         method=method,
         outputs_dir=outputs_dir,
         report_filename=report_filename,
+        audit_partition=audit_partition,
     )
     return estimator.calibration_report()
 

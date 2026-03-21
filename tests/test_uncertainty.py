@@ -65,7 +65,11 @@ class UncertaintyTests(unittest.TestCase):
             build_target(x_test),
         )
 
-    def _build_estimator(self) -> tuple[UncertaintyEstimator, LinearRegression, pd.DataFrame, pd.Series]:
+    def _build_estimator(
+        self,
+        *,
+        audit_partition: str = "validation_audit",
+    ) -> tuple[UncertaintyEstimator, LinearRegression, pd.DataFrame, pd.Series]:
         config = make_config()
         x_train = pd.DataFrame({"cement": np.linspace(100, 180, 24), "water": np.linspace(160, 210, 24)})
         y_train = pd.Series(12 + (0.11 * x_train["cement"]) - (0.03 * x_train["water"]))
@@ -85,7 +89,12 @@ class UncertaintyTests(unittest.TestCase):
             "uncertainty.get_project_root",
             return_value=Path(tmpdir),
         ):
-            estimator = UncertaintyEstimator(model=model, report_model=model, outputs_dir=Path(tmpdir) / "outputs")
+            estimator = UncertaintyEstimator(
+                model=model,
+                report_model=model,
+                outputs_dir=Path(tmpdir) / "outputs",
+                audit_partition=audit_partition,
+            )
 
         return estimator, model, x_test, y_test
 
@@ -145,6 +154,25 @@ class UncertaintyTests(unittest.TestCase):
             val_idx.isdisjoint(cal_idx),
             "Coverage audit must use a partition disjoint from conformal calibration data."
         )
+
+    def test_holdout_audit_partition_is_disjoint_from_calibration_at_runtime(self) -> None:
+        estimator, _, _, y_test = self._build_estimator(audit_partition="holdout")
+
+        report = estimator.calibration_report()
+
+        self.assertEqual(report["audit_partition"], "holdout")
+        self.assertEqual(report["audit_sample_count"], len(y_test))
+        self.assertTrue(report["coverage_audit"]["partitions_disjoint"])
+        self.assertEqual(report["coverage_audit"]["expected_partition"], "holdout")
+
+    def test_holdout_audit_coverage_does_not_reuse_validation_rows(self) -> None:
+        estimator, _, _, _ = self._build_estimator(audit_partition="holdout")
+
+        cal_idx = set(estimator.x_calibration.index.tolist())
+        audit_idx = set(estimator.x_audit.index.tolist())
+
+        self.assertTrue(audit_idx.isdisjoint(cal_idx))
+        self.assertEqual(estimator.audit_partition, "holdout")
 
     def test_strength_dependent_scale_is_reported_for_intervals(self) -> None:
         estimator, _, x_test = self._build_heteroscedastic_estimator()
