@@ -186,7 +186,6 @@ class ProposalEngine:
             return []
 
         trial_history = trial_history or []
-        expected_array = max(1, int(proposal_count)) > 1
         resolved_model_hint = self._resolve_model_hint(model_hint)
         prompt_variant = resolve_prompt_variant(self.llm_config, resolved_model_hint)
         family_state = build_family_state_summary(
@@ -201,75 +200,90 @@ class ProposalEngine:
             max_attempts += max(0, int(self.llm_config.get("max_regeneration_attempts", 1)))
 
         seen_signatures: set[tuple[str, str]] = set()
-        for attempt_index in range(1, max_attempts + 1):
-            prompt = self._build_experiment_prompt(
-                available_models=available_models,
-                research_brief=research_brief,
-                current_best=current_best,
-                experiment_memory=experiment_memory,
-                diversity_state=diversity_state,
-                proposal_count=proposal_count,
-                trial_history=trial_history,
-                search_progress=search_progress or {},
-                family_state=family_state,
-                prompt_variant=prompt_variant,
-            )
-            schema = (
-                self._build_proposals_schema(available_models, proposal_count=max(1, int(proposal_count)))
-                if expected_array
-                else self._build_proposal_variant_schema(available_models)
-            )
-            interaction = self._perform_interaction(
-                task="experiment_proposals",
-                prompt=prompt,
-                response_format=schema,
-                model_hint=resolved_model_hint,
-                prompt_variant=prompt_variant,
-                expect_array=expected_array,
-            )
-            parsed = interaction.get("parsed_json")
-            candidates = parsed if expected_array and isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+        request_counts = [max(1, int(proposal_count))]
+        if request_counts[0] > 1:
+            request_counts.append(1)
 
-            validated: list[dict[str, Any]] = []
-            rejection_reason = interaction.get("rejection_reason")
-            duplicate_rejected = False
-            for item in candidates:
-                suggestion = self._validate_proposal(item, available_models)
-                if suggestion is None:
-                    rejection_reason = {
-                        "code": "malformed_or_incomplete",
-                        "message": "Proposal payload failed schema-aware validation.",
-                    }
-                    continue
-                gate_result = gate_proposal(
-                    proposal=suggestion,
+        for request_index, requested_count in enumerate(request_counts, start=1):
+            expected_array = requested_count > 1
+            for attempt_index in range(1, max_attempts + 1):
+                prompt = self._build_experiment_prompt(
                     available_models=available_models,
-                    current_run_signatures=seen_signatures,
-                    memory_payload=experiment_memory,
+                    research_brief=research_brief,
+                    current_best=current_best,
+                    experiment_memory=experiment_memory,
+                    diversity_state=diversity_state,
+                    proposal_count=requested_count,
                     trial_history=trial_history,
+                    search_progress=search_progress or {},
                     family_state=family_state,
-                    duplicate_settings=self.llm_config.get("duplicate_similarity_thresholds", {}),
+                    prompt_variant=prompt_variant,
                 )
-                if not gate_result["accepted"]:
-                    rejection_reason = gate_result["reason"]
-                    duplicate_rejected = bool(gate_result.get("duplicate_rejected", False))
-                    continue
-                seen_signatures.add(gate_result["signature"])
-                validated.append(suggestion)
-                if len(validated) >= max(1, int(proposal_count)):
-                    break
+                schema = (
+                    self._build_proposals_schema(available_models, proposal_count=requested_count)
+                    if expected_array
+                    else self._build_proposal_variant_schema(available_models)
+                )
+                try:
+                    interaction = self._perform_interaction(
+                        task="experiment_proposals",
+                        prompt=prompt,
+                        response_format=schema,
+                        model_hint=resolved_model_hint,
+                        prompt_variant=prompt_variant,
+                        expect_array=expected_array,
+                    )
+                except ProposalExtractionError:
+                    if expected_array and request_index < len(request_counts):
+                        break
+                    raise
+                parsed = interaction.get("parsed_json")
+                candidates = (
+                    parsed if expected_array and isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+                )
 
-            interaction["duplicate_rejected"] = duplicate_rejected
-            interaction["rejection_reason"] = rejection_reason
-            interaction["final_parsed_candidate"] = (
-                validated[0] if len(validated) == 1 else validated or interaction.get("final_parsed_candidate")
-            )
-            interaction["regeneration_attempted"] = attempt_index < max_attempts and not validated
-            interaction["fallback_used"] = attempt_index == max_attempts and not validated
-            self._write_interaction_log(interaction)
+                validated: list[dict[str, Any]] = []
+                rejection_reason = interaction.get("rejection_reason")
+                duplicate_rejected = False
+                for item in candidates:
+                    suggestion = self._validate_proposal(item, available_models)
+                    if suggestion is None:
+                        rejection_reason = {
+                            "code": "malformed_or_incomplete",
+                            "message": "Proposal payload failed schema-aware validation.",
+                        }
+                        continue
+                    gate_result = gate_proposal(
+                        proposal=suggestion,
+                        available_models=available_models,
+                        current_run_signatures=seen_signatures,
+                        memory_payload=experiment_memory,
+                        trial_history=trial_history,
+                        family_state=family_state,
+                        duplicate_settings=self.llm_config.get("duplicate_similarity_thresholds", {}),
+                    )
+                    if not gate_result["accepted"]:
+                        rejection_reason = gate_result["reason"]
+                        duplicate_rejected = bool(gate_result.get("duplicate_rejected", False))
+                        continue
+                    seen_signatures.add(gate_result["signature"])
+                    validated.append(suggestion)
+                    if len(validated) >= requested_count:
+                        break
 
-            if validated:
-                return validated
+                interaction["duplicate_rejected"] = duplicate_rejected
+                interaction["rejection_reason"] = rejection_reason
+                interaction["final_parsed_candidate"] = (
+                    validated[0] if len(validated) == 1 else validated or interaction.get("final_parsed_candidate")
+                )
+                interaction["regeneration_attempted"] = attempt_index < max_attempts and not validated
+                interaction["fallback_used"] = (
+                    request_index < len(request_counts) or (attempt_index == max_attempts and not validated)
+                )
+                self._write_interaction_log(interaction)
+
+                if validated:
+                    return validated
 
         return []
 
@@ -790,21 +804,25 @@ class ProposalEngine:
         channels: dict[str, str],
         expect_array: bool,
     ) -> tuple[str, str, Any, bool]:
-        response_text = channels.get("response_text", "")
-        parsed = self._extract_json(response_text, expect_array=expect_array)
-        if parsed is not None:
-            return response_text.strip(), "response", parsed, False
+        for channel_name, channel_text in (
+            ("response", channels.get("response_text", "")),
+            ("thinking", channels.get("thinking_text", "")),
+        ):
+            parsed = self._extract_json(channel_text, expect_array=expect_array)
+            if parsed is not None:
+                return channel_text.strip(), channel_name, parsed, False
 
-        repaired = self._repair_json_text(response_text, expect_array=expect_array)
-        if repaired is not None:
-            try:
-                parsed = json.loads(repaired)
-            except Exception:
-                parsed = None
-            if parsed is not None and (
-                (expect_array and isinstance(parsed, list)) or (not expect_array and isinstance(parsed, dict))
-            ):
-                return repaired, "repaired_json", parsed, True
+            repaired = self._repair_json_text(channel_text, expect_array=expect_array)
+            if repaired is not None:
+                try:
+                    parsed = json.loads(repaired)
+                except Exception:
+                    parsed = None
+                if parsed is not None and (
+                    (expect_array and isinstance(parsed, list)) or (not expect_array and isinstance(parsed, dict))
+                ):
+                    extracted_from = "repaired_json" if channel_name == "response" else "repaired_thinking"
+                    return repaired, extracted_from, parsed, True
 
         raise ProposalExtractionError("Visible response was empty or did not contain valid JSON.")
 

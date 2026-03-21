@@ -167,6 +167,49 @@ class LLMBackendTests(unittest.TestCase):
         payload = mock_post.call_args.kwargs["json"]
         self.assertIn("/no_think", payload["prompt"])
 
+    def test_ollama_backend_falls_back_to_cli_when_http_generation_fails(self) -> None:
+        config = {
+            "llm": {
+                "enabled": True,
+                "backend_mode": "ollama",
+                "default_local_proposal_model": "qwen3:4b",
+                "ollama": {
+                    "model": "qwen3:4b",
+                    "base_url": "http://localhost:11434",
+                    "use_cli_fallback": True,
+                },
+            }
+        }
+        backend = OllamaBackend(config)
+
+        with patch.object(backend, "_http_available", return_value=True), patch.object(
+            backend,
+            "_generate_http",
+            side_effect=RuntimeError("http failed"),
+        ), patch.object(
+            backend,
+            "_cli_available",
+            return_value=True,
+        ), patch.object(
+            backend,
+            "_generate_cli",
+            return_value={
+                "backend": "ollama",
+                "transport": "cli",
+                "model": "qwen3:4b",
+                "text": '{"ok": true}',
+                "response_text": '{"ok": true}',
+                "thinking_text": "",
+                "backend_raw_text": '{"ok": true}',
+                "raw": {},
+            },
+        ) as mock_cli:
+            payload = backend.generate_text("hello")
+
+        self.assertEqual(payload["transport"], "cli")
+        self.assertEqual(payload["model"], "qwen3:4b")
+        mock_cli.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

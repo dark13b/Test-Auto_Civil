@@ -359,14 +359,18 @@ class OllamaBackend(LLMBackend):
         model_name = str(model or self.default_model)
         LOGGER.debug("[LLM] Resolved model: %s via ollama", model_name)
         if self._http_available():
-            return self._generate_http(
-                prompt,
-                system_prompt=system_prompt,
-                response_format=response_format,
-                model=model_name,
-                max_output_tokens=max_output_tokens,
-                temperature=temperature,
-            )
+            try:
+                return self._generate_http(
+                    prompt,
+                    system_prompt=system_prompt,
+                    response_format=response_format,
+                    model=model_name,
+                    max_output_tokens=max_output_tokens,
+                    temperature=temperature,
+                )
+            except Exception:
+                if not self._cli_available():
+                    raise
         if self._cli_available():
             return self._generate_cli(
                 prompt,

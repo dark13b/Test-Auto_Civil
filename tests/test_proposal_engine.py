@@ -261,7 +261,7 @@ class ProposalEngineTests(unittest.TestCase):
         self.assertEqual(proposals[0]["model_name"], "ModelFamilyA")
         self.assertEqual(record["extracted_from_channel"], "response")
 
-    def test_response_extraction_raises_when_visible_response_is_empty_even_if_thinking_exists(self) -> None:
+    def test_response_extraction_falls_back_to_thinking_text_when_visible_response_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "llm_interactions.jsonl"
             backend = RecordingBackend(
@@ -275,16 +275,20 @@ class ProposalEngineTests(unittest.TestCase):
             )
             engine = self._make_engine(backend, log_path=log_path)
 
-            with self.assertRaises(ProposalExtractionError):
-                engine.generate_experiment_proposals(
-                    available_models=self.available_models,
-                    research_brief=self.research_brief,
-                    current_best=self.current_best,
-                    experiment_memory=self.experiment_memory,
-                    diversity_state={},
-                    proposal_count=1,
-                    model_hint="qwen3:4b",
-                )
+            proposals = engine.generate_experiment_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory=self.experiment_memory,
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:4b",
+            )
+            record = self._read_jsonl(log_path)[0]
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["model_name"], "ModelFamilyA")
+        self.assertEqual(record["extracted_from_channel"], "thinking")
 
     def test_json_repair_success_marks_repair_used(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -365,6 +369,48 @@ class ProposalEngineTests(unittest.TestCase):
         self.assertTrue(records[0]["duplicate_rejected"])
         self.assertEqual(records[0]["rejection_reason"]["code"], "exact_duplicate")
         self.assertTrue(records[0]["regeneration_attempted"])
+
+    def test_multi_proposal_request_degrades_to_single_proposal_mode_when_array_response_is_unusable(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": "",
+                    "thinking_text": "",
+                },
+                {
+                    "response_text": '{"model_name":"ModelFamilyB","params":{"alpha":0.4},"proposal_family":"family-b","hypothesis":"single fallback"}',
+                },
+            ]
+        )
+        engine = self._make_engine(
+            backend,
+            llm_config={
+                "compact_prompt_models": ["qwen3:4b"],
+                "enable_regeneration_on_reject": False,
+                "max_regeneration_attempts": 0,
+                "duplicate_similarity_thresholds": {
+                    "numeric_tolerance": 0.05,
+                    "float_round_digits": 4,
+                },
+                "temporarily_block_saturated_families": True,
+                "diversity": {"max_family_share": 0.35},
+            },
+        )
+
+        proposals = engine.generate_experiment_proposals(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=4,
+            model_hint="qwen3:4b",
+        )
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]["model_name"], "ModelFamilyB")
+        self.assertEqual(len(backend.prompts), 2)
+        self.assertIn("Return exactly one JSON object.", backend.prompts[1])
 
     def test_ambiguous_json_is_not_silently_accepted(self) -> None:
         backend = RecordingBackend(
