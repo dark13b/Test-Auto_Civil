@@ -10,7 +10,7 @@ import pandas as pd
 
 import research_loop
 from novelty_scorer import NoveltyScorer
-from proposal_engine import ProposalEngine
+from proposal_engine import ProposalEngine, ProposalParseFailure, ProposalPreflightFailure
 from research_loop import (
     _append_synchronized_results,
     _initialize_research_log,
@@ -20,8 +20,20 @@ from research_loop import (
 
 
 class StubProposalEngine:
-    def __init__(self, proposals: list[dict]) -> None:
+    def __init__(
+        self,
+        proposals: list[dict],
+        *,
+        status: str = "llm_success",
+        smoke_test_ok: bool = True,
+        smoke_test_status: str = "llm_success",
+        smoke_test_error: str | None = None,
+    ) -> None:
         self._proposals = proposals
+        self._status = status
+        self._smoke_test_ok = smoke_test_ok
+        self._smoke_test_status = smoke_test_status
+        self._smoke_test_error = smoke_test_error
         self.backend_name = "stub"
         self.last_interaction_summary = {
             "model": "qwen3:8b",
@@ -33,6 +45,55 @@ class StubProposalEngine:
 
     def generate_experiment_proposals(self, **_: object) -> list[dict]:
         return list(self._proposals)
+
+    def generate_research_proposals(self, **_: object) -> dict[str, object]:
+        normalized = []
+        for proposal in self._proposals:
+            normalized.append(
+                {
+                    **proposal,
+                    "proposal_source": proposal.get("proposal_source", "llm"),
+                    "research_proposal": proposal.get(
+                        "research_proposal",
+                        {
+                            "hypothesis": proposal.get("hypothesis", "stub hypothesis"),
+                            "rationale": "stub rationale",
+                            "change_type": "hyperparameter",
+                            "target_component": proposal.get("model_name", "unknown"),
+                            "proposed_change": "stub change",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "small",
+                            },
+                            "confidence": 0.5,
+                            "novelty_claim": "stub novelty",
+                            "risk_notes": "stub risk",
+                            "candidate_config": {
+                                "model_name": proposal.get("model_name", "unknown"),
+                                "params": dict(proposal.get("params", {})),
+                            },
+                        },
+                    ),
+                }
+            )
+        return {
+            "status": self._status,
+            "backend": self.backend_name,
+            "model": "qwen3:8b",
+            "prompt_variant": "rich",
+            "proposals": normalized,
+        }
+
+    def run_proposal_smoke_test(self, **_: object) -> dict[str, object]:
+        return {
+            "ok": self._smoke_test_ok,
+            "status": self._smoke_test_status,
+            "backend": self.backend_name,
+            "model": "qwen3:8b",
+            "error": self._smoke_test_error,
+        }
 
     def summarize_run(self, **_: object) -> dict[str, object]:
         return {"backend": "stub", "available": True, "summary": "stub-summary"}
@@ -130,11 +191,13 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
             family_limit=1,
             current_run_signatures=set(),
             proposal_engine=StubProposalEngine([]),
+            allow_deterministic_fallback=True,
         )
 
         self.assertTrue(candidates)
-        self.assertEqual(metadata["proposal_mode"], "deterministic_fallback")
+        self.assertEqual(metadata["proposal_mode"], "fallback_used")
         self.assertEqual(metadata["proposal_backend"], "fallback")
+        self.assertEqual(metadata["proposal_status"], "fallback_used")
 
     def test_select_scout_candidates_falls_back_when_json_repair_is_ambiguous(self) -> None:
         available_models = {
@@ -171,10 +234,11 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
             family_limit=1,
             current_run_signatures=set(),
             proposal_engine=proposal_engine,
+            allow_deterministic_fallback=True,
         )
 
         self.assertTrue(candidates)
-        self.assertEqual(metadata["proposal_mode"], "deterministic_fallback")
+        self.assertEqual(metadata["proposal_mode"], "fallback_used")
 
     def test_select_scout_candidates_normalizes_llm_proposals_for_confirm_stage(self) -> None:
         available_models = {
@@ -202,6 +266,27 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                         "display_name": "LightGBM",
                         "proposal_family": "llm-boosting",
                         "hypothesis": "Try stronger regularization.",
+                        "proposal_source": "llm",
+                        "research_proposal": {
+                            "hypothesis": "Try stronger regularization.",
+                            "rationale": "The current family is close but unstable.",
+                            "change_type": "hyperparameter",
+                            "target_component": "LGBMRegressor",
+                            "proposed_change": "Increase learning_rate to 0.1 at 500 trees.",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "0.03-0.08 MPa",
+                            },
+                            "confidence": 0.61,
+                            "novelty_claim": "No accepted run used this setting.",
+                            "risk_notes": "May overfit if num_leaves remains large.",
+                            "candidate_config": {
+                                "model_name": "LGBMRegressor",
+                                "params": {"n_estimators": 500, "learning_rate": 0.1},
+                            },
+                        },
                         "params": {"n_estimators": 500, "learning_rate": 0.1},
                     }
                 ]
@@ -209,9 +294,39 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
         )
 
         self.assertEqual(metadata["proposal_mode"], "llm")
+        self.assertEqual(metadata["proposal_status"], "llm_success")
         self.assertEqual(candidates[0]["stage"], "scout")
         self.assertEqual(candidates[0]["experiment_id"], "llm-scout-001")
         self.assertEqual(candidates[0]["proposal_family"], "llm-boosting")
+        self.assertEqual(candidates[0]["proposal_source"], "llm")
+
+    def test_select_scout_candidates_raises_when_fallback_disabled_and_llm_parse_fails(self) -> None:
+        available_models = {
+            "RandomForestRegressor": {
+                "display_name": "RandomForest",
+                "search_space": {
+                    "n_estimators": {"type": "int", "low": 100, "high": 300, "step": 100},
+                },
+            }
+        }
+
+        class ParseFailProposalEngine(StubProposalEngine):
+            def generate_research_proposals(self, **_: object) -> dict[str, object]:
+                raise ProposalParseFailure("invalid json", failure_kind="llm_parse_failure")
+
+        with self.assertRaises(ProposalParseFailure):
+            _select_scout_candidates(
+                brief={"scout_candidates_per_cycle": 1},
+                lab_state={"accepted_experiments": []},
+                available_models=available_models,
+                memory_payload={"runs": [], "accepted_experiments": []},
+                current_best={"model_name": "RandomForestRegressor", "hyperparameters": {}},
+                scout_limit=1,
+                family_limit=1,
+                current_run_signatures=set(),
+                proposal_engine=ParseFailProposalEngine([]),
+                allow_deterministic_fallback=False,
+            )
 
     def test_run_engineering_research_loop_keeps_confirmed_improvement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -555,6 +670,93 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
 
             self.assertEqual(best_result["model_name"], "ModelFamilyA")
             evaluate_mock.assert_not_called()
+
+    def test_run_engineering_research_loop_aborts_when_preflight_fails_and_fallback_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "baseline_model.pkl").write_bytes(b"baseline")
+
+            config = {
+                "experiment": {"random_seed": 42},
+                "engineering": {"uncertainty_method": "conformal"},
+                "research": {
+                    "max_cycles": 1,
+                    "max_family_repeats_per_cycle": 1,
+                    "scout_cv_repeats": 1,
+                    "confirm_cv_repeats": 1,
+                    "max_trial_seconds": 0.0,
+                    "max_runtime_minutes": 0.0,
+                    "rebuild_reports_on_keep": False,
+                    "brief_path": "research_brief.md",
+                    "editable_surface_path": "research_lab.py",
+                },
+                "llm": {
+                    "enabled": True,
+                    "allow_deterministic_fallback": False,
+                    "tasks": {"summary_enabled": False},
+                },
+            }
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(research_loop, "load_config", return_value=config))
+                stack.enter_context(patch.object(research_loop, "get_outputs_dir", return_value=outputs_dir))
+                stack.enter_context(patch.object(research_loop, "set_global_seed"))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "_read_baseline_metrics",
+                        return_value={
+                            "model_name": "ModelFamilyA",
+                            "display_name": "Model A",
+                            "hyperparameters": {"depth": 2},
+                            "composite_score": 0.80,
+                            "validation_verdict": "WARN",
+                            "validation_report": {},
+                            "test_metrics": {},
+                        },
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "load_human_research_brief",
+                        return_value={
+                            "goal": "Improve composite_score",
+                            "acceptance_metric": "composite_score",
+                            "min_improvement_pct": 0.0,
+                            "required_model_families": [],
+                            "scout_candidates_per_cycle": 1,
+                            "confirm_top_k": 1,
+                        },
+                    )
+                )
+                stack.enter_context(patch.object(research_loop, "get_available_model_configs", return_value={}))
+                stack.enter_context(patch.object(research_loop, "load_dataset", return_value="dataset"))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "split_dataset",
+                        return_value=("x_train", "x_val", "x_test", "y_train", "y_val", "y_test"),
+                    )
+                )
+                stack.enter_context(patch.object(research_loop.EngineeringValidator, "from_config", return_value=object()))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "_build_proposal_engine",
+                        return_value=StubProposalEngine(
+                            [],
+                            smoke_test_ok=False,
+                            smoke_test_status="llm_backend_failure",
+                            smoke_test_error="backend unreachable",
+                        ),
+                    )
+                )
+                stack.enter_context(patch.object(research_loop, "_build_results_sync_writer", return_value=Mock()))
+                stack.enter_context(patch.object(research_loop, "log_status"))
+
+                with self.assertRaises(ProposalPreflightFailure):
+                    research_loop.run_engineering_research_loop(cycles_override=1, with_report=False)
 
     def test_analyze_interactions_path_still_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

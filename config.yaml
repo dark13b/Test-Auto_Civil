@@ -503,7 +503,7 @@ research:
 llm:
   enabled: true
   backend_mode: ollama
-  allow_deterministic_fallback: true
+  allow_deterministic_fallback: false
   default_local_proposal_model: qwen3:8b
   default_openai_model: gpt-4o
   qwen_thinking_mode: false

@@ -19,7 +19,7 @@ from model_routing import resolve_model_for_backend
 DEFAULT_LLM_CONFIG: dict[str, Any] = {
     "enabled": False,
     "backend_mode": "ollama",
-    "allow_deterministic_fallback": True,
+    "allow_deterministic_fallback": False,
     "default_local_proposal_model": "qwen3:8b",
     "default_openai_model": "gpt-4o",
     "qwen_thinking_mode": False,

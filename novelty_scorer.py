@@ -130,6 +130,51 @@ class NoveltyScorer:
         score = self.compute_novelty_score(proposal, archive)
         return score >= self.threshold, score
 
+    def score_proposal(
+        self,
+        proposal: dict,
+        history: list[dict],
+        available_models: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Compatibility shim for callers that expect a structured novelty result.
+        """
+        if available_models:
+            self.search_spaces = available_models
+
+        archive: list[dict[str, Any]] = []
+        recent_history = history[-ARCHIVE_WINDOW:] if history else []
+        for item in recent_history:
+            if not isinstance(item, dict):
+                continue
+            past_proposal = item.get("proposal")
+            if not isinstance(past_proposal, dict):
+                past_proposal = {
+                    "model_name": item.get("model_name"),
+                    "params": item.get("params", {}),
+                    "proposal_family": item.get("proposal_family", ""),
+                }
+            archive.append({"proposal": past_proposal})
+
+        novelty_score = self.compute_novelty_score(proposal, archive)
+        max_similarity = round(1.0 - novelty_score, 4)
+        closest_match = None
+        if archive:
+            target_model = str(proposal.get("model_name", ""))
+            for candidate in reversed(archive):
+                past = candidate.get("proposal", {})
+                if str(past.get("model_name", "")) == target_model:
+                    closest_match = past
+                    break
+            if closest_match is None:
+                closest_match = archive[-1].get("proposal", {})
+
+        return {
+            "novelty_score": novelty_score,
+            "max_similarity": max_similarity,
+            "closest_match": closest_match,
+        }
+
     def enforce_diversity_budget(
         self,
         proposals: list[dict],

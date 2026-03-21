@@ -3,7 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from proposal_engine import ProposalEngine, ProposalExtractionError
+from proposal_engine import (
+    ProposalBackendFailure,
+    ProposalEngine,
+    ProposalExtractionError,
+    ProposalParseFailure,
+    ProposalSchemaFailure,
+)
 
 
 class RecordingBackend:
@@ -477,6 +483,131 @@ class ProposalEngineTests(unittest.TestCase):
                 proposal_count=1,
                 model_hint="qwen3:8b",
             )
+
+    def test_generate_research_proposals_accepts_valid_strict_hypothesis_json(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": json.dumps(
+                        {
+                            "hypothesis": "Reducing LightGBM num_leaves should reduce variance on this dataset.",
+                            "rationale": "Recent boosted-tree runs plateaued while showing instability in high-strength mixes.",
+                            "change_type": "hyperparameter",
+                            "target_component": "LGBMRegressor",
+                            "proposed_change": "Set num_leaves=24 and min_child_samples=18 while keeping learning_rate near 0.08.",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "0.05-0.12 MPa",
+                            },
+                            "confidence": 0.64,
+                            "novelty_claim": "Recent accepted trials used num_leaves 31-37, not 24 with higher min_child_samples.",
+                            "risk_notes": "May underfit low-strength regime if regularization is too strong.",
+                            "candidate_config": {
+                                "model_name": "ModelFamilyA",
+                                "params": {"depth": 3, "learning_rate": 0.1},
+                            },
+                        }
+                    )
+                }
+            ]
+        )
+        engine = self._make_engine(backend)
+
+        result = engine.generate_research_proposals(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=1,
+            model_hint="qwen3:8b",
+        )
+
+        self.assertEqual(result["status"], "llm_success")
+        self.assertEqual(len(result["proposals"]), 1)
+        proposal = result["proposals"][0]
+        self.assertEqual(proposal["proposal_source"], "llm")
+        self.assertEqual(proposal["research_proposal"]["expected_metric_effect"]["metric"], "rmse")
+        self.assertEqual(proposal["params"]["depth"], 3)
+
+    def test_generate_research_proposals_rejects_empty_response(self) -> None:
+        backend = RecordingBackend([{"response_text": "", "thinking_text": ""}])
+        engine = self._make_engine(backend)
+
+        with self.assertRaises(ProposalParseFailure):
+            engine.generate_research_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory=self.experiment_memory,
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:8b",
+            )
+
+    def test_generate_research_proposals_rejects_schema_mismatch(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": json.dumps(
+                        {
+                            "hypothesis": "",
+                            "rationale": "blank hypothesis should be rejected",
+                            "change_type": "hyperparameter",
+                            "target_component": "ModelFamilyA",
+                            "proposed_change": "depth=3",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "small",
+                            },
+                            "confidence": 1.2,
+                            "novelty_claim": "none",
+                            "risk_notes": "none",
+                            "candidate_config": {
+                                "model_name": "ModelFamilyA",
+                                "params": {"depth": 3, "learning_rate": 0.1},
+                            },
+                        }
+                    )
+                }
+            ]
+        )
+        engine = self._make_engine(backend)
+
+        with self.assertRaises(ProposalSchemaFailure):
+            engine.generate_research_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory=self.experiment_memory,
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:8b",
+            )
+
+    def test_run_proposal_smoke_test_reports_backend_failure(self) -> None:
+        class FailingBackend(RecordingBackend):
+            def generate_text(self, prompt: str, **kwargs: object) -> dict:
+                raise ProposalBackendFailure("backend down", failure_kind="llm_backend_failure")
+
+        backend = FailingBackend([])
+        engine = self._make_engine(backend)
+
+        smoke_result = engine.run_proposal_smoke_test(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            model_hint="qwen3:8b",
+        )
+
+        self.assertFalse(smoke_result["ok"])
+        self.assertEqual(smoke_result["status"], "llm_backend_failure")
 
 
 if __name__ == "__main__":
