@@ -14,6 +14,8 @@ from typing import Any
 import pandas as pd
 import yaml
 
+from novelty_scorer import NoveltyScorer
+
 
 RESEARCH_SURFACE_STATE_START = "# RESEARCH_SURFACE_STATE_START"
 RESEARCH_SURFACE_STATE_END = "# RESEARCH_SURFACE_STATE_END"
@@ -190,7 +192,7 @@ def load_human_research_brief(path: Path) -> dict[str, Any]:
 
 def _empty_memory() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "accepted_experiments": [],
         "runs": [],
     }
@@ -212,8 +214,8 @@ def load_or_initialize_experiment_memory(memory_path: Path) -> dict[str, Any]:
         payload["runs"] = []
     if "accepted_experiments" not in payload or not isinstance(payload.get("accepted_experiments"), list):
         payload["accepted_experiments"] = []
-    if "schema_version" not in payload:
-        payload["schema_version"] = 2
+    if int(payload.get("schema_version", 0) or 0) < 3:
+        payload["schema_version"] = 3
     return payload
 
 
@@ -263,8 +265,20 @@ def record_experiment_memory(memory_path: Path, run_id: str, trial_record: dict[
             "selection_status": trial_record.get("selection_status"),
             "validation_verdict": trial_record.get("validation_verdict"),
             "composite_score": trial_record.get("composite_score"),
+            "rmse": trial_record.get("rmse"),
+            "val_rmse": trial_record.get("test_rmse", trial_record.get("val_rmse")),
             "scout_improvement_pct": trial_record.get("scout_improvement_pct"),
             "confirm_improvement_pct": trial_record.get("confirm_improvement_pct"),
+            "novelty_score": trial_record.get("novelty_score"),
+            "expected_delta_rmse": trial_record.get("expected_delta_rmse"),
+            "actual_delta_rmse": trial_record.get("actual_delta_rmse"),
+            "calibration_error": trial_record.get("calibration_error"),
+            "hard_fail_reasons": list(trial_record.get("hard_fail_reasons", [])),
+            "hard_constraint_reasons": list(trial_record.get("hard_constraint_reasons", [])),
+            "engineering_caution_reasons": list(trial_record.get("engineering_caution_reasons", [])),
+            "data_review_flag_reasons": list(trial_record.get("data_review_flag_reasons", [])),
+            "dataset_anomaly_reasons": list(trial_record.get("dataset_anomaly_reasons", [])),
+            "warn_reasons": list(trial_record.get("warn_reasons", [])),
             "signature": [signature[0], signature[1]],
         }
     )
@@ -513,6 +527,9 @@ def gate_proposal(
                 "code": "malformed_or_incomplete",
                 "message": "Proposal params are incomplete for the selected model family.",
             },
+            "novelty_score": 0.0,
+            "max_similarity": 1.0,
+            "closest_match": None,
         }
     if any(param_name not in search_space for param_name in params):
         return {
@@ -522,8 +539,17 @@ def gate_proposal(
                 "code": "malformed_or_incomplete",
                 "message": "Proposal contains parameters outside the allowed search space.",
             },
+            "novelty_score": 0.0,
+            "max_similarity": 1.0,
+            "closest_match": None,
         }
 
+    novelty_threshold = float(duplicate_settings.get("novelty_gate_threshold", 0.20))
+    novelty_result = NoveltyScorer(threshold=novelty_threshold).score_proposal(
+        proposal={"model_name": model_name, "params": params},
+        history=_iter_normalized_trials(trial_history, memory_payload),
+        available_models=available_models,
+    )
     signature = build_config_signature(model_name, params)
     if should_skip_duplicate_proposal(
         model_name=model_name,
@@ -539,6 +565,9 @@ def gate_proposal(
                 "message": "Proposal exactly matches a recent or historic configuration.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -571,6 +600,9 @@ def gate_proposal(
                 "message": "Proposal stays too close to recent runs from a saturated family.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -583,6 +615,9 @@ def gate_proposal(
                 "message": "Proposal is too similar to a recent configuration.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -595,6 +630,9 @@ def gate_proposal(
                 "message": "Weak recent evidence does not justify another similar run for this family.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -607,6 +645,9 @@ def gate_proposal(
                 "message": "This family is temporarily blocked unless the proposal is materially different.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -614,6 +655,9 @@ def gate_proposal(
         "accepted": True,
         "duplicate_rejected": False,
         "reason": None,
+        "novelty_score": float(novelty_result["novelty_score"]),
+        "max_similarity": float(novelty_result["max_similarity"]),
+        "closest_match": novelty_result.get("closest_match"),
         "signature": signature,
     }
 

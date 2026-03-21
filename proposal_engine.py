@@ -180,6 +180,9 @@ class ProposalEngine:
         proposal_count: int,
         trial_history: list[dict[str, Any]] | None = None,
         search_progress: dict[str, Any] | None = None,
+        failure_patterns: dict[str, Any] | None = None,
+        knowledge_context: str | None = None,
+        underexplored_families: list[str] | None = None,
         model_hint: str | None = None,
     ) -> list[dict[str, Any]]:
         if not self.is_available():
@@ -216,6 +219,9 @@ class ProposalEngine:
                     proposal_count=requested_count,
                     trial_history=trial_history,
                     search_progress=search_progress or {},
+                    failure_patterns=failure_patterns or {},
+                    knowledge_context=str(knowledge_context or ""),
+                    underexplored_families=underexplored_families or [],
                     family_state=family_state,
                     prompt_variant=prompt_variant,
                 )
@@ -519,6 +525,9 @@ class ProposalEngine:
         proposal_count: int,
         trial_history: list[dict[str, Any]],
         search_progress: dict[str, Any],
+        failure_patterns: dict[str, Any],
+        knowledge_context: str,
+        underexplored_families: list[str],
         family_state: dict[str, Any],
         prompt_variant: str,
     ) -> str:
@@ -528,6 +537,8 @@ class ProposalEngine:
 
         lines = [
             "Generate experiment proposals for concrete compressive strength regression.",
+            "Think internally using these hidden steps only: STEP 1: diagnose, STEP 2: hypothesize, STEP 3: predict, STEP 4: propose JSON.",
+            "Do not reveal the hidden steps. Output JSON only.",
             f"Goal: {research_brief.get('goal', 'Improve composite_score')}",
             f"Acceptance metric: {research_brief.get('acceptance_metric', 'composite_score')}",
             f"Current best: {current_best.get('model_name', 'unknown')} | composite={self._format_metric(current_best.get('composite_score'))}",
@@ -540,6 +551,10 @@ class ProposalEngine:
             + self._format_family_list(family_state.get("underexplored_promising_families", [])),
             "Temporarily blocked families: "
             + self._format_family_list(family_state.get("temporarily_blocked_families", [])),
+            "STEP 1: diagnose current best metrics, recent failures, and underexplored families.",
+            "STEP 2: hypothesize one mechanism for improvement.",
+            "STEP 3: predict an expected_delta in RMSE improvement units.",
+            "STEP 4: propose JSON only with model_name, params, proposal_family, hypothesis, expected_delta.",
             "Avoid saturated or temporarily blocked families unless the proposal is materially different from recent runs.",
             "Do not repeat exact recent configs.",
             "Schema example: {\"model_name\":\"MODEL\",\"params\":{}}",
@@ -565,6 +580,12 @@ class ProposalEngine:
 
         if search_progress and prompt_variant == "rich":
             lines.append("Search progress: " + json.dumps(search_progress, sort_keys=True))
+        if failure_patterns:
+            lines.append("Failure patterns: " + json.dumps(failure_patterns, sort_keys=True))
+        if knowledge_context:
+            lines.append("Knowledge context:\n" + knowledge_context)
+        if underexplored_families:
+            lines.append("Underexplored families: " + ", ".join(sorted(str(item) for item in underexplored_families)))
         if diversity_state.get("historic_family_counts") and prompt_variant == "rich":
             lines.append(
                 "Historic family counts: " + json.dumps(diversity_state.get("historic_family_counts", {}), sort_keys=True)
@@ -621,8 +642,9 @@ class ProposalEngine:
                         },
                         "proposal_family": {"type": "string"},
                         "hypothesis": {"type": "string"},
+                        "expected_delta": {"type": "number"},
                     },
-                    "required": ["model_name", "params", "proposal_family", "hypothesis"],
+                    "required": ["model_name", "params", "proposal_family", "hypothesis", "expected_delta"],
                     "additionalProperties": False,
                 }
             )
@@ -682,7 +704,55 @@ class ProposalEngine:
             "params": normalized_params,
             "proposal_family": str(payload.get("proposal_family", "llm-generated")),
             "hypothesis": str(payload.get("hypothesis", "LLM-generated suggestion")),
+            "expected_delta": float(payload.get("expected_delta", 0.0)),
         }
+
+    def generate_feature_proposal(
+        self,
+        *,
+        research_brief: dict[str, Any],
+        current_best: dict[str, Any],
+        knowledge_context: str = "",
+        failure_patterns: dict[str, Any] | None = None,
+        model_hint: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Request one feature-engineering proposal as JSON only."""
+        if not self.is_available():
+            return None
+        resolved_model_hint = self._resolve_model_hint(model_hint)
+        prompt = "\n".join(
+            [
+                "Propose exactly one new engineered feature for concrete strength regression.",
+                "Return JSON only with hypothesis, mechanism, expected_effect, and code.",
+                "The code must define: def new_feature(df: pd.DataFrame) -> pd.Series:",
+                f"Goal: {research_brief.get('goal', 'Improve RMSE')}",
+                f"Current best model: {current_best.get('model_name', 'unknown')}",
+                "Knowledge context:",
+                knowledge_context or "None",
+                "Failure patterns: " + json.dumps(failure_patterns or {}, sort_keys=True),
+            ]
+        )
+        interaction = self._perform_interaction(
+            task="feature_proposal",
+            prompt=prompt,
+            response_format={
+                "type": "object",
+                "properties": {
+                    "hypothesis": {"type": "string"},
+                    "mechanism": {"type": "string"},
+                    "expected_effect": {"type": "string"},
+                    "code": {"type": "string"},
+                },
+                "required": ["hypothesis", "mechanism", "expected_effect", "code"],
+                "additionalProperties": False,
+            },
+            model_hint=resolved_model_hint,
+            prompt_variant=resolve_prompt_variant(self.llm_config, resolved_model_hint),
+            expect_array=False,
+        )
+        self._write_interaction_log(interaction)
+        parsed = interaction.get("parsed_json")
+        return parsed if isinstance(parsed, dict) else None
 
     def _validate_param_value(self, value: Any, spec: dict[str, Any]) -> Any:
         parameter_type = spec.get("type")

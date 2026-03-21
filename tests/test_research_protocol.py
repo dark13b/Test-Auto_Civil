@@ -78,8 +78,14 @@ class ResearchProtocolTests(unittest.TestCase):
                 "hyperparameters": json.dumps({"n_estimators": 300, "learning_rate": 0.05}),
                 "selection_status": "new_best",
                 "composite_score": 0.91,
+                "rmse": 4.8,
+                "test_rmse": 4.7,
                 "validation_verdict": "WARN",
                 "proposal_family": "boosting-balanced",
+                "expected_delta_rmse": 0.2,
+                "actual_delta_rmse": 0.1,
+                "calibration_error": 0.1,
+                "novelty_score": 0.44,
             }
             record_experiment_memory(
                 memory_path=memory_path,
@@ -88,8 +94,10 @@ class ResearchProtocolTests(unittest.TestCase):
             )
 
             parsed_again = load_or_initialize_experiment_memory(memory_path)
+            self.assertEqual(parsed_again["schema_version"], 3)
             self.assertEqual(len(parsed_again["runs"]), 1)
             self.assertEqual(len(parsed_again["runs"][0]["trials"]), 1)
+            self.assertEqual(parsed_again["runs"][0]["trials"][0]["novelty_score"], 0.44)
 
             signature = build_config_signature("LGBMRegressor", {"n_estimators": 300, "learning_rate": 0.05})
             self.assertTrue(
@@ -140,6 +148,7 @@ class ResearchProtocolTests(unittest.TestCase):
 
         self.assertFalse(result["accepted"])
         self.assertEqual(result["reason"]["code"], "exact_duplicate")
+        self.assertIn("novelty_score", result)
 
     def test_gate_proposal_rejects_near_duplicate_with_float_tolerance(self) -> None:
         trial_history = [
@@ -171,6 +180,7 @@ class ResearchProtocolTests(unittest.TestCase):
 
         self.assertFalse(result["accepted"])
         self.assertEqual(result["reason"]["code"], "near_duplicate")
+        self.assertLess(result["novelty_score"], 0.20)
 
     def test_gate_proposal_rejects_saturated_family_when_recent_run_is_too_similar(self) -> None:
         trial_history = [

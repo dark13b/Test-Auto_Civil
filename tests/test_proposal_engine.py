@@ -111,7 +111,7 @@ class ProposalEngineTests(unittest.TestCase):
         backend = RecordingBackend(
             [
                 {
-                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"prompt probe"}',
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"prompt probe","expected_delta":0.15}',
                 }
             ]
         )
@@ -138,7 +138,7 @@ class ProposalEngineTests(unittest.TestCase):
         backend = RecordingBackend(
             [
                 {
-                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"compact probe"}',
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"compact probe","expected_delta":0.12}',
                 }
             ]
         )
@@ -168,7 +168,7 @@ class ProposalEngineTests(unittest.TestCase):
         backend = RecordingBackend(
             [
                 {
-                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"rich probe"}',
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"rich probe","expected_delta":0.11}',
                 }
             ]
         )
@@ -195,7 +195,7 @@ class ProposalEngineTests(unittest.TestCase):
         backend = RecordingBackend(
             [
                 {
-                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"default model probe"}',
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"default model probe","expected_delta":0.18}',
                 }
             ]
         )
@@ -239,8 +239,8 @@ class ProposalEngineTests(unittest.TestCase):
             backend = RecordingBackend(
                 [
                     {
-                        "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"try depth"}',
-                        "thinking_text": '{"model_name":"ModelFamilyB","params":{"alpha":0.2},"proposal_family":"family-b","hypothesis":"ignored"}',
+                        "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"try depth","expected_delta":0.20}',
+                        "thinking_text": '{"model_name":"ModelFamilyB","params":{"alpha":0.2},"proposal_family":"family-b","hypothesis":"ignored","expected_delta":0.10}',
                     }
                 ]
             )
@@ -259,7 +259,39 @@ class ProposalEngineTests(unittest.TestCase):
 
         self.assertEqual(len(proposals), 1)
         self.assertEqual(proposals[0]["model_name"], "ModelFamilyA")
-        self.assertEqual(record["extracted_from_channel"], "response")
+        self.assertEqual(proposals[0]["expected_delta"], 0.20)
+
+    def test_prompt_includes_failure_patterns_knowledge_and_expected_delta_instruction(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": '{"model_name":"ModelFamilyA","params":{"depth":3,"learning_rate":0.1},"proposal_family":"family-a","hypothesis":"guided probe","expected_delta":0.14}',
+                }
+            ]
+        )
+        engine = self._make_engine(backend)
+
+        proposals = engine.generate_experiment_proposals(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            proposal_count=1,
+            trial_history=self._build_trial_history(3),
+            search_progress=self.search_progress,
+            failure_patterns={"validator_failure_reasons": [{"reason": "high water ratio", "count": 2}]},
+            knowledge_context="Empirical Best Ranges\n- Keep depth moderate [source: repo]",
+            underexplored_families=["ModelFamilyB"],
+            model_hint="qwen3:8b",
+        )
+
+        prompt = backend.prompts[0]
+        self.assertIn("STEP 1: diagnose", prompt)
+        self.assertIn("Failure patterns", prompt)
+        self.assertIn("Knowledge context", prompt)
+        self.assertIn("expected_delta", prompt)
+        self.assertEqual(proposals[0]["expected_delta"], 0.14)
 
     def test_response_extraction_falls_back_to_thinking_text_when_visible_response_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import pandas as pd
 
 import research_loop
+from novelty_scorer import NoveltyScorer
 from proposal_engine import ProposalEngine
 from research_loop import (
     _append_synchronized_results,
@@ -410,6 +411,150 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 exit_code = research_loop.main()
 
         self.assertEqual(exit_code, 0)
+
+    def test_run_engineering_research_loop_rejects_low_novelty_before_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "baseline_model.pkl").write_bytes(b"baseline")
+
+            available_models = {
+                "ModelFamilyA": {
+                    "display_name": "Model A",
+                    "search_space": {
+                        "depth": {"type": "int", "low": 1, "high": 8},
+                    },
+                }
+            }
+            baseline_metrics = {
+                "model_name": "ModelFamilyA",
+                "display_name": "Model A",
+                "hyperparameters": {"depth": 2},
+                "composite_score": 0.80,
+                "validation_verdict": "WARN",
+                "validation_report": {},
+                "test_metrics": {"rmse": 4.5},
+            }
+            memory_payload = {
+                "schema_version": 3,
+                "accepted_experiments": [],
+                "runs": [
+                    {
+                        "run_id": "old-run",
+                        "trials": [
+                            {
+                                "model_name": "ModelFamilyA",
+                                "proposal_family": "family-a",
+                                "params": {"depth": 3},
+                                "selection_status": "scout_no_improvement",
+                                "validation_verdict": "WARN",
+                                "signature": ["ModelFamilyA", '{"depth":3}'],
+                            }
+                        ],
+                    }
+                ],
+            }
+
+            config = {
+                "experiment": {"random_seed": 42},
+                "engineering": {"uncertainty_method": "conformal"},
+                "research": {
+                    "max_cycles": 1,
+                    "max_family_repeats_per_cycle": 1,
+                    "scout_cv_repeats": 1,
+                    "confirm_cv_repeats": 1,
+                    "max_trial_seconds": 0.0,
+                    "max_runtime_minutes": 0.0,
+                    "rebuild_reports_on_keep": False,
+                    "brief_path": "research_brief.md",
+                    "editable_surface_path": "research_lab.py",
+                    "novelty_gate_threshold": 0.20,
+                    "hypothesis_archive_filename": "hypothesis_archive.json",
+                },
+                "llm": {
+                    "enabled": True,
+                    "tasks": {"summary_enabled": False},
+                    "compact_prompt_models": ["qwen3:4b"],
+                },
+            }
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(research_loop, "load_config", return_value=config))
+                stack.enter_context(patch.object(research_loop, "get_outputs_dir", return_value=outputs_dir))
+                stack.enter_context(patch.object(research_loop, "set_global_seed"))
+                stack.enter_context(patch.object(research_loop, "_read_baseline_metrics", return_value=baseline_metrics))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "load_human_research_brief",
+                        return_value={
+                            "goal": "Improve composite_score",
+                            "acceptance_metric": "composite_score",
+                            "min_improvement_pct": 0.0,
+                            "required_model_families": [],
+                            "scout_candidates_per_cycle": 1,
+                            "confirm_top_k": 1,
+                        },
+                    )
+                )
+                stack.enter_context(patch.object(research_loop, "get_available_model_configs", return_value=available_models))
+                stack.enter_context(patch.object(research_loop, "load_dataset", return_value="dataset"))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "split_dataset",
+                        return_value=("x_train", "x_val", "x_test", "y_train", "y_val", "y_test"),
+                    )
+                )
+                stack.enter_context(patch.object(research_loop.EngineeringValidator, "from_config", return_value=object()))
+                stack.enter_context(
+                    patch.object(research_loop, "read_research_surface_state", return_value={"accepted_experiments": []})
+                )
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "_build_proposal_engine",
+                        return_value=StubProposalEngine(
+                            [
+                                {
+                                    "model_name": "ModelFamilyA",
+                                    "display_name": "Model A",
+                                    "proposal_family": "family-a",
+                                    "hypothesis": "Duplicate depth",
+                                    "expected_delta": 0.1,
+                                    "params": {"depth": 3},
+                                }
+                            ]
+                        ),
+                    )
+                )
+                evaluate_mock = stack.enter_context(patch.object(research_loop, "_evaluate_stage_candidate"))
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "load_or_initialize_experiment_memory",
+                        side_effect=lambda _path: memory_payload,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "validate_final_artifact_consistency",
+                        return_value={"consistent": True, "mismatches": []},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        research_loop,
+                        "_sync_final_artifacts_from_source_of_truth",
+                        return_value={"best_search_metrics": baseline_metrics},
+                    )
+                )
+                stack.enter_context(patch.object(research_loop, "_build_results_sync_writer", return_value=Mock()))
+                stack.enter_context(patch.object(research_loop, "log_status"))
+                best_result = research_loop.run_engineering_research_loop(cycles_override=1, with_report=False)
+
+            self.assertEqual(best_result["model_name"], "ModelFamilyA")
+            evaluate_mock.assert_not_called()
 
     def test_analyze_interactions_path_still_works(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

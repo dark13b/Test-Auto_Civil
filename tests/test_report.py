@@ -188,6 +188,9 @@ class ReportTests(unittest.TestCase):
         self.assertIn("regime_specific_modeling", final_metrics)
         self.assertIn("structured_metrics_summary", final_metrics["regime_specific_modeling"])
         self.assertIn("pass_fail", final_metrics["regime_specific_modeling"])
+        review_payloads = [payload for path, payload in saved_payloads if path.name == "scientific_report_review.json"]
+        self.assertEqual(len(review_payloads), 1)
+        self.assertIn("scientific_accuracy", review_payloads[0]["scores"])
 
     def test_report_context_blocks_second_holdout_use(self) -> None:
         report.REPORT_CONTEXT = SimpleNamespace(_test_set_used_in_report=True)

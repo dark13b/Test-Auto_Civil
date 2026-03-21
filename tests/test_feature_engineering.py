@@ -116,6 +116,18 @@ class FeatureEngineeringTests(unittest.TestCase):
         values = engineered[ENGINEERED_FEATURE_COLUMNS + ENGINEERING_DIAGNOSTIC_COLUMNS].to_numpy(dtype=float)
         self.assertTrue(np.isfinite(values).all())
 
+    def test_optional_promoted_features_are_loaded_when_configured(self) -> None:
+        config = make_config()
+        config["engineering"]["experimental_feature_modules"] = ["tests.support_test_promoted_features"]
+
+        engineered = build_engineering_features(make_frame(), config=config)
+
+        self.assertIn("cement_plus_water_feature", engineered.columns)
+        self.assertAlmostEqual(
+            float(engineered.loc[0, "cement_plus_water_feature"]),
+            360.0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
