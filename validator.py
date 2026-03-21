@@ -176,6 +176,10 @@ class EngineeringValidator:
     age_regime_early_max_days: float = 7.0
     age_regime_later_min_days: float = 56.0
     workability_support_superplasticizer_ratio: float = 0.01
+    superplasticizer_assumed_unit: str = "kg_per_m3"
+    superplasticizer_unit_confidence: str = CONFIDENCE_MODERATE
+    superplasticizer_dosage_warn_kg_per_m3: float = 18.0
+    superplasticizer_binder_ratio_warn: float = 0.05
     paste_rich_aggregate_paste_ratio_threshold: float = 2.85
     shrinkage_low_water_binder_threshold: float = 0.38
     shrinkage_strength_threshold: float = 50.0
@@ -242,6 +246,18 @@ class EngineeringValidator:
             age_regime_later_min_days=float(rules.get("age_regime_later_min_days", 56.0)),
             workability_support_superplasticizer_ratio=float(
                 rules.get("workability_support_superplasticizer_ratio", 0.01)
+            ),
+            superplasticizer_assumed_unit=str(
+                rules.get("superplasticizer_assumed_unit", "kg_per_m3")
+            ),
+            superplasticizer_unit_confidence=str(
+                rules.get("superplasticizer_unit_confidence", CONFIDENCE_MODERATE)
+            ),
+            superplasticizer_dosage_warn_kg_per_m3=float(
+                rules.get("superplasticizer_dosage_warn_kg_per_m3", 18.0)
+            ),
+            superplasticizer_binder_ratio_warn=float(
+                rules.get("superplasticizer_binder_ratio_warn", 0.05)
             ),
             paste_rich_aggregate_paste_ratio_threshold=float(
                 rules.get("paste_rich_aggregate_paste_ratio_threshold", 2.85)
@@ -449,6 +465,7 @@ class EngineeringValidator:
         fly_ash_replacement_ratio = _safe_float(sample.get("fly_ash_replacement_ratio"))
         slag_replacement_ratio = _safe_float(sample.get("slag_replacement_ratio"))
         aggregate_paste_ratio = _safe_float(sample.get("aggregate_paste_ratio"))
+        superplasticizer_binder_ratio = _safe_float(sample.get("superplasticizer_binder_ratio"))
         cement_content = _safe_float(sample.get(self.cement_column))
         water_content = _safe_float(sample.get(self.water_column))
         slag_content = _safe_float(sample.get("slag"))
@@ -485,6 +502,7 @@ class EngineeringValidator:
             "slag_replacement_ratio": slag_replacement_ratio,
             "aggregate_paste_ratio": aggregate_paste_ratio,
             "superplasticizer": superplasticizer,
+            "superplasticizer_binder_ratio": superplasticizer_binder_ratio,
             "age_days": age_days,
             "target_strength": target_strength,
             "age_regime_code": age_regime_code,
@@ -1121,6 +1139,38 @@ class EngineeringValidator:
                 ),
                 recommended_review_action="Check slump/workability evidence and admixture support before acceptance.",
                 assessment_confidence=workability_support["confidence"],
+            )
+
+        superplasticizer = context["superplasticizer"]
+        superplasticizer_binder_ratio = context.get("superplasticizer_binder_ratio")
+        if superplasticizer is not None and (
+            superplasticizer >= self.superplasticizer_dosage_warn_kg_per_m3
+            or (superplasticizer_binder_ratio or 0.0) >= self.superplasticizer_binder_ratio_warn
+        ):
+            add_warning(
+                data_review_flags_by_code,
+                warning_code="superplasticizer_dosage_review",
+                warning_category=WARNING_CATEGORY_DATA_REVIEW_FLAG,
+                severity=SEVERITY_MEDIUM,
+                message=(
+                    f"Superplasticizer dosage is high under the assumed {self.superplasticizer_assumed_unit} convention."
+                ),
+                triggering_factors={
+                    "superplasticizer": superplasticizer,
+                    "assumed_unit": self.superplasticizer_assumed_unit,
+                    "unit_confidence": self.superplasticizer_unit_confidence,
+                    "superplasticizer_binder_ratio": superplasticizer_binder_ratio,
+                    "dosage_warn_threshold": self.superplasticizer_dosage_warn_kg_per_m3,
+                    "binder_ratio_warn_threshold": self.superplasticizer_binder_ratio_warn,
+                },
+                academic_note=(
+                    "High admixture dosage can reflect a true high-range water reducer demand, a unit mismatch, "
+                    "or a missing conversion between absolute dosage and binder-relative reporting."
+                ),
+                recommended_review_action=(
+                    "Confirm the superplasticizer units and dosage basis before treating the mix as plausible."
+                ),
+                assessment_confidence=self.superplasticizer_unit_confidence,
             )
 
         hard_constraints = list(hard_constraints_by_code.values())

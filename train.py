@@ -7,6 +7,7 @@ import os
 import pickle
 import random
 import re
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -66,6 +67,8 @@ ARTIFACT_VERSION_MODULES = {
     "joblib": "joblib",
 }
 
+RUN_ARTIFACTS_DIRNAME = "runs"
+
 
 def log_status(message: str) -> None:
     """Print a timestamped status message."""
@@ -107,6 +110,11 @@ def get_outputs_dir(config: dict[str, Any]) -> Path:
     outputs_dir = get_project_root() / config["paths"]["outputs_dir"]
     outputs_dir.mkdir(parents=True, exist_ok=True)
     return outputs_dir
+
+
+def create_run_id() -> str:
+    """Create a timestamp-based run identifier."""
+    return pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
 
 
 def get_input_columns(config: dict[str, Any]) -> list[str]:
@@ -763,18 +771,355 @@ def compute_config_hash(config: dict[str, Any] | None) -> str | None:
     return sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def get_git_commit_hash(project_root: Path | None = None) -> str | None:
+    """Return the current git commit hash when available."""
+    resolved_root = get_project_root() if project_root is None else project_root
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=resolved_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    commit = completed.stdout.strip()
+    return commit or None
+
+
+def compute_file_hash(path: Path) -> str | None:
+    """Return a SHA-256 hash for a file when it exists."""
+    if not path.exists():
+        return None
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def extract_artifact_metadata(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Return normalized artifact metadata from a JSON payload."""
+    if not isinstance(payload, dict):
+        return {}
+    raw_metadata = payload.get("artifact_metadata", {})
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    for key in ("artifact_id", "run_id", "source_mode", "timestamp", "model_artifact_id"):
+        if key not in metadata and key in payload:
+            metadata[key] = payload[key]
+    return metadata
+
+
+def artifact_run_id(payload: dict[str, Any] | None) -> str | None:
+    """Return the run id associated with a JSON payload."""
+    metadata = extract_artifact_metadata(payload)
+    run_id = metadata.get("run_id")
+    return None if run_id is None else str(run_id)
+
+
+def artifact_id(payload: dict[str, Any] | None) -> str | None:
+    """Return the artifact id associated with a JSON payload."""
+    metadata = extract_artifact_metadata(payload)
+    current_artifact_id = metadata.get("artifact_id")
+    return None if current_artifact_id is None else str(current_artifact_id)
+
+
+def infer_active_run_id(
+    outputs_dir: Path,
+    *payloads: dict[str, Any] | None,
+    fallback: str | None = None,
+) -> str:
+    """Resolve the active run id from in-memory payloads or the latest-run manifest."""
+    for payload in payloads:
+        run_id = artifact_run_id(payload)
+        if run_id:
+            return run_id
+
+    latest_manifest_path = outputs_dir / "latest_run_manifest.json"
+    if latest_manifest_path.exists():
+        try:
+            with latest_manifest_path.open("r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest_run_id = manifest.get("run_id")
+            if manifest_run_id:
+                return str(manifest_run_id)
+        except Exception:
+            pass
+
+    return fallback or create_run_id()
+
+
+def mark_json_artifact_stale(
+    path: str | Path,
+    *,
+    active_run_id: str | None,
+    reason: str | None = None,
+) -> bool:
+    """Mark a canonical JSON artifact as stale when it does not belong to the active run."""
+    artifact_path = Path(path)
+    if not artifact_path.exists():
+        return False
+
+    try:
+        with artifact_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return False
+
+    current_run_id = artifact_run_id(payload)
+    metadata = dict(extract_artifact_metadata(payload))
+    already_stale = bool(metadata.get("stale") or payload.get("stale"))
+    if current_run_id == active_run_id and not already_stale:
+        return False
+
+    stale_reason = reason or (
+        "artifact does not belong to the active run"
+        if active_run_id
+        else "artifact lineage could not be resolved"
+    )
+    metadata["stale"] = True
+    metadata["canonical_latest"] = False
+    metadata["stale_reason"] = stale_reason
+    metadata["stale_checked_against_run_id"] = active_run_id
+    if current_run_id is not None:
+        metadata.setdefault("run_id", current_run_id)
+    payload["artifact_metadata"] = metadata
+    payload["stale"] = True
+    payload["stale_reason"] = stale_reason
+    if active_run_id is not None:
+        payload["active_run_id"] = active_run_id
+
+    save_json_artifact(artifact_path, payload)
+    return True
+
+
+def build_json_artifact_metadata(
+    *,
+    outputs_dir: Path,
+    filename: str,
+    run_id: str,
+    source_mode: str,
+    config: dict[str, Any] | None = None,
+    model_artifact_id: str | None = None,
+    model_id: str | None = None,
+    parent_artifact_ids: list[str] | None = None,
+    parent_run_ids: list[str] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the shared metadata envelope for a JSON artifact."""
+    timestamp = pd.Timestamp.now().isoformat()
+    canonical_path = outputs_dir / filename
+    run_path = outputs_dir / RUN_ARTIFACTS_DIRNAME / run_id / filename
+    metadata = {
+        "artifact_schema_version": 1,
+        "artifact_name": filename,
+        "artifact_type": "json",
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "source_mode": source_mode,
+        "config_hash": compute_config_hash(config),
+        "code_fingerprint": {
+            "git_commit": get_git_commit_hash(outputs_dir.parent),
+        },
+        "model_artifact_id": model_artifact_id,
+        "model_id": model_id,
+        "parent_artifact_ids": list(parent_artifact_ids or []),
+        "parent_run_ids": list(parent_run_ids or []),
+        "canonical_path": str(canonical_path),
+        "run_scoped_path": str(run_path),
+        "canonical_latest": True,
+        "stale": False,
+    }
+    artifact_key = json.dumps(
+        {
+            "filename": filename,
+            "run_id": run_id,
+            "source_mode": source_mode,
+            "timestamp": timestamp,
+            "model_artifact_id": model_artifact_id,
+            "parent_artifact_ids": metadata["parent_artifact_ids"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    metadata["artifact_id"] = sha256(artifact_key.encode("utf-8")).hexdigest()
+    if isinstance(extra_metadata, dict):
+        metadata.update(to_serializable(extra_metadata))
+    return metadata
+
+
+def _update_run_manifest(outputs_dir: Path, metadata: dict[str, Any]) -> None:
+    """Record the latest artifact set for a run and refresh the latest-run pointer."""
+    run_id = str(metadata["run_id"])
+    run_dir = outputs_dir / RUN_ARTIFACTS_DIRNAME / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / "run_manifest.json"
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    else:
+        manifest = {
+            "run_id": run_id,
+            "created_at": metadata["timestamp"],
+            "artifacts": {},
+        }
+    manifest.setdefault("artifacts", {})
+    manifest["updated_at"] = metadata["timestamp"]
+    manifest["artifacts"][str(metadata["artifact_name"])] = {
+        "artifact_id": metadata["artifact_id"],
+        "source_mode": metadata["source_mode"],
+        "timestamp": metadata["timestamp"],
+        "canonical_path": metadata["canonical_path"],
+        "run_scoped_path": metadata["run_scoped_path"],
+        "model_artifact_id": metadata.get("model_artifact_id"),
+        "parent_artifact_ids": list(metadata.get("parent_artifact_ids", [])),
+    }
+    save_json_artifact(manifest_path, manifest)
+    latest_manifest = {
+        "run_id": run_id,
+        "updated_at": metadata["timestamp"],
+        "manifest_path": str(manifest_path),
+        "artifacts": manifest["artifacts"],
+    }
+    save_json_artifact(outputs_dir / "latest_run_manifest.json", latest_manifest)
+
+
+def write_run_scoped_json_artifact(
+    *,
+    outputs_dir: Path,
+    filename: str,
+    payload: dict[str, Any],
+    run_id: str,
+    source_mode: str,
+    config: dict[str, Any] | None = None,
+    model_artifact_id: str | None = None,
+    model_id: str | None = None,
+    parent_artifact_ids: list[str] | None = None,
+    parent_run_ids: list[str] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Write one JSON artifact to both run-scoped and canonical latest locations."""
+    metadata = build_json_artifact_metadata(
+        outputs_dir=outputs_dir,
+        filename=filename,
+        run_id=run_id,
+        source_mode=source_mode,
+        config=config,
+        model_artifact_id=model_artifact_id,
+        model_id=model_id,
+        parent_artifact_ids=parent_artifact_ids,
+        parent_run_ids=parent_run_ids,
+        extra_metadata=extra_metadata,
+    )
+    enriched_payload = dict(payload)
+    enriched_payload["artifact_id"] = metadata["artifact_id"]
+    enriched_payload["run_id"] = metadata["run_id"]
+    enriched_payload["timestamp"] = metadata["timestamp"]
+    enriched_payload["source_mode"] = metadata["source_mode"]
+    enriched_payload["parent_artifact_ids"] = list(metadata["parent_artifact_ids"])
+    if metadata.get("model_artifact_id") is not None:
+        enriched_payload["model_artifact_id"] = metadata["model_artifact_id"]
+    enriched_payload["artifact_metadata"] = metadata
+
+    canonical_path = outputs_dir / filename
+    run_path = outputs_dir / RUN_ARTIFACTS_DIRNAME / run_id / filename
+    run_path.parent.mkdir(parents=True, exist_ok=True)
+    save_json_artifact(run_path, enriched_payload)
+    save_json_artifact(canonical_path, enriched_payload)
+    _update_run_manifest(outputs_dir, metadata)
+    return canonical_path, run_path, enriched_payload
+
+
+def write_run_scoped_dataframe(
+    *,
+    outputs_dir: Path,
+    filename: str,
+    frame: pd.DataFrame,
+    run_id: str,
+    source_mode: str,
+    config: dict[str, Any] | None = None,
+    model_artifact_id: str | None = None,
+    parent_artifact_ids: list[str] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> tuple[Path, Path, pd.DataFrame, dict[str, Any]]:
+    """Write one dataframe to both run-scoped and canonical latest CSV paths."""
+    metadata = build_json_artifact_metadata(
+        outputs_dir=outputs_dir,
+        filename=filename,
+        run_id=run_id,
+        source_mode=source_mode,
+        config=config,
+        model_artifact_id=model_artifact_id,
+        parent_artifact_ids=parent_artifact_ids,
+        extra_metadata=extra_metadata,
+    )
+    enriched_frame = frame.copy()
+    enriched_frame["artifact_id"] = metadata["artifact_id"]
+    enriched_frame["run_id"] = metadata["run_id"]
+    enriched_frame["timestamp"] = metadata["timestamp"]
+    enriched_frame["source_mode"] = metadata["source_mode"]
+    enriched_frame["model_artifact_id"] = metadata.get("model_artifact_id")
+    enriched_frame["parent_artifact_ids"] = json.dumps(list(metadata["parent_artifact_ids"]))
+
+    canonical_path = outputs_dir / filename
+    run_path = outputs_dir / RUN_ARTIFACTS_DIRNAME / run_id / filename
+    run_path.parent.mkdir(parents=True, exist_ok=True)
+    enriched_frame.to_csv(run_path, index=False)
+    enriched_frame.to_csv(canonical_path, index=False)
+    _update_run_manifest(outputs_dir, metadata)
+    return canonical_path, run_path, enriched_frame, metadata
+
+
+def read_pickle_artifact_metadata(path: Path) -> dict[str, Any] | None:
+    """Read only the metadata envelope for a pickled artifact when present."""
+    if not path.exists():
+        return None
+    with path.open("rb") as handle:
+        raw_artifact = pickle.load(handle)
+    if (
+        isinstance(raw_artifact, dict)
+        and "payload" in raw_artifact
+        and isinstance(raw_artifact.get("artifact_metadata"), dict)
+    ):
+        return dict(raw_artifact["artifact_metadata"])
+    return None
+
+
 def build_pickle_artifact_metadata(
     obj: Any,
     config: dict[str, Any] | None = None,
     model_id: str | None = None,
+    run_id: str | None = None,
+    source_mode: str | None = None,
+    parent_artifact_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build metadata stored alongside pickled model artifacts."""
+    saved_at = pd.Timestamp.now().isoformat()
+    artifact_key = json.dumps(
+        {
+            "saved_at": saved_at,
+            "model_id": model_id or type(obj).__name__,
+            "run_id": run_id,
+            "source_mode": source_mode,
+            "parent_artifact_ids": list(parent_artifact_ids or []),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return {
-        "artifact_schema_version": 1,
+        "artifact_schema_version": 2,
         "library_versions": get_runtime_library_versions(),
-        "saved_at": pd.Timestamp.now().isoformat(),
+        "saved_at": saved_at,
         "model_id": model_id or type(obj).__name__,
         "config_hash": compute_config_hash(config),
+        "run_id": run_id,
+        "source_mode": source_mode,
+        "parent_artifact_ids": list(parent_artifact_ids or []),
+        "artifact_id": sha256(artifact_key.encode("utf-8")).hexdigest(),
+        "code_fingerprint": {
+            "git_commit": get_git_commit_hash(),
+        },
     }
 
 
@@ -820,14 +1165,26 @@ def save_pickle_artifact(
     *,
     config: dict[str, Any] | None = None,
     model_id: str | None = None,
-) -> None:
+    run_id: str | None = None,
+    source_mode: str | None = None,
+    parent_artifact_ids: list[str] | None = None,
+) -> dict[str, Any]:
     """Serialize an object as a pickle file with backward-compatible metadata."""
+    metadata = build_pickle_artifact_metadata(
+        obj,
+        config=config,
+        model_id=model_id,
+        run_id=run_id,
+        source_mode=source_mode,
+        parent_artifact_ids=parent_artifact_ids,
+    )
     artifact_bundle = {
-        "artifact_metadata": build_pickle_artifact_metadata(obj, config=config, model_id=model_id),
+        "artifact_metadata": metadata,
         "payload": obj,
     }
     with path.open("wb") as handle:
         pickle.dump(artifact_bundle, handle)
+    return metadata
 
 
 def load_pickle_artifact(path: Path, *, return_metadata: bool = False) -> Any:

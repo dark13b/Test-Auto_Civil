@@ -299,6 +299,28 @@ class EngineeringValidatorContextTests(unittest.TestCase):
             warning_codes(sample_report, "engineering_cautions"),
         )
 
+    def test_high_superplasticizer_dosage_is_flagged_with_unit_assumption(self) -> None:
+        validator = make_validator(
+            superplasticizer_assumed_unit="kg_per_m3",
+            superplasticizer_unit_confidence="moderate",
+            superplasticizer_dosage_warn_kg_per_m3=18.0,
+            superplasticizer_binder_ratio_warn=0.05,
+        )
+        x_test = make_mix(
+            cement=200.0,
+            slag=80.0,
+            fly_ash=20.0,
+            water=155.0,
+            superplasticizer=22.0,
+        )
+
+        sample_report = validator.validate_predictions(np.asarray([32.0]), x_test)["sample_reports"][0]
+
+        self.assertIn("superplasticizer_dosage_review", warning_codes(sample_report, "data_review_flags"))
+        review_flag = warning_by_code(sample_report, "data_review_flags", "superplasticizer_dosage_review")
+        self.assertIn("kg_per_m3", review_flag["message"])
+        self.assertIn("superplasticizer", review_flag["evidence_summary"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,6 +105,10 @@ validator:
   slag_replacement_warn: 0.7
   early_age_days_warn: 3.0
   early_age_strength_warn: 30.0
+  superplasticizer_assumed_unit: kg_per_m3
+  superplasticizer_unit_confidence: moderate
+  superplasticizer_dosage_warn_kg_per_m3: 18.0
+  superplasticizer_binder_ratio_warn: 0.05
 
 engineering:
   feature_engineering: true

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,18 +11,24 @@ import numpy as np
 import pandas as pd
 from feature_engineering import build_engineering_features
 from train import (
+    artifact_id,
+    compute_file_hash,
+    create_run_id,
     get_base_input_columns,
     get_input_columns,
     get_outputs_dir,
     get_project_root,
+    infer_active_run_id,
     load_pickle_artifact,
     load_config,
     load_dataset,
     log_status,
+    read_pickle_artifact_metadata,
     resolve_model_feature_columns,
     save_json_artifact,
     set_global_seed,
     split_dataset,
+    write_run_scoped_json_artifact,
 )
 
 try:
@@ -55,6 +62,7 @@ class UncertaintyEstimator:
         self.config = self._load_config(config_path)
         self.outputs_dir = self._resolve_outputs_dir(outputs_dir)
         self.model_path = self._resolve_model_path(model_path)
+        self.current_best_payload = self._load_json_payload(self.outputs_dir / "best_search_result.json")
         self.method = str(
             method or self.config.get("engineering", {}).get("uncertainty_method", "conformal")
         ).strip().lower()
@@ -89,6 +97,15 @@ class UncertaintyEstimator:
 
         set_global_seed(self.seed)
         self.model = model if model is not None else load_pickle_artifact(self.model_path)
+        self.model_metadata = read_pickle_artifact_metadata(self.model_path) or {}
+        self.model_artifact_id = str(
+            self.model_metadata.get("artifact_id") or compute_file_hash(self.model_path) or "unknown-model-artifact"
+        )
+        self.active_run_id = infer_active_run_id(
+            self.outputs_dir,
+            self.current_best_payload,
+            fallback=str(self.model_metadata.get("run_id") or create_run_id()),
+        )
         self.report_model = report_model if report_model is not None else self.model
         self.feature_columns = resolve_model_feature_columns(self.model, self.config)
         assert id(self.model) == id(self.report_model), (
@@ -104,6 +121,15 @@ class UncertaintyEstimator:
         self.x_validation = self.x_calibration
         self.y_validation = self.y_calibration
         self._fit_estimators()
+
+    @staticmethod
+    def _load_json_payload(path: Path) -> dict[str, Any]:
+        """Load a JSON artifact when present, otherwise return an empty dictionary."""
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
 
     def _load_config(self, config_path: str | Path | None) -> dict[str, Any]:
         """Load the project configuration from disk."""
@@ -474,6 +500,7 @@ class UncertaintyEstimator:
             "coverage": coverage,
             "mean_interval_width": mean_interval_width,
             "sharpness": mean_interval_width,
+            "model_artifact_id": self.model_artifact_id,
             "calibration_sample_count": int(len(self.y_calibration)),
             "validation_sample_count": int(len(self.y_validation)),
             "reliability_plot_data": grouped.to_dict(orient="records"),
@@ -498,7 +525,17 @@ class UncertaintyEstimator:
             },
         }
         report_path = self.outputs_dir / self.report_filename
-        save_json_artifact(report_path, report)
+        _, _, enriched_report = write_run_scoped_json_artifact(
+            outputs_dir=self.outputs_dir,
+            filename=self.report_filename,
+            payload=report,
+            run_id=self.active_run_id,
+            source_mode="uncertainty",
+            config=self.config,
+            model_artifact_id=self.model_artifact_id,
+            model_id=str(type(self.model).__name__),
+            parent_artifact_ids=[artifact_id(self.current_best_payload)] if artifact_id(self.current_best_payload) else [],
+        )
         for row in grouped.to_dict(orient="records"):
             flag = row["coverage_flag"]
             log_status(
@@ -514,7 +551,7 @@ class UncertaintyEstimator:
             f"Saved uncertainty calibration report to {report_path} | "
             f"Coverage={coverage:.3f} | Mean interval width={mean_interval_width:.3f}"
         )
-        return report
+        return enriched_report
 
     def validate_coverage_target(self) -> bool:
         """Run the calibration audit and validate it against the configured target."""

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from search import build_post_search_ensemble
+from search import build_post_search_ensemble, finalize_search_artifacts, resolve_final_best_result
 
 
 class SearchTests(unittest.TestCase):
@@ -75,9 +75,11 @@ class SearchTests(unittest.TestCase):
             ), patch("search.save_pickle_artifact") as save_pickle_mock, patch(
                 "search.append_optuna_trial_record"
             ), patch("search.append_research_log"), patch("search.log_status"):
+                save_pickle_mock.return_value = {"artifact_id": "ensemble-model-artifact"}
                 result = build_post_search_ensemble(
                     outputs_dir=outputs_dir,
                     config=config,
+                    run_id="run-20260320T172804",
                     x_train=pd.DataFrame({"cement": [1.0, 2.0]}),
                     y_train=pd.Series([2.0, 4.0]),
                     x_val=pd.DataFrame({"cement": [3.0, 4.0]}),
@@ -87,6 +89,105 @@ class SearchTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "new_best")
         save_pickle_mock.assert_called_once()
+
+    def test_finalize_search_artifacts_rewrites_current_ensemble_metrics_for_ensemble_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            current_best = {
+                "trial_number": 31,
+                "best_trial": 31,
+                "model_name": "StackingRegressor",
+                "source": "post_search_ensemble",
+                "status": "new_best",
+                "cv_r2": 0.91,
+                "composite_score": 0.91,
+                "validation_verdict": "PASS",
+                "hyperparameters": {"base_models": []},
+                "validation_report": {"pass_rate": 1.0},
+                "selected_base_models": [{"model_name": "XGBRegressor", "trial_number": 21}],
+                "artifact_id": "ensemble-parent",
+            }
+            baseline_metrics = {"composite_score": 0.75}
+            config = {"experiment": {"random_seed": 42}}
+
+            (outputs_dir / "search_state_best_model.pkl").write_bytes(b"placeholder")
+
+            with patch("search.resolve_final_best_result", return_value=dict(current_best)), patch(
+                "search.load_pickle_artifact",
+                return_value=object(),
+            ), patch(
+                "search.save_pickle_artifact",
+                return_value={"artifact_id": "final-model-artifact"},
+            ), patch(
+                "search.write_run_scoped_json_artifact"
+            ) as write_json_mock, patch(
+                "search.load_json_artifact",
+                side_effect=[
+                    {"best_search_metrics": {"trial_number": 31}},
+                    {"trial_number": 31, "status": "new_best"},
+                ],
+            ):
+                finalize_search_artifacts(
+                    outputs_dir,
+                    baseline_metrics,
+                    config=config,
+                    run_id="run-20260321T004724",
+                )
+
+        written_filenames = [call.kwargs["filename"] for call in write_json_mock.call_args_list]
+        self.assertIn("ensemble_metrics.json", written_filenames)
+        ensemble_call = next(
+            call for call in write_json_mock.call_args_list if call.kwargs["filename"] == "ensemble_metrics.json"
+        )
+        self.assertEqual(ensemble_call.kwargs["source_mode"], "ensemble")
+        self.assertEqual(ensemble_call.kwargs["run_id"], "run-20260321T004724")
+        self.assertEqual(ensemble_call.kwargs["payload"]["source"], "post_search_ensemble")
+
+    def test_resolve_final_best_result_ignores_stale_search_state_when_final_metrics_match_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            pd.DataFrame(
+                [
+                    {
+                        "trial_number": 31,
+                        "model_name": "StackingRegressor",
+                        "composite_score": 0.91,
+                        "selection_status": "new_best",
+                        "validation_verdict": "PASS",
+                    }
+                ]
+            ).to_csv(outputs_dir / "optuna_results.csv", index=False)
+            (outputs_dir / "search_state_best_result.json").write_text(
+                json.dumps(
+                    {
+                        "trial_number": 31,
+                        "best_trial": 31,
+                        "model_name": "StackingRegressor",
+                        "composite_score": 0.91,
+                        "source": "post_search_ensemble",
+                        "stale": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            final_best = {
+                "trial_number": 31,
+                "best_trial": 31,
+                "model_name": "StackingRegressor",
+                "composite_score": 0.91,
+                "source": "post_search_ensemble",
+                "validation_verdict": "PASS",
+            }
+            (outputs_dir / "final_metrics.json").write_text(
+                json.dumps({"best_search_metrics": final_best}),
+                encoding="utf-8",
+            )
+
+            resolved = resolve_final_best_result(outputs_dir, {"composite_score": 0.75})
+
+        self.assertEqual(resolved["model_name"], "StackingRegressor")
+        self.assertEqual(resolved["source"], "post_search_ensemble")
+        self.assertNotIn("stale", resolved)
 
 
 if __name__ == "__main__":

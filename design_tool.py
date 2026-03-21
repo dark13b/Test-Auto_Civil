@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -14,17 +15,25 @@ import pandas as pd
 
 from feature_engineering import build_engineering_features
 from train import (
+    artifact_id,
+    artifact_run_id,
+    compute_file_hash,
+    create_run_id,
     get_base_input_columns,
     get_outputs_dir,
     get_project_root,
     get_target_column,
+    infer_active_run_id,
     load_config,
     load_dataset,
     load_pickle_artifact,
     log_status,
+    read_pickle_artifact_metadata,
     resolve_model_feature_columns,
     save_json_artifact,
     set_global_seed,
+    write_run_scoped_dataframe,
+    write_run_scoped_json_artifact,
 )
 from uncertainty import UncertaintyEstimator
 from validator import EngineeringValidator
@@ -51,9 +60,21 @@ class MixDesignOptimizer:
         self.design_config = self.config["engineering"]["design_tool"]
         self.validator = EngineeringValidator.from_config(self.config)
         self.model = load_pickle_artifact(self.model_path)
+        self.model_metadata = read_pickle_artifact_metadata(self.model_path) or {}
+        self.model_artifact_id = str(
+            self.model_metadata.get("artifact_id") or compute_file_hash(self.model_path) or "unknown-model-artifact"
+        )
         self.feature_columns = resolve_model_feature_columns(self.model, self.config)
         dataset = load_dataset(self.config)
         self.reference_dataset = dataset[self.base_columns + [self.target_column]].copy()
+        self.current_best_payload = self._load_json_payload(self.outputs_dir / "best_search_result.json")
+        self.current_uncertainty_payload = self._load_json_payload(self.outputs_dir / "uncertainty_calibration.json")
+        self.active_run_id = infer_active_run_id(
+            self.outputs_dir,
+            self.current_best_payload,
+            self.current_uncertainty_payload,
+            fallback=create_run_id(),
+        )
         self.uncertainty_estimator = UncertaintyEstimator(
             model=self.model,
             report_model=self.model,
@@ -61,6 +82,15 @@ class MixDesignOptimizer:
             outputs_dir=self.outputs_dir,
             report_filename="design_uncertainty_calibration.json",
         )
+
+    @staticmethod
+    def _load_json_payload(path: Path) -> dict[str, Any]:
+        """Load a JSON payload when the file exists, otherwise return an empty dictionary."""
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
 
     def _load_config(self, config_path: str | Path | None) -> dict[str, Any]:
         """Load the project configuration from disk."""
@@ -313,6 +343,86 @@ class MixDesignOptimizer:
             "confidence_label": confidence_label,
             "target_window_overlap": overlap / target_window_width,
         }
+
+    def _superplasticizer_unit_metadata(self) -> dict[str, str]:
+        """Return the configured superplasticizer unit assumption used in artifacts."""
+        validator_config = self.config.get("validator", {})
+        return {
+            "assumed_unit": str(validator_config.get("superplasticizer_assumed_unit", "kg_per_m3")),
+            "confidence": str(validator_config.get("superplasticizer_unit_confidence", "moderate")),
+        }
+
+    def _uncertainty_metadata(self) -> dict[str, Any]:
+        """Describe the uncertainty lineage used for design ranking and export."""
+        official_run_id = artifact_run_id(self.current_uncertainty_payload)
+        official_artifact_id = artifact_id(self.current_uncertainty_payload)
+        official_model_artifact_id = self.current_uncertainty_payload.get("model_artifact_id")
+        official_matches_current_run = (
+            official_run_id == self.active_run_id
+            and str(official_model_artifact_id or self.model_artifact_id) == str(self.model_artifact_id)
+        )
+        return {
+            "method": str(self.uncertainty_estimator.method),
+            "coverage_target": float(self.uncertainty_estimator.coverage_level),
+            "derived_from_official_estimator": True,
+            "official_calibration_artifact_id": official_artifact_id,
+            "official_calibration_run_id": official_run_id,
+            "official_calibration_matches_current_run": bool(official_matches_current_run),
+            "model_artifact_id": self.model_artifact_id,
+        }
+
+    def _design_parent_artifact_ids(self) -> list[str]:
+        """Return lineage parents for design artifacts."""
+        parent_ids = [artifact_id(self.current_best_payload), artifact_id(self.current_uncertainty_payload)]
+        return [str(parent_id) for parent_id in parent_ids if parent_id]
+
+    def _result_to_batch_record(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Flatten one optimized result into the canonical batch CSV schema."""
+        reference = result["estimated_cement_saving_vs_reference"]
+        return {
+            "target_strength": result["target_strength"],
+            "success": result["success"],
+            "predicted_strength": result["predicted_strength"],
+            "validation_verdict": result["validation_verdict"],
+            "cement": result["mix_design"]["cement"],
+            "slag": result["mix_design"]["slag"],
+            "fly_ash": result["mix_design"]["fly_ash"],
+            "water": result["mix_design"]["water"],
+            "superplasticizer": result["mix_design"]["superplasticizer"],
+            "coarse_aggregate": result["mix_design"]["coarse_aggregate"],
+            "fine_aggregate": result["mix_design"]["fine_aggregate"],
+            "age": result["mix_design"]["age"],
+            "water_cement_ratio": result["engineered_ratios"]["water_cement_ratio"],
+            "water_binder_ratio": result["engineered_ratios"]["water_binder_ratio"],
+            "total_binder": result["engineered_ratios"]["total_binder"],
+            "cement_saving_kg_per_m3": reference["cement_saving_kg_per_m3"],
+            "cement_saving_percent": reference["cement_saving_percent"],
+        }
+
+    def _build_design_artifact_payload(
+        self,
+        result: dict[str, Any],
+        *,
+        source_mode: str,
+        batch_summary_row: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Attach shared design lineage, uncertainty, and units metadata to one result."""
+        payload = dict(result)
+        payload["source_mode"] = source_mode
+        payload["material_units"] = {
+            "superplasticizer": self._superplasticizer_unit_metadata(),
+        }
+        payload["uncertainty_metadata"] = self._uncertainty_metadata()
+        if batch_summary_row is not None:
+            payload["batch_summary_row"] = batch_summary_row
+        return payload
+
+    def _clear_canonical_design_jsons(self, keep_filenames: set[str]) -> None:
+        """Delete stale canonical design JSONs before writing the new batch export set."""
+        for existing_path in self.outputs_dir.glob("design_*MPa.json"):
+            if existing_path.name in keep_filenames:
+                continue
+            existing_path.unlink(missing_ok=True)
 
     def _plausibility_penalty(
         self,
@@ -685,31 +795,81 @@ class MixDesignOptimizer:
 
     def batch_optimize(self, target_strengths: list[float]) -> pd.DataFrame:
         """Optimize a list of target strengths and return a flat results dataframe."""
-        records: list[dict[str, Any]] = []
-        for target_strength in target_strengths:
-            result = self.optimize(target_strength)
-            reference = result["estimated_cement_saving_vs_reference"]
-            record = {
-                "target_strength": result["target_strength"],
-                "success": result["success"],
-                "predicted_strength": result["predicted_strength"],
-                "validation_verdict": result["validation_verdict"],
-                "cement": result["mix_design"]["cement"],
-                "slag": result["mix_design"]["slag"],
-                "fly_ash": result["mix_design"]["fly_ash"],
-                "water": result["mix_design"]["water"],
-                "superplasticizer": result["mix_design"]["superplasticizer"],
-                "coarse_aggregate": result["mix_design"]["coarse_aggregate"],
-                "fine_aggregate": result["mix_design"]["fine_aggregate"],
-                "age": result["mix_design"]["age"],
-                "water_cement_ratio": result["engineered_ratios"]["water_cement_ratio"],
-                "water_binder_ratio": result["engineered_ratios"]["water_binder_ratio"],
-                "total_binder": result["engineered_ratios"]["total_binder"],
-                "cement_saving_kg_per_m3": reference["cement_saving_kg_per_m3"],
-                "cement_saving_percent": reference["cement_saving_percent"],
-            }
-            records.append(record)
-        return pd.DataFrame(records)
+        return pd.DataFrame([self._result_to_batch_record(self.optimize(target_strength)) for target_strength in target_strengths])
+
+    def export_single_target_artifact(
+        self,
+        target_strength: float,
+        *,
+        run_id: str | None = None,
+    ) -> tuple[dict[str, Any], Path]:
+        """Optimize and export one design JSON artifact with shared lineage metadata."""
+        current_run_id = str(run_id or self.active_run_id)
+        result = self.optimize(target_strength)
+        payload = self._build_design_artifact_payload(result, source_mode="design_single")
+        filename = f"design_{_target_label(target_strength)}MPa.json"
+        canonical_path, _, _ = write_run_scoped_json_artifact(
+            outputs_dir=self.outputs_dir,
+            filename=filename,
+            payload=payload,
+            run_id=current_run_id,
+            source_mode="design_single",
+            config=self.config,
+            model_artifact_id=self.model_artifact_id,
+            model_id=str(type(self.model).__name__),
+            parent_artifact_ids=self._design_parent_artifact_ids(),
+        )
+        log_status(f"Saved design report to {canonical_path}")
+        return payload, canonical_path
+
+    def export_batch_artifacts(
+        self,
+        target_strengths: list[float],
+        *,
+        run_id: str | None = None,
+    ) -> tuple[pd.DataFrame, list[Path]]:
+        """Export a batch CSV and matching per-target JSONs from one shared result set."""
+        current_run_id = str(run_id or self.active_run_id)
+        results = [self.optimize(target_strength) for target_strength in target_strengths]
+        batch_frame = pd.DataFrame([self._result_to_batch_record(result) for result in results])
+        _, _, enriched_frame, batch_metadata = write_run_scoped_dataframe(
+            outputs_dir=self.outputs_dir,
+            filename="batch_design_results.csv",
+            frame=batch_frame,
+            run_id=current_run_id,
+            source_mode="design_batch",
+            config=self.config,
+            model_artifact_id=self.model_artifact_id,
+            parent_artifact_ids=self._design_parent_artifact_ids(),
+        )
+
+        keep_filenames = {f"design_{_target_label(target)}MPa.json" for target in target_strengths}
+        self._clear_canonical_design_jsons(keep_filenames)
+
+        exported_paths: list[Path] = []
+        for result in results:
+            target_strength = float(result["target_strength"])
+            row = enriched_frame.loc[enriched_frame["target_strength"] == target_strength].iloc[0].to_dict()
+            payload = self._build_design_artifact_payload(
+                result,
+                source_mode="design_batch",
+                batch_summary_row=row,
+            )
+            filename = f"design_{_target_label(target_strength)}MPa.json"
+            canonical_path, _, _ = write_run_scoped_json_artifact(
+                outputs_dir=self.outputs_dir,
+                filename=filename,
+                payload=payload,
+                run_id=current_run_id,
+                source_mode="design_batch",
+                config=self.config,
+                model_artifact_id=self.model_artifact_id,
+                model_id=str(type(self.model).__name__),
+                parent_artifact_ids=[batch_metadata["artifact_id"], *self._design_parent_artifact_ids()],
+            )
+            exported_paths.append(canonical_path)
+        log_status(f"Saved batch design results to {self.outputs_dir / 'batch_design_results.csv'}")
+        return enriched_frame, exported_paths
 
     def save_design_report(self, result: dict[str, Any], output_path: str | Path) -> Path:
         """Save a JSON report for an optimized concrete mix design."""
@@ -717,7 +877,7 @@ class MixDesignOptimizer:
         if not resolved_path.is_absolute():
             resolved_path = self.project_root / resolved_path
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
-        save_json_artifact(resolved_path, result)
+        save_json_artifact(resolved_path, self._build_design_artifact_payload(result, source_mode="design_single"))
         log_status(f"Saved design report to {resolved_path}")
         return resolved_path
 
@@ -744,9 +904,7 @@ def main() -> int:
     try:
         optimizer = MixDesignOptimizer()
         if args.target is not None:
-            result = optimizer.optimize(args.target)
-            output_path = optimizer.outputs_dir / f"design_{_target_label(args.target)}MPa.json"
-            optimizer.save_design_report(result, output_path)
+            result, _ = optimizer.export_single_target_artifact(args.target)
             log_status(
                 f"Target={result['target_strength']:.2f} MPa | "
                 f"Predicted={result['predicted_strength']:.2f} MPa | "
@@ -755,10 +913,7 @@ def main() -> int:
             )
         else:
             target_strengths = [float(item.strip()) for item in str(args.batch).split(",") if item.strip()]
-            batch_frame = optimizer.batch_optimize(target_strengths)
-            output_path = optimizer.outputs_dir / "batch_design_results.csv"
-            batch_frame.to_csv(output_path, index=False)
-            log_status(f"Saved batch design results to {output_path}")
+            optimizer.export_batch_artifacts(target_strengths)
         return 0
     except Exception as exc:
         log_status(f"Design optimization failed: {exc}")

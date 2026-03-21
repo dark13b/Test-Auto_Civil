@@ -8,23 +8,29 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.inspection import permutation_importance
 
 from train import (
+    artifact_id,
+    artifact_run_id,
     compute_regression_metrics,
     EngineeringValidator,
     get_outputs_dir,
+    infer_active_run_id,
     load_pickle_artifact,
     load_config,
     load_dataset,
     log_status,
+    mark_json_artifact_stale,
     resolve_model_feature_columns,
-    save_json_artifact,
     set_global_seed,
     split_dataset,
+    write_run_scoped_json_artifact,
 )
 from uncertainty import UncertaintyEstimator
 from validator import summarize_validation_report
@@ -260,14 +266,34 @@ def main() -> int:
 
         baseline_metrics = load_json_artifact(outputs_dir / "baseline_metrics.json")
         baseline_model = load_pickle_artifact(outputs_dir / "baseline_model.pkl")
-        canonical_final_metrics = (
+        existing_final_metrics = (
             load_json_artifact(outputs_dir / "final_metrics.json")
             if (outputs_dir / "final_metrics.json").exists()
             else {}
         )
-        best_search_result = canonical_final_metrics.get("best_search_metrics")
-        if not isinstance(best_search_result, dict) or not best_search_result:
-            best_search_result = load_json_artifact(outputs_dir / "best_search_result.json")
+        best_search_result = load_json_artifact(outputs_dir / "best_search_result.json")
+        active_run_id = infer_active_run_id(outputs_dir, best_search_result, existing_final_metrics)
+        if existing_final_metrics and artifact_run_id(existing_final_metrics) not in {None, active_run_id}:
+            log_status(
+                "WARNING stale_final_metrics_ignored | "
+                f"final_metrics_run_id={artifact_run_id(existing_final_metrics)} | active_run_id={active_run_id}"
+            )
+            mark_json_artifact_stale(
+                outputs_dir / "final_metrics.json",
+                active_run_id=active_run_id,
+                reason="stale final metrics ignored during report generation",
+            )
+            existing_final_metrics = {}
+        mark_json_artifact_stale(
+            outputs_dir / "search_state_best_result.json",
+            active_run_id=active_run_id,
+            reason="stale intermediate search-state artifact from a different run",
+        )
+        mark_json_artifact_stale(
+            outputs_dir / "ensemble_metrics.json",
+            active_run_id=active_run_id,
+            reason="stale ensemble artifact from a different run",
+        )
         best_model = load_pickle_artifact(outputs_dir / "best_search_model.pkl")
         optuna_results = pd.read_csv(outputs_dir / "optuna_results.csv")
 
@@ -333,7 +359,7 @@ def main() -> int:
             float(best_search_result["composite_score"]),
         )
         validation_summary = summarize_validation_report(validation_report)
-        final_metrics = dict(canonical_final_metrics) if isinstance(canonical_final_metrics, dict) else {}
+        final_metrics = dict(existing_final_metrics) if isinstance(existing_final_metrics, dict) else {}
         final_metrics.update(
             {
                 "baseline_metrics": baseline_metrics,
@@ -351,7 +377,21 @@ def main() -> int:
                 "uncertainty_audit": uncertainty_audit.get("coverage_audit", {}),
             }
         )
-        save_json_artifact(outputs_dir / "final_metrics.json", final_metrics)
+        write_run_scoped_json_artifact(
+            outputs_dir=outputs_dir,
+            filename="final_metrics.json",
+            payload=final_metrics,
+            run_id=active_run_id,
+            source_mode="report",
+            config=config,
+            model_artifact_id=best_search_result.get("model_artifact_id"),
+            model_id=str(best_search_result["model_name"]),
+            parent_artifact_ids=[
+                parent_id
+                for parent_id in (artifact_id(best_search_result), artifact_id(uncertainty_audit))
+                if parent_id
+            ],
+        )
 
         log_status(
             f"Final report ready. Best model={validation_result['model_name']} | "

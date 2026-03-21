@@ -441,6 +441,49 @@ class ResearchProtocolTests(unittest.TestCase):
         self.assertEqual(report["source_of_truth"], "final_metrics.json")
         self.assertEqual(report["mismatches"][0]["artifact"], "best_search_result.json")
 
+    def test_validate_final_artifact_consistency_detects_run_scope_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "best_search_model.pkl").write_bytes(b"placeholder")
+            (outputs_dir / "final_metrics.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-current",
+                        "baseline_metrics": {"composite_score": 0.8},
+                        "best_search_metrics": {
+                            "run_id": "run-current",
+                            "artifact_id": "best-current",
+                            "model_name": "LGBMRegressor",
+                            "hyperparameters": {"n_estimators": 300},
+                            "composite_score": 0.83,
+                            "validation_verdict": "WARN",
+                        },
+                        "best_model_name": "LGBMRegressor",
+                        "best_model_hyperparameters": {"n_estimators": 300},
+                        "validation_verdict": "WARN",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "best_search_result.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-stale",
+                        "artifact_id": "best-stale",
+                        "model_name": "LGBMRegressor",
+                        "hyperparameters": {"n_estimators": 300},
+                        "composite_score": 0.83,
+                        "validation_verdict": "WARN",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_final_artifact_consistency(outputs_dir)
+
+        self.assertFalse(report["consistent"])
+        self.assertTrue(any(item["field"] == "run_id" for item in report["mismatches"]))
+
 
 if __name__ == "__main__":
     unittest.main()

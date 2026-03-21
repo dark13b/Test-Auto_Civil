@@ -90,6 +90,15 @@ def _to_serializable(value: Any) -> Any:
     return value
 
 
+def _artifact_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_metadata = payload.get("artifact_metadata", {})
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    for key in ("run_id", "artifact_id", "model_artifact_id", "source_mode", "timestamp"):
+        if key not in metadata and key in payload:
+            metadata[key] = payload[key]
+    return metadata
+
+
 def load_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Required JSON artifact not found: {path}")
@@ -764,15 +773,23 @@ def build_acceptance_decision(final_metrics: dict[str, Any], brief: dict[str, An
     improvement_pct = _to_float(final_metrics.get("composite_improvement_pct"), 0.0)
     best_metrics = final_metrics.get("best_search_metrics", {})
     best_model_name = str(best_metrics.get("model_name", "unknown")) if isinstance(best_metrics, dict) else "unknown"
+    final_metrics_metadata = _artifact_metadata(final_metrics)
+    stale_inputs = bool(final_metrics_metadata.get("stale", False))
 
-    accepted = improvement_pct >= minimum_improvement_pct
+    accepted = (improvement_pct >= minimum_improvement_pct) and not stale_inputs
     decision_reason = (
         "accepted: measured improvement meets threshold"
         if accepted
-        else "rejected: measured improvement below threshold"
+        else (
+            "rejected: stale artifact inputs detected"
+            if stale_inputs
+            else "rejected: measured improvement below threshold"
+        )
     )
     return {
         "source_of_truth": "final_metrics.json",
+        "run_id": final_metrics_metadata.get("run_id", final_metrics.get("run_id")),
+        "source_mode": "acceptance",
         "acceptance_metric": str(brief.get("acceptance_metric", "composite_score")),
         "measured_improvement_pct": improvement_pct,
         "required_min_improvement_pct": minimum_improvement_pct,
@@ -790,9 +807,12 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
         raise ValueError("final_metrics.json must contain best_search_metrics.")
 
     mismatches: list[dict[str, Any]] = []
+    final_metrics_metadata = _artifact_metadata(final_metrics)
+    best_metrics_metadata = _artifact_metadata(best_search_metrics)
     best_result_path = outputs_dir / "best_search_result.json"
     if best_result_path.exists():
         best_result = load_json_file(best_result_path)
+        best_result_metadata = _artifact_metadata(best_result)
         for key in ("model_name", "hyperparameters", "composite_score", "validation_verdict"):
             if _to_serializable(best_result.get(key)) != _to_serializable(best_search_metrics.get(key)):
                 mismatches.append(
@@ -801,6 +821,23 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
                         "field": key,
                         "expected": best_search_metrics.get(key),
                         "actual": best_result.get(key),
+                    }
+                )
+        for key, expected_value, actual_value in (
+            ("run_id", best_metrics_metadata.get("run_id"), best_result_metadata.get("run_id")),
+            (
+                "model_artifact_id",
+                best_metrics_metadata.get("model_artifact_id"),
+                best_result_metadata.get("model_artifact_id"),
+            ),
+        ):
+            if expected_value != actual_value:
+                mismatches.append(
+                    {
+                        "artifact": "best_search_result.json",
+                        "field": key,
+                        "expected": expected_value,
+                        "actual": actual_value,
                     }
                 )
     else:
@@ -840,6 +877,15 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
                 "field": "validation_verdict",
                 "expected": best_search_metrics.get("validation_verdict"),
                 "actual": final_metrics.get("validation_verdict"),
+            }
+        )
+    if final_metrics_metadata.get("run_id") not in {None, best_metrics_metadata.get("run_id")}:
+        mismatches.append(
+            {
+                "artifact": "final_metrics.json",
+                "field": "run_id",
+                "expected": best_metrics_metadata.get("run_id"),
+                "actual": final_metrics_metadata.get("run_id"),
             }
         )
 
