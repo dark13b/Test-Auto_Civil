@@ -7,6 +7,7 @@ import copy
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from proposal_engine import (
     ProposalExtractionError,
     ProposalParseFailure,
     ProposalPreflightFailure,
+    ProposalSemanticFailure,
     ProposalSchemaFailure,
 )
 from research_protocol import (
@@ -52,6 +54,7 @@ from train import (
     save_pickle_artifact,
     set_global_seed,
     split_dataset,
+    write_run_scoped_json_artifact,
 )
 from validator import summarize_validation_report
 
@@ -69,6 +72,8 @@ SEARCH_STATE_BEST_MODEL_FILENAME = "search_state_best_model.pkl"
 EXPERIMENT_MEMORY_FILENAME = "experiment_memory.json"
 LLM_RUN_SUMMARY_FILENAME = "llm_run_summary.json"
 LLM_SMOKE_TEST_FILENAME = "llm_smoke_test.json"
+LLM_SMOKE_RELIABILITY_FILENAME = "llm_smoke_reliability.json"
+RUN_MANIFEST_FILENAME = "run_manifest.json"
 HYPOTHESIS_ARCHIVE_FILENAME = "hypothesis_archive.json"
 
 
@@ -135,6 +140,153 @@ def _append_research_log(path: Path, line: str) -> None:
         handle.write(line + "\n")
 
 
+def _increment_count(mapping: dict[str, int], key: Any, *, amount: int = 1) -> None:
+    normalized_key = str(key)
+    mapping[normalized_key] = mapping.get(normalized_key, 0) + int(amount)
+
+
+def _build_run_manifest_payload(
+    *,
+    run_id: str,
+    run_started_at: str,
+    run_finished_at: str,
+    config: dict[str, Any],
+    brief: dict[str, Any],
+    llm_config: dict[str, Any],
+    allow_deterministic_fallback: bool,
+    preflight_result: dict[str, Any] | None,
+    proposal_metadata: dict[str, Any] | None,
+    smoke_summary: dict[str, Any] | None,
+    proposal_status_counts: dict[str, int],
+    semantic_rejection_counts: dict[str, int],
+    llm_failure_counts: dict[str, int],
+    archive_update_summary: dict[str, int],
+    number_of_candidates_evaluated: int,
+    holdout_touched_during_search: bool,
+    final_abort_reason: str | None,
+    final_run_status: str,
+    final_metrics: dict[str, Any] | None,
+    acceptance: dict[str, Any] | None,
+    validation_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    backend = None
+    model = None
+    smoke_test_status = None
+    preflight_status = None
+    if isinstance(preflight_result, dict):
+        backend = preflight_result.get("backend")
+        model = preflight_result.get("model")
+        smoke_test_status = preflight_result.get("status")
+        preflight_status = "passed" if bool(preflight_result.get("ok", False)) else "failed"
+    elif isinstance(proposal_metadata, dict):
+        backend = proposal_metadata.get("proposal_backend")
+        model = proposal_metadata.get("proposal_model")
+
+    selection_metric_name = str(brief.get("acceptance_metric") or "composite_score")
+    manifest = {
+        "run_id": run_id,
+        "timestamp": {
+            "started_at": run_started_at,
+            "finished_at": run_finished_at,
+        },
+        "backend": backend,
+        "model": model,
+        "fallback_allowed": bool(allow_deterministic_fallback),
+        "preflight_status": preflight_status,
+        "smoke_test_status": smoke_test_status,
+        "proposal_status_counts": dict(sorted(proposal_status_counts.items())),
+        "semantic_rejection_counts": dict(sorted(semantic_rejection_counts.items())),
+        "final_abort_reason": final_abort_reason,
+        "holdout_touched_during_search": bool(holdout_touched_during_search),
+        "selection_metric_name": selection_metric_name,
+        "selection_partition": "validation",
+        "final_holdout_metric_name": None,
+        "number_of_candidates_evaluated": int(number_of_candidates_evaluated),
+        "llm_failure_counts": dict(sorted(llm_failure_counts.items())),
+        "archive_update_summary": dict(sorted(archive_update_summary.items())) or None,
+        "final_run_status": final_run_status,
+        "runtime_context": {
+            "backend_mode": llm_config.get("backend_mode"),
+            "llm_enabled": bool(llm_config.get("enabled", False)),
+            "selection_metric_name": selection_metric_name,
+            "config_random_seed": config.get("experiment", {}).get("random_seed"),
+        },
+    }
+    if isinstance(smoke_summary, dict):
+        manifest["smoke_test_summary"] = smoke_summary
+        failure_counts = smoke_summary.get("failure_class_counts", {})
+        manifest["llm_failure_counts"] = dict(sorted(failure_counts.items())) if isinstance(failure_counts, dict) else dict(sorted(llm_failure_counts.items()))
+        manifest["smoke_test_status"] = smoke_summary.get("compatibility", {}).get("interpretation", smoke_test_status)
+    if isinstance(final_metrics, dict):
+        holdout_metrics = final_metrics.get("holdout_metrics")
+        if isinstance(holdout_metrics, dict) and holdout_metrics:
+            manifest["final_holdout_metric_name"] = next(iter(holdout_metrics.keys()))
+    if isinstance(acceptance, dict):
+        manifest["acceptance_decision"] = {
+            "accepted": acceptance.get("accepted"),
+            "decision_reason": acceptance.get("decision_reason"),
+            "source_mode": acceptance.get("source_mode"),
+        }
+    if isinstance(validation_report, dict):
+        manifest["final_artifact_validation"] = {
+            "consistent": validation_report.get("consistent"),
+            "mismatches": validation_report.get("mismatches", []),
+        }
+    return manifest
+
+
+def _write_run_manifest(outputs_dir: Path, payload: dict[str, Any]) -> None:
+    run_id = str(payload.get("run_id", "unknown"))
+    write_run_scoped_json_artifact(
+        outputs_dir=outputs_dir,
+        filename=RUN_MANIFEST_FILENAME,
+        payload=payload,
+        run_id=run_id,
+        source_mode="manifest",
+    )
+
+
+def _load_run_manifest_counts(
+    *,
+    memory_path: Path,
+    archive_path: Path,
+    run_id: str,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+    proposal_status_counts: dict[str, int] = {}
+    semantic_rejection_counts: dict[str, int] = {}
+    llm_failure_counts: dict[str, int] = {}
+    archive_update_summary: dict[str, int] = {"added": 0, "resolved": 0}
+
+    if memory_path.exists():
+        memory_payload = load_json_file(memory_path)
+        for run in memory_payload.get("runs", []):
+            if str(run.get("run_id")) != str(run_id):
+                continue
+            for trial in run.get("trials", []):
+                _increment_count(proposal_status_counts, trial.get("selection_status", "unknown"))
+                if str(trial.get("proposal_source")) == "llm" and trial.get("proposal_status") == "error":
+                    _increment_count(llm_failure_counts, "error")
+                semantic_result = str(trial.get("semantic_validation_result", "")).lower()
+                if semantic_result == "failed":
+                    rejection = trial.get("semantic_rejection_reason")
+                    if isinstance(rejection, dict):
+                        _increment_count(semantic_rejection_counts, rejection.get("code", "unknown"))
+                    else:
+                        _increment_count(semantic_rejection_counts, trial.get("proposal_status", "unknown"))
+
+    if archive_path.exists():
+        archive_payload = load_json_file(archive_path)
+        for record in archive_payload.get("records", []):
+            if str(record.get("run_id")) != str(run_id):
+                continue
+            if record.get("timestamp") is not None:
+                archive_update_summary["added"] += int(record.get("outcome") == "pending")
+                archive_update_summary["resolved"] += int(record.get("outcome") not in {None, "pending"})
+            if record.get("calibration_error") is not None and record.get("outcome") is not None:
+                _increment_count(llm_failure_counts, str(record.get("outcome")))
+    return proposal_status_counts, semantic_rejection_counts, llm_failure_counts, archive_update_summary
+
+
 def _read_baseline_metrics(outputs_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
     baseline_path = outputs_dir / "baseline_metrics.json"
     if baseline_path.exists():
@@ -154,6 +306,12 @@ def _read_baseline_metrics(outputs_dir: Path, config: dict[str, Any]) -> dict[st
 
 
 def _load_current_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any]) -> dict[str, Any]:
+    best_result_path = outputs_dir / BEST_RESULT_FILENAME
+    if best_result_path.exists():
+        payload = load_json_file(best_result_path)
+        payload.setdefault("source", "best_search_result")
+        return payload
+
     final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME
     if final_metrics_path.exists():
         final_metrics = load_json_file(final_metrics_path)
@@ -162,12 +320,6 @@ def _load_current_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any
             payload = copy.deepcopy(best_search_metrics)
             payload.setdefault("source", "final_metrics")
             return payload
-
-    best_result_path = outputs_dir / BEST_RESULT_FILENAME
-    if best_result_path.exists():
-        payload = load_json_file(best_result_path)
-        payload.setdefault("source", "best_search_result")
-        return payload
 
     payload = copy.deepcopy(baseline_metrics)
     payload["source"] = "baseline"
@@ -198,7 +350,9 @@ def _build_final_metrics_payload(
         "best_model_name": best_result["model_name"],
         "best_model_hyperparameters": copy.deepcopy(best_result["hyperparameters"]),
         "validation_summary": _build_validation_summary(validation_report),
-        "validation_metrics": copy.deepcopy(best_result.get("val_metrics", best_result.get("test_metrics", {}))),
+        "validation_metrics": copy.deepcopy(
+            best_result.get("selection_metrics", best_result.get("val_metrics", best_result.get("test_metrics", {})))
+        ),
     }
 
 
@@ -252,6 +406,9 @@ def _build_record(
             "proposal_family": experiment.get("proposal_family"),
             "proposal_source": experiment.get("proposal_source"),
             "proposal_status": experiment.get("proposal_status"),
+            "semantic_validation_result": experiment.get("semantic_validation_result"),
+            "semantic_validation_error": experiment.get("semantic_validation_error"),
+            "semantic_rejection_reason": experiment.get("semantic_rejection_reason"),
             "proposal_backend": experiment.get("proposal_backend"),
             "proposal_model": experiment.get("proposal_model"),
             "prompt_hash": experiment.get("prompt_hash"),
@@ -274,7 +431,7 @@ def _build_record(
         return record
 
     validation_report = result.get("validation_report", {})
-    val_metrics = result.get("val_metrics", result.get("test_metrics", {}))
+    val_metrics = result.get("selection_metrics", result.get("val_metrics", result.get("test_metrics", {})))
     record.update(
         {
             "rmse": result.get("rmse"),
@@ -471,6 +628,21 @@ def _build_proposal_engine(config: dict[str, Any], outputs_dir: Path) -> Proposa
     )
 
 
+def _apply_llm_smoke_overrides(
+    config: dict[str, Any],
+    *,
+    backend_mode: str | None = None,
+) -> dict[str, Any]:
+    if not backend_mode:
+        return config
+    updated = copy.deepcopy(config)
+    llm_config = get_llm_config(updated)
+    llm_config["enabled"] = True
+    llm_config["backend_mode"] = backend_mode
+    updated["llm"] = llm_config
+    return updated
+
+
 def _extract_feature_list(frame: Any) -> list[str]:
     columns = getattr(frame, "columns", None)
     if columns is None:
@@ -635,6 +807,7 @@ def _run_llm_preflight(
     archive_records: list[dict[str, Any]],
     llm_enabled: bool,
     allow_deterministic_fallback: bool,
+    model_hint: str | None = None,
 ) -> dict[str, Any] | None:
     if proposal_engine is None:
         if not llm_enabled:
@@ -672,6 +845,7 @@ def _run_llm_preflight(
         failure_patterns=failure_patterns,
         knowledge_context=knowledge_context,
         archive_records=archive_records,
+        model_hint=model_hint,
     )
     write_json_file(outputs_dir / LLM_SMOKE_TEST_FILENAME, smoke_result)
     if not bool(smoke_result.get("ok", False)) and not allow_deterministic_fallback:
@@ -681,6 +855,268 @@ def _run_llm_preflight(
             interaction=smoke_result,
         )
     return smoke_result
+
+
+def _percentile(sorted_values: list[float], percentile: float) -> float | None:
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    bounded = min(max(percentile, 0.0), 1.0)
+    index = max(0, min(len(sorted_values) - 1, int((len(sorted_values) * bounded) + 0.999999) - 1))
+    return sorted_values[index]
+
+
+def summarize_smoke_test_trials(
+    trials: list[dict[str, Any]],
+    *,
+    requested_backend: str | None = None,
+    requested_model: str | None = None,
+) -> dict[str, Any]:
+    total_trials = len(trials)
+    if total_trials == 0:
+        return {
+            "total_trials": 0,
+            "success_count": 0,
+            "success_rate": 0.0,
+            "parse_failure_rate": 0.0,
+            "schema_failure_rate": 0.0,
+            "semantic_failure_rate": 0.0,
+            "hidden_channel_incidence": 0.0,
+            "empty_visible_response_incidence": 0.0,
+            "repair_usage_rate": 0.0,
+            "median_latency_seconds": None,
+            "p95_latency_seconds": None,
+            "status_counts": {},
+            "backend_counts": {},
+            "model_counts": {},
+            "backend_model_counts": {},
+            "compatibility": {
+                "issue_codes": ["no_trials"],
+                "issues": [{"code": "no_trials", "count": 1}],
+                "interpretation": "incompatible for control tasks",
+            },
+        }
+
+    status_counts: dict[str, int] = {}
+    backend_counts: dict[str, int] = {}
+    model_counts: dict[str, int] = {}
+    backend_model_counts: dict[str, int] = {}
+    failure_class_counts: dict[str, int] = {}
+    unexpected_pairs: dict[str, int] = {}
+    success_count = 0
+    parse_failure_count = 0
+    schema_failure_count = 0
+    semantic_failure_count = 0
+    hidden_channel_count = 0
+    empty_visible_count = 0
+    repair_count = 0
+    latencies: list[float] = []
+
+    for trial in trials:
+        status = str(trial.get("status", "unknown"))
+        backend = str(trial.get("backend", "unknown"))
+        model = str(trial.get("model", "unknown"))
+        channel = str(trial.get("extracted_from_channel", "unknown"))
+        pair = f"{backend}::{model}"
+
+        status_counts[status] = status_counts.get(status, 0) + 1
+        backend_counts[backend] = backend_counts.get(backend, 0) + 1
+        model_counts[model] = model_counts.get(model, 0) + 1
+        backend_model_counts[pair] = backend_model_counts.get(pair, 0) + 1
+
+        failure_class = trial.get("failure_class")
+        if failure_class:
+            code = str(failure_class)
+            failure_class_counts[code] = failure_class_counts.get(code, 0) + 1
+
+        if bool(trial.get("ok", False)):
+            success_count += 1
+        if status == "llm_parse_failure":
+            parse_failure_count += 1
+        if status == "llm_schema_failure":
+            schema_failure_count += 1
+        semantic_result = str(trial.get("semantic_validation_result", "")).lower()
+        if semantic_result == "failed" or status in {
+            "duplicate_proposal",
+            "near_duplicate_proposal",
+            "semantically_invalid_candidate_config",
+            "unsupported_novelty_claim",
+            "inconsistent_expected_effect",
+            "non_executable_semantic_config",
+        }:
+            semantic_failure_count += 1
+        if channel in {"thinking", "repaired_thinking"}:
+            hidden_channel_count += 1
+        if bool(trial.get("visible_response_empty", False)):
+            empty_visible_count += 1
+        if bool(trial.get("repair_used", False)):
+            repair_count += 1
+
+        latency = trial.get("latency_seconds")
+        if isinstance(latency, (int, float)):
+            latencies.append(float(latency))
+
+        backend_unexpected = requested_backend not in {None, "", "hybrid"} and backend != requested_backend
+        model_unexpected = bool(requested_model) and model != requested_model
+        if backend_unexpected or model_unexpected:
+            unexpected_pairs[pair] = unexpected_pairs.get(pair, 0) + 1
+
+    latencies.sort()
+    issue_codes: list[str] = []
+    issues: list[dict[str, Any]] = []
+
+    backend_failures = status_counts.get("llm_backend_failure", 0)
+    if backend_failures:
+        issue_codes.append("backend_or_model_failure")
+        issues.append({"code": "backend_or_model_failure", "count": backend_failures})
+    hidden_failures = failure_class_counts.get("hidden_channel_only", 0)
+    if hidden_failures:
+        issue_codes.append("hidden_channel_output")
+        issues.append({"code": "hidden_channel_output", "count": hidden_failures})
+    if semantic_failure_count:
+        issue_codes.append("semantic_rejection")
+        issues.append({"code": "semantic_rejection", "count": semantic_failure_count})
+    if unexpected_pairs:
+        issue_codes.append("unexpected_backend_model_pair")
+        issues.append(
+            {
+                "code": "unexpected_backend_model_pair",
+                "count": sum(unexpected_pairs.values()),
+                "pairs": unexpected_pairs,
+            }
+        )
+
+    success_rate = success_count / total_trials
+    parse_failure_rate = parse_failure_count / total_trials
+    schema_failure_rate = schema_failure_count / total_trials
+    semantic_failure_rate = semantic_failure_count / total_trials
+    hidden_channel_incidence = hidden_channel_count / total_trials
+    empty_visible_response_incidence = empty_visible_count / total_trials
+    repair_usage_rate = repair_count / total_trials
+
+    if (
+        not issue_codes
+        and success_rate >= 0.9
+        and parse_failure_count == 0
+        and schema_failure_count == 0
+        and semantic_failure_count == 0
+        and hidden_channel_count == 0
+    ):
+        interpretation = "usable"
+    elif (backend_failures > 0 and success_rate < 0.8) or success_rate < 0.5:
+        interpretation = "incompatible for control tasks"
+    else:
+        interpretation = "unstable"
+
+    return {
+        "total_trials": total_trials,
+        "success_count": success_count,
+        "success_rate": success_rate,
+        "parse_failure_count": parse_failure_count,
+        "parse_failure_rate": parse_failure_rate,
+        "schema_failure_count": schema_failure_count,
+        "schema_failure_rate": schema_failure_rate,
+        "semantic_failure_count": semantic_failure_count,
+        "semantic_failure_rate": semantic_failure_rate,
+        "hidden_channel_incidence": hidden_channel_incidence,
+        "empty_visible_response_incidence": empty_visible_response_incidence,
+        "repair_usage_rate": repair_usage_rate,
+        "median_latency_seconds": _percentile(latencies, 0.5),
+        "p95_latency_seconds": _percentile(latencies, 0.95),
+        "status_counts": status_counts,
+        "backend_counts": backend_counts,
+        "model_counts": model_counts,
+        "backend_model_counts": backend_model_counts,
+        "failure_class_counts": failure_class_counts,
+        "unexpected_backend_model_pairs": unexpected_pairs,
+        "compatibility": {
+            "issue_codes": issue_codes,
+            "issues": issues,
+            "interpretation": interpretation,
+        },
+    }
+
+
+def run_repeated_llm_smoke_test(
+    *,
+    proposal_engine: ProposalEngine | None,
+    available_models: dict[str, dict[str, Any]],
+    brief: dict[str, Any],
+    current_best: dict[str, Any],
+    memory_payload: dict[str, Any],
+    knowledge_context: str,
+    failure_patterns: dict[str, Any],
+    archive_records: list[dict[str, Any]],
+    trials: int,
+    summary_path: Path | None = None,
+    requested_backend: str | None = None,
+    model_hint: str | None = None,
+) -> dict[str, Any]:
+    requested_trials = max(1, int(trials))
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    trial_history = [
+        trial
+        for run in memory_payload.get("runs", [])
+        for trial in run.get("trials", [])
+    ]
+    normalized_trials: list[dict[str, Any]] = []
+
+    for trial_index in range(1, requested_trials + 1):
+        if proposal_engine is None:
+            trial_result = {
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "ok": False,
+                "status": "aborted_due_to_preflight_failure",
+                "backend": requested_backend or "disabled",
+                "model": model_hint,
+                "prompt_hash": None,
+                "proposal_preview": None,
+                "error": "LLM proposal engine is disabled by config.",
+                "extracted_from_channel": "response",
+                "visible_response_empty": True,
+                "parse_success": False,
+                "schema_success": False,
+                "repair_used": False,
+                "latency_seconds": None,
+                "failure_class": "llm_backend_failure",
+            }
+        else:
+            trial_result = proposal_engine.run_proposal_smoke_test(
+                available_models=available_models,
+                research_brief=brief,
+                current_best=current_best,
+                experiment_memory=memory_payload,
+                diversity_state=_build_diversity_state(memory_payload),
+                trial_history=trial_history,
+                search_progress={"phase": "preflight", "trial_index": trial_index, "trial_count": requested_trials},
+                failure_patterns=failure_patterns,
+                knowledge_context=knowledge_context,
+                archive_records=archive_records,
+                model_hint=model_hint,
+            )
+        normalized = dict(trial_result)
+        normalized["trial_index"] = trial_index
+        normalized.setdefault("timestamp", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+        normalized_trials.append(normalized)
+
+    summary = summarize_smoke_test_trials(
+        normalized_trials,
+        requested_backend=requested_backend or (proposal_engine.backend_name if proposal_engine is not None else None),
+        requested_model=model_hint,
+    )
+    report = {
+        "generated_at": timestamp,
+        "requested_trials": requested_trials,
+        "requested_backend": requested_backend or (proposal_engine.backend_name if proposal_engine is not None else None),
+        "requested_model": model_hint,
+        "summary_path": str(summary_path) if summary_path is not None else None,
+        "trials": normalized_trials,
+        "summary": summary,
+    }
+    if summary_path is not None:
+        write_json_file(summary_path, report)
+    return report
 
 
 def _select_scout_candidates(
@@ -849,7 +1285,7 @@ def _select_scout_candidates(
                 "prompt_variant": llm_result.get("prompt_variant"),
                 "proposal_error": "LLM proposals were rejected by novelty/diversity gates.",
             }
-        except (ProposalBackendFailure, ProposalParseFailure, ProposalSchemaFailure) as exc:
+        except (ProposalBackendFailure, ProposalParseFailure, ProposalSchemaFailure, ProposalSemanticFailure) as exc:
             if not allow_deterministic_fallback:
                 raise
             deterministic_candidates = research_lab.scout_experiments(
@@ -917,10 +1353,12 @@ def analyze_interaction_log(outputs_dir: Path, *, filename: str = "llm_interacti
             "interaction_count": 0,
             "channel_counts": {},
             "rejection_counts": {},
+            "semantic_rejection_counts": {},
         }
 
     channel_counts: dict[str, int] = {}
     rejection_counts: dict[str, int] = {}
+    semantic_rejection_counts: dict[str, int] = {}
     repair_count = 0
     parse_success_count = 0
     with interaction_path.open("r", encoding="utf-8") as handle:
@@ -936,11 +1374,16 @@ def analyze_interaction_log(outputs_dir: Path, *, filename: str = "llm_interacti
         if isinstance(rejection, dict):
             code = str(rejection.get("code", "unknown"))
             rejection_counts[code] = rejection_counts.get(code, 0) + 1
+        semantic_rejection = record.get("semantic_rejection_reason")
+        if isinstance(semantic_rejection, dict):
+            code = str(semantic_rejection.get("code", "unknown"))
+            semantic_rejection_counts[code] = semantic_rejection_counts.get(code, 0) + 1
     return {
         "exists": True,
         "interaction_count": len(records),
         "channel_counts": channel_counts,
         "rejection_counts": rejection_counts,
+        "semantic_rejection_counts": semantic_rejection_counts,
         "repair_count": repair_count,
         "parse_success_count": parse_success_count,
     }
@@ -985,6 +1428,7 @@ def run_engineering_research_loop(
     _initialize_research_log(log_path, baseline_metrics)
 
     run_id = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    run_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     current_run_signatures: set[tuple[str, str]] = set()
     proposal_engine = _build_proposal_engine(config, outputs_dir)
     llm_config = get_llm_config(config)
@@ -1007,19 +1451,60 @@ def run_engineering_research_loop(
     knowledge_context = _build_knowledge_context_for_loop(current_best=current_best_result, x_train=x_train)
     failure_patterns = FailureAnalyzer(memory_path).extract_failure_patterns()
     archive_records = hypothesis_archive.load().get("records", [])
-    preflight_result = _run_llm_preflight(
-        proposal_engine=proposal_engine,
-        outputs_dir=outputs_dir,
-        available_models=available_models,
-        brief=brief,
-        current_best=current_best_result,
-        memory_payload=memory_payload,
-        knowledge_context=knowledge_context,
-        failure_patterns=failure_patterns,
-        archive_records=archive_records,
-        llm_enabled=bool(llm_config.get("enabled", False)),
-        allow_deterministic_fallback=allow_deterministic_fallback,
-    )
+    preflight_result: dict[str, Any] | None = None
+    final_metrics: dict[str, Any] | None = None
+    acceptance: dict[str, Any] | None = None
+    validation_report: dict[str, Any] | None = None
+    final_abort_reason: str | None = None
+    final_run_status = "running"
+    try:
+        preflight_result = _run_llm_preflight(
+            proposal_engine=proposal_engine,
+            outputs_dir=outputs_dir,
+            available_models=available_models,
+            brief=brief,
+            current_best=current_best_result,
+            memory_payload=memory_payload,
+            knowledge_context=knowledge_context,
+            failure_patterns=failure_patterns,
+            archive_records=archive_records,
+            llm_enabled=bool(llm_config.get("enabled", False)),
+            allow_deterministic_fallback=allow_deterministic_fallback,
+        )
+    except ProposalPreflightFailure as exc:
+        preflight_result = dict(getattr(exc, "interaction", {}) or {})
+        final_abort_reason = str(exc)
+        final_run_status = "aborted"
+        proposal_status_counts, semantic_rejection_counts, llm_failure_counts, archive_update_summary = _load_run_manifest_counts(
+            memory_path=memory_path,
+            archive_path=archive_path,
+            run_id=run_id,
+        )
+        manifest = _build_run_manifest_payload(
+            run_id=run_id,
+            run_started_at=run_started_at,
+            run_finished_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            config=config,
+            brief=brief,
+            llm_config=llm_config,
+            allow_deterministic_fallback=allow_deterministic_fallback,
+            preflight_result=preflight_result,
+            proposal_metadata=None,
+            smoke_summary=None,
+            proposal_status_counts=proposal_status_counts,
+            semantic_rejection_counts=semantic_rejection_counts,
+            llm_failure_counts=llm_failure_counts,
+            archive_update_summary=archive_update_summary,
+            number_of_candidates_evaluated=0,
+            holdout_touched_during_search=False,
+            final_abort_reason=final_abort_reason,
+            final_run_status=final_run_status,
+            final_metrics=None,
+            acceptance=None,
+            validation_report=None,
+        )
+        _write_run_manifest(outputs_dir, manifest)
+        raise
 
     for cycle_number in range(1, max_cycles + 1):
         elapsed_runtime = time.perf_counter() - research_start
@@ -1311,15 +1796,6 @@ def run_engineering_research_loop(
                         outputs_dir=outputs_dir,
                         audit_partition="validation_audit",
                     )
-                    if rebuild_reports_on_keep:
-                        import report
-
-                        if report.main() != 0:
-                            raise RuntimeError("Report generation failed after a kept confirm experiment.")
-                        validation_report = validate_final_artifact_consistency(outputs_dir)
-                        write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
-                        if not validation_report["consistent"]:
-                            raise RuntimeError(f"Post-report artifact mismatch: {validation_report['mismatches']}")
                     confirmed_reference = current_best_result
                 else:
                     selection_status = "reverted"
@@ -1404,19 +1880,6 @@ def run_engineering_research_loop(
             best_model_source_path=baseline_model_path,
         )
 
-    if with_report and not rebuild_reports_on_keep:
-        from uncertainty import recalibrate_uncertainty_artifacts
-        import report
-
-        recalibrate_uncertainty_artifacts(
-            model_path=outputs_dir / BEST_MODEL_FILENAME,
-            method=str(config["engineering"]["uncertainty_method"]),
-            outputs_dir=outputs_dir,
-            audit_partition="validation_audit",
-        )
-        if report.main() != 0:
-            raise RuntimeError("Report generation failed at end of research loop.")
-
     final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME
     if final_metrics_path.exists():
         final_metrics = load_json_file(final_metrics_path)
@@ -1440,6 +1903,52 @@ def run_engineering_research_loop(
     write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
     if not validation_report["consistent"]:
         raise RuntimeError(f"Final artifact mismatch: {validation_report['mismatches']}")
+    if with_report:
+        from uncertainty import recalibrate_uncertainty_artifacts
+        import report
+
+        recalibrate_uncertainty_artifacts(
+            model_path=outputs_dir / BEST_MODEL_FILENAME,
+            method=str(config["engineering"]["uncertainty_method"]),
+            outputs_dir=outputs_dir,
+            audit_partition="validation_audit",
+        )
+        if report.main() != 0:
+            raise RuntimeError("Report generation failed after search finalization.")
+        validation_report = validate_final_artifact_consistency(outputs_dir)
+        write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
+        if not validation_report["consistent"]:
+            raise RuntimeError(f"Post-report artifact mismatch: {validation_report['mismatches']}")
+    final_run_status = "success"
+    proposal_status_counts, semantic_rejection_counts, llm_failure_counts, archive_update_summary = _load_run_manifest_counts(
+        memory_path=memory_path,
+        archive_path=archive_path,
+        run_id=run_id,
+    )
+    manifest = _build_run_manifest_payload(
+        run_id=run_id,
+        run_started_at=run_started_at,
+        run_finished_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        config=config,
+        brief=brief,
+        llm_config=llm_config,
+        allow_deterministic_fallback=allow_deterministic_fallback,
+        preflight_result=preflight_result,
+        proposal_metadata=proposal_metadata,
+        smoke_summary=None,
+        proposal_status_counts=proposal_status_counts,
+        semantic_rejection_counts=semantic_rejection_counts,
+        llm_failure_counts=llm_failure_counts,
+        archive_update_summary=archive_update_summary,
+        number_of_candidates_evaluated=trial_number,
+        holdout_touched_during_search=bool(with_report),
+        final_abort_reason=final_abort_reason,
+        final_run_status=final_run_status,
+        final_metrics=final_metrics,
+        acceptance=acceptance,
+        validation_report=validation_report,
+    )
+    _write_run_manifest(outputs_dir, manifest)
     return final_metrics["best_search_metrics"]
 
 
@@ -1466,6 +1975,28 @@ def main() -> int:
         action="store_true",
         help="Run the strict proposal-engine preflight check and exit.",
     )
+    parser.add_argument(
+        "--llm-smoke-repeat",
+        type=int,
+        default=None,
+        help="Run the strict proposal-engine smoke test repeatedly and export a reliability summary.",
+    )
+    parser.add_argument(
+        "--llm-backend-mode",
+        choices=["ollama", "openai", "hybrid"],
+        default=None,
+        help="Override llm.backend_mode for smoke-test commands.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Override the proposal model hint for smoke-test commands.",
+    )
+    parser.add_argument(
+        "--llm-smoke-summary",
+        default=None,
+        help="Optional path for the repeated smoke-test JSON summary artifact.",
+    )
     args = parser.parse_args()
 
     try:
@@ -1484,13 +2015,18 @@ def main() -> int:
                 f"count={interaction_summary['interaction_count']} | "
                 f"channels={json.dumps(interaction_summary['channel_counts'], sort_keys=True)} | "
                 f"rejections={json.dumps(interaction_summary['rejection_counts'], sort_keys=True)} | "
+                f"semantic_rejections={json.dumps(interaction_summary.get('semantic_rejection_counts', {}), sort_keys=True)} | "
                 f"repairs={interaction_summary.get('repair_count', 0)} | "
                 f"parse_success={interaction_summary.get('parse_success_count', 0)}"
             )
             return 0
 
-        if args.llm_smoke_test:
-            config = load_config()
+        if args.llm_smoke_test or args.llm_smoke_repeat is not None:
+            config = _apply_llm_smoke_overrides(
+                load_config(),
+                backend_mode=args.llm_backend_mode,
+            )
+            outputs_dir = get_outputs_dir(config)
             baseline_metrics = _read_baseline_metrics(outputs_dir, config)
             current_best_result = _load_current_best_result(outputs_dir, baseline_metrics)
             research_config = dict(config.get("research", {}))
@@ -1508,6 +2044,43 @@ def main() -> int:
                 research_config.get("hypothesis_archive_filename", HYPOTHESIS_ARCHIVE_FILENAME)
             )
             hypothesis_archive = HypothesisArchive(archive_path)
+            knowledge_context = _build_knowledge_context_for_loop(
+                current_best=current_best_result,
+                x_train=x_train,
+            )
+            failure_patterns = FailureAnalyzer(memory_path).extract_failure_patterns()
+            archive_records = hypothesis_archive.load().get("records", [])
+
+            if args.llm_smoke_repeat is not None:
+                summary_path = (
+                    Path(args.llm_smoke_summary)
+                    if args.llm_smoke_summary
+                    else outputs_dir / LLM_SMOKE_RELIABILITY_FILENAME
+                )
+                report = run_repeated_llm_smoke_test(
+                    proposal_engine=proposal_engine,
+                    available_models=available_models,
+                    brief=brief,
+                    current_best=current_best_result,
+                    memory_payload=memory_payload,
+                    knowledge_context=knowledge_context,
+                    failure_patterns=failure_patterns,
+                    archive_records=archive_records,
+                    trials=args.llm_smoke_repeat,
+                    summary_path=summary_path,
+                    requested_backend=args.llm_backend_mode,
+                    model_hint=args.llm_model,
+                )
+                log_status(
+                    "LLM smoke reliability | "
+                    f"trials={report['requested_trials']} | "
+                    f"success_rate={report['summary']['success_rate']:.3f} | "
+                    f"semantic_failure_rate={report['summary'].get('semantic_failure_rate', 0.0):.3f} | "
+                    f"interpretation={report['summary']['compatibility']['interpretation']} | "
+                    f"summary={summary_path}"
+                )
+                return 0 if report["summary"]["success_count"] == report["summary"]["total_trials"] else 1
+
             smoke_result = _run_llm_preflight(
                 proposal_engine=proposal_engine,
                 outputs_dir=outputs_dir,
@@ -1515,14 +2088,12 @@ def main() -> int:
                 brief=brief,
                 current_best=current_best_result,
                 memory_payload=memory_payload,
-                knowledge_context=_build_knowledge_context_for_loop(
-                    current_best=current_best_result,
-                    x_train=x_train,
-                ),
-                failure_patterns=FailureAnalyzer(memory_path).extract_failure_patterns(),
-                archive_records=hypothesis_archive.load().get("records", []),
+                knowledge_context=knowledge_context,
+                failure_patterns=failure_patterns,
+                archive_records=archive_records,
                 llm_enabled=bool(llm_config.get("enabled", False)),
                 allow_deterministic_fallback=bool(llm_config.get("allow_deterministic_fallback", False)),
+                model_hint=args.llm_model,
             )
             log_status(
                 "LLM smoke test | "

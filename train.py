@@ -76,7 +76,19 @@ DEFAULT_REGIME_BLEND_WIDTH_MPA = 2.0
 def log_status(message: str) -> None:
     """Print a timestamped status message."""
     timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}")
+    text = f"[{timestamp}] {message}"
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        fallback = (text + "\n").encode("ascii", errors="backslashreplace")
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            buffer.write(fallback)
+            sys.stdout.flush()
+            return
+        sys.stdout.write(fallback.decode("ascii"))
+        sys.stdout.flush()
 
 
 def get_project_root() -> Path:
@@ -759,6 +771,8 @@ def evaluate_candidate(
         "r2": cv_metrics["r2"],
         "composite_score": cv_metrics["composite_score"],
         "cv_metrics": cv_metrics,
+        "selection_partition": "validation",
+        "selection_metrics": val_metrics,
         "val_metrics": val_metrics,
         "test_metrics": val_metrics,
         "validation_verdict": validation_report["verdict"],
@@ -907,6 +921,8 @@ def build_stacking_ensemble(
         "r2": cv_metrics["r2"],
         "composite_score": cv_metrics["composite_score"],
         "cv_metrics": cv_metrics,
+        "selection_partition": "validation",
+        "selection_metrics": val_metrics,
         "val_metrics": val_metrics,
         "test_metrics": val_metrics,
         "validation_verdict": validation_report["verdict"],

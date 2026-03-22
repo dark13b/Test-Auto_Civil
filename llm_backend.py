@@ -20,7 +20,7 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
     "enabled": False,
     "backend_mode": "ollama",
     "allow_deterministic_fallback": False,
-    "default_local_proposal_model": "qwen3:8b",
+    "default_local_proposal_model": "qwen3-coder:480b-cloud",
     "default_openai_model": "gpt-4o",
     "qwen_thinking_mode": False,
     "compact_prompt_models": ["qwen3:4b"],
@@ -34,6 +34,20 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
     "diversity": {
         "max_family_share": 0.35,
     },
+    "admission_policy": {
+        "policy_name": "backend_admission",
+        "version": 1,
+        "warning_band_fraction": 0.8,
+        "thresholds": {
+            "min_success_rate": 0.9,
+            "max_backend_failure_rate": 0.1,
+            "max_parse_failure_rate": 0.1,
+            "max_schema_failure_rate": 0.1,
+            "max_hidden_channel_incidence": 0.05,
+            "max_empty_visible_response_incidence": 0.1,
+            "max_p95_latency_seconds": 5.0,
+        },
+    },
     "interval_trials": 15,
     "interaction_interval_minutes": 5.0,
     "smart_model_after_progress": 0.67,
@@ -42,11 +56,11 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
     "interaction_log_filename": "llm_interactions.jsonl",
     "ollama": {
         "base_url": "http://localhost:11434",
-        "model": "qwen3:8b",
-        "fast_model": "qwen3:4b",
-        "smart_model": "qwen3:8b",
+        "model": "qwen3-coder:480b-cloud",
+        "fast_model": "qwen3-coder:480b-cloud",
+        "smart_model": "qwen3-coder:480b-cloud",
         "options": {},
-        "timeout_seconds": 30,
+        "timeout_seconds": 600,
         "use_cli_fallback": True,
     },
     "openai": {
@@ -66,6 +80,8 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
 }
 
 LOGGER = logging.getLogger("llm_backend")
+SUBPROCESS_TEXT_ENCODING = "utf-8"
+SUBPROCESS_TEXT_ERRORS = "replace"
 
 
 class BackendUnavailableError(RuntimeError):
@@ -88,7 +104,9 @@ def get_llm_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(llm_config, dict) and llm_config:
         normalized = _deep_merge(DEFAULT_LLM_CONFIG, llm_config)
         normalized["default_local_proposal_model"] = str(
-            normalized.get("default_local_proposal_model") or normalized.get("ollama", {}).get("model") or "qwen3:8b"
+            normalized.get("default_local_proposal_model")
+            or normalized.get("ollama", {}).get("model")
+            or "qwen3-coder:480b-cloud"
         )
         normalized["default_openai_model"] = str(
             normalized.get("default_openai_model") or normalized.get("openai", {}).get("model") or "gpt-4o"
@@ -144,6 +162,10 @@ def get_llm_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_model_name(model_name: str | None) -> str:
     return str(model_name or "").strip().lower()
+
+
+def _is_cloud_model_name(model_name: str | None) -> bool:
+    return "cloud" in _normalize_model_name(model_name)
 
 
 def resolve_prompt_variant(llm_config: dict[str, Any], model_name: str | None) -> str:
@@ -285,6 +307,8 @@ class OllamaBackend(LLMBackend):
         self.smart_model = str(ollama_config.get("smart_model", self.default_model))
         self.request_options = dict(ollama_config.get("options", {}))
         self.timeout_seconds = max(1, int(ollama_config.get("timeout_seconds", 30)))
+        if any(_is_cloud_model_name(candidate) for candidate in (self.default_model, self.fast_model, self.smart_model)):
+            self.timeout_seconds = max(self.timeout_seconds, 600)
         self.use_cli_fallback = bool(ollama_config.get("use_cli_fallback", True))
         self.qwen_thinking_mode = bool(llm_config.get("qwen_thinking_mode", False))
 
@@ -336,6 +360,8 @@ class OllamaBackend(LLMBackend):
                 ["ollama", "list"],
                 capture_output=True,
                 text=True,
+                encoding=SUBPROCESS_TEXT_ENCODING,
+                errors=SUBPROCESS_TEXT_ERRORS,
                 timeout=self.timeout_seconds,
                 check=False,
             )
@@ -410,7 +436,15 @@ class OllamaBackend(LLMBackend):
             json=payload,
             timeout=self.timeout_seconds,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status_code = getattr(response, "status_code", None)
+            if status_code in {401, 403}:
+                raise BackendUnavailableError(
+                    f"Ollama authentication failed for model '{model}'. Run `ollama signin` and retry."
+                ) from exc
+            raise
         raw_payload = response.json()
         text = raw_payload.get("response", "")
         response_text, thinking_text = split_response_and_thinking(text if isinstance(text, str) else str(text))
@@ -440,16 +474,28 @@ class OllamaBackend(LLMBackend):
             max_output_tokens=max_output_tokens,
             temperature=temperature,
         )
+        extra_timeout_seconds = max(1, int(max_output_tokens / 32))
+        if _is_cloud_model_name(model):
+            extra_timeout_seconds = max(240, int(max_output_tokens / 8))
+
         result = subprocess.run(
             ["ollama", "run", model],
             input=cli_prompt,
             capture_output=True,
             text=True,
-            timeout=self.timeout_seconds + max(1, int(max_output_tokens / 32)),
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors=SUBPROCESS_TEXT_ERRORS,
+            timeout=self.timeout_seconds + extra_timeout_seconds,
             check=False,
         )
         if result.returncode != 0:
-            raise BackendUnavailableError(result.stderr.strip() or "ollama CLI request failed")
+            stderr = result.stderr.strip()
+            lowered = stderr.lower()
+            if "unauthorized" in lowered or "forbidden" in lowered or "not logged in" in lowered:
+                raise BackendUnavailableError(
+                    f"Ollama authentication failed for model '{model}'. Run `ollama signin` and retry. {stderr}".strip()
+                )
+            raise BackendUnavailableError(stderr or "ollama CLI request failed")
         response_text, thinking_text = split_response_and_thinking(result.stdout.strip())
         return {
             "backend": self.backend_name,

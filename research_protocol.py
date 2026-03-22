@@ -39,6 +39,9 @@ RESEARCH_RESULTS_COLUMNS = [
     "proposal_family",
     "proposal_source",
     "proposal_status",
+    "semantic_validation_result",
+    "semantic_validation_error",
+    "semantic_rejection_reason",
     "proposal_backend",
     "proposal_model",
     "prompt_hash",
@@ -77,6 +80,20 @@ class DuplicateExperimentError(ValueError):
     """Raised when LAB_STATE contains duplicate accepted experiment identities."""
 
 
+NOVELTY_ASSERTION_PHRASES = (
+    "not tried",
+    "not been tried",
+    "never tried",
+    "no accepted run",
+    "no prior run",
+    "new setting",
+    "new configuration",
+    "novel",
+    "unseen",
+    "first",
+)
+
+
 def _to_float(value: Any, fallback: float) -> float:
     try:
         return float(value)
@@ -89,6 +106,145 @@ def _to_int(value: Any, fallback: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return int(fallback)
+
+
+def _normalize_text_for_match(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _text_mentions_any(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _has_numeric_magnitude(text: str) -> bool:
+    return bool(re.search(r"-?\d+(?:\.\d+)?", text))
+
+
+def _proposal_from_archive_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    outcome = _normalize_text_for_match(record.get("outcome"))
+    selection_status = _normalize_text_for_match(record.get("selection_status"))
+    if outcome not in {"accepted", "kept"} and selection_status not in {"accepted", "kept", "new_best"}:
+        if not bool(record.get("accepted", False)):
+            return None
+    proposal = record.get("proposal")
+    if isinstance(proposal, dict) and proposal:
+        return proposal
+    model_name = str(record.get("model_name", "")).strip()
+    params = _extract_trial_params(record)
+    if not model_name:
+        return None
+    return {"model_name": model_name, "params": params}
+
+
+def _candidate_references(
+    *,
+    current_best: dict[str, Any] | None,
+    trial_history: list[dict[str, Any]],
+    memory_payload: dict[str, Any],
+    archive_records: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    references: list[dict[str, Any]] = []
+    for trial in _iter_normalized_trials(trial_history, memory_payload):
+        references.append({"model_name": trial["model_name"], "params": trial["params"]})
+    for record in archive_records or []:
+        if not isinstance(record, dict):
+            continue
+        proposal = _proposal_from_archive_record(record)
+        if proposal is not None:
+            references.append(proposal)
+    if isinstance(current_best, dict):
+        current_best_name = str(current_best.get("model_name", "")).strip()
+        current_best_params = _extract_trial_params(current_best)
+        if current_best_name:
+            references.append({"model_name": current_best_name, "params": current_best_params})
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for proposal in references:
+        signature = build_config_signature(str(proposal.get("model_name", "")), dict(proposal.get("params", {})))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(proposal)
+    return unique
+
+
+def _config_mentions_semantic_details(proposal: dict[str, Any], candidate_config: dict[str, Any]) -> bool:
+    model_name = str(candidate_config.get("model_name", "")).strip().lower()
+    params = candidate_config.get("params", {})
+    if not model_name or not isinstance(params, dict):
+        return False
+    text_blob = " ".join(
+        str(proposal.get(field, ""))
+        for field in (
+            "hypothesis",
+            "rationale",
+            "proposed_change",
+            "target_component",
+            "novelty_claim",
+            "risk_notes",
+        )
+    ).lower()
+    if model_name and model_name.lower() in text_blob:
+        return True
+    for param_name in params:
+        if str(param_name).lower() in text_blob:
+            return True
+    return False
+
+
+def _proposal_text_conflicts_with_config(proposal: dict[str, Any], candidate_config: dict[str, Any]) -> bool:
+    text_blob = " ".join(
+        str(proposal.get(field, ""))
+        for field in (
+            "hypothesis",
+            "rationale",
+            "proposed_change",
+            "target_component",
+            "novelty_claim",
+            "risk_notes",
+        )
+    ).lower()
+    params = candidate_config.get("params", {})
+    if not isinstance(params, dict):
+        return False
+    for param_name, candidate_value in params.items():
+        param_text = re.escape(str(param_name).lower())
+        if isinstance(candidate_value, bool):
+            continue
+        if isinstance(candidate_value, (int, float)) and not isinstance(candidate_value, bool):
+            pattern = re.compile(rf"{param_text}\D{{0,24}}(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+            match = pattern.search(text_blob)
+            if match is None:
+                continue
+            try:
+                text_value = float(match.group(1))
+            except ValueError:
+                continue
+            if abs(text_value - float(candidate_value)) > max(1e-9, abs(float(candidate_value)) * 0.01):
+                return True
+        else:
+            pattern = re.compile(rf"{param_text}\D{{0,24}}([a-z0-9_.-]+)", re.IGNORECASE)
+            match = pattern.search(text_blob)
+            if match is None:
+                continue
+            if _normalize_text_for_match(match.group(1)) != _normalize_text_for_match(candidate_value):
+                return True
+    return False
+
+
+def _metric_direction_supports_improvement(expected_metric_effect: dict[str, Any], expected_direction: str) -> bool:
+    metric = _normalize_text_for_match(expected_metric_effect.get("metric"))
+    direction = _normalize_text_for_match(expected_metric_effect.get("direction"))
+    direction = direction or _normalize_text_for_match(expected_direction)
+    if any(token in metric for token in ("rmse", "mae", "mse", "loss", "error")):
+        return direction == "down"
+    if any(token in metric for token in ("accuracy", "score", "r2", "auc", "f1")):
+        return direction == "up"
+    return True
+
+
+def _novelty_claim_asserts_novelty(novelty_claim: str) -> bool:
+    return _text_mentions_any(_normalize_text_for_match(novelty_claim), NOVELTY_ASSERTION_PHRASES)
 
 
 def _to_serializable(value: Any) -> Any:
@@ -668,6 +824,208 @@ def gate_proposal(
         "max_similarity": float(novelty_result["max_similarity"]),
         "closest_match": novelty_result.get("closest_match"),
         "signature": signature,
+    }
+
+
+def gate_research_proposal(
+    *,
+    proposal: dict[str, Any],
+    available_models: dict[str, dict[str, Any]],
+    current_run_signatures: set[tuple[str, str]],
+    memory_payload: dict[str, Any],
+    trial_history: list[dict[str, Any]],
+    family_state: dict[str, Any],
+    duplicate_settings: dict[str, Any],
+    current_best: dict[str, Any] | None = None,
+    archive_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    candidate_config = proposal.get("candidate_config")
+    if not isinstance(candidate_config, dict):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "non_executable_semantic_config",
+                "message": "candidate_config must be an executable object with model_name and params.",
+            },
+        }
+
+    model_name = str(candidate_config.get("model_name", "")).strip()
+    params = candidate_config.get("params")
+    if not model_name or model_name not in available_models or not isinstance(params, dict):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "non_executable_semantic_config",
+                "message": "candidate_config does not target an allowed executable model family.",
+                "model_name": model_name or None,
+            },
+        }
+    if not params:
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "semantically_invalid_candidate_config",
+                "message": "candidate_config is executable but does not propose any actual parameter change.",
+                "model_name": model_name,
+            },
+        }
+
+    novelty_claim = str(proposal.get("novelty_claim", ""))
+    references = _candidate_references(
+        current_best=current_best,
+        trial_history=trial_history,
+        memory_payload=memory_payload,
+        archive_records=archive_records,
+    )
+    candidate_signature = build_config_signature(model_name, params)
+    novelty_claim_asserts_novelty = _novelty_claim_asserts_novelty(novelty_claim)
+    for reference in references:
+        reference_model = str(reference.get("model_name", "")).strip()
+        reference_params = dict(reference.get("params", {}))
+        if not reference_model or reference_model != model_name:
+            continue
+        reference_signature = build_config_signature(reference_model, reference_params)
+        if candidate_signature == reference_signature:
+            code = "unsupported_novelty_claim" if novelty_claim_asserts_novelty else "duplicate_proposal"
+            message = (
+                "novelty_claim contradicts an already-tried configuration."
+                if code == "unsupported_novelty_claim"
+                else "Proposal exactly matches a recent or historic configuration."
+            )
+            return {
+                "accepted": False,
+                "duplicate_rejected": True,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": code,
+                    "message": message,
+                    "model_name": model_name,
+                },
+            }
+        if proposals_are_near_duplicates(
+            model_name=model_name,
+            candidate_params=params,
+            reference_params=reference_params,
+            available_models=available_models,
+            duplicate_settings=duplicate_settings,
+        ):
+            code = "unsupported_novelty_claim" if novelty_claim_asserts_novelty else "near_duplicate_proposal"
+            message = (
+                "novelty_claim contradicts an effectively identical archived configuration."
+                if code == "unsupported_novelty_claim"
+                else "Proposal is too similar to a recent configuration."
+            )
+            return {
+                "accepted": False,
+                "duplicate_rejected": True,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": code,
+                    "message": message,
+                    "model_name": model_name,
+                },
+            }
+
+    if _proposal_text_conflicts_with_config(proposal, candidate_config):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "inconsistent_expected_effect",
+                "message": "The written hypothesis conflicts with the executable candidate_config.",
+                "model_name": model_name,
+            },
+        }
+
+    expected_metric_effect = proposal.get("expected_metric_effect", {})
+    expected_direction = str(proposal.get("expected_direction", "")).strip().lower()
+    if isinstance(expected_metric_effect, dict) and expected_direction in {"improve", "worsen_risk"}:
+        if not _has_numeric_magnitude(str(expected_metric_effect.get("magnitude_estimate", ""))):
+            return {
+                "accepted": False,
+                "duplicate_rejected": False,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": "inconsistent_expected_effect",
+                    "message": "Expected improvement must include a bounded numeric magnitude estimate.",
+                    "model_name": model_name,
+                },
+            }
+        if not _metric_direction_supports_improvement(expected_metric_effect, expected_direction):
+            return {
+                "accepted": False,
+                "duplicate_rejected": False,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": "inconsistent_expected_effect",
+                    "message": "expected_metric_effect direction conflicts with the claimed outcome.",
+                    "model_name": model_name,
+                },
+            }
+
+    if not _config_mentions_semantic_details(proposal, candidate_config):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "semantically_invalid_candidate_config",
+                "message": "The narrative does not mention the executable config or any changed parameters.",
+                "model_name": model_name,
+            },
+        }
+
+    gate_result = gate_proposal(
+        proposal={"model_name": model_name, "params": params},
+        available_models=available_models,
+        current_run_signatures=current_run_signatures,
+        memory_payload=memory_payload,
+        trial_history=trial_history,
+        family_state=family_state,
+        duplicate_settings=duplicate_settings,
+    )
+    if not gate_result.get("accepted", False):
+        reason = dict(gate_result.get("reason") or {})
+        code = str(reason.get("code", "semantic_rejection"))
+        if code == "exact_duplicate":
+            code = "duplicate_proposal"
+            reason["code"] = code
+            reason["message"] = "Proposal exactly matches a recent or historic configuration."
+        elif code == "near_duplicate":
+            code = "near_duplicate_proposal"
+            reason["code"] = code
+            reason["message"] = "Proposal is too similar to a recent configuration."
+        else:
+            reason["code"] = code
+        return {
+            "accepted": False,
+            "duplicate_rejected": bool(gate_result.get("duplicate_rejected", False)),
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": reason,
+            "reason": reason,
+            "novelty_score": gate_result.get("novelty_score"),
+            "max_similarity": gate_result.get("max_similarity"),
+            "closest_match": gate_result.get("closest_match"),
+            "signature": gate_result.get("signature"),
+        }
+
+    return {
+        "accepted": True,
+        "duplicate_rejected": False,
+        "semantic_validation_result": "passed",
+        "semantic_rejection_reason": None,
+        "reason": None,
+        "novelty_score": gate_result.get("novelty_score"),
+        "max_similarity": gate_result.get("max_similarity"),
+        "closest_match": gate_result.get("closest_match"),
+        "signature": gate_result.get("signature"),
     }
 
 

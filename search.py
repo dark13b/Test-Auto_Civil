@@ -413,7 +413,10 @@ def build_trial_record(
         return base_record
 
     validation_report = result["validation_report"]
-    validation_metrics = result.get("val_metrics", result.get("test_metrics", {}))
+    validation_metrics = result.get(
+        "selection_metrics",
+        result.get("val_metrics", result.get("test_metrics", {})),
+    )
     base_record.update(
         {
             "rmse": result["rmse"],
@@ -614,7 +617,12 @@ def build_final_metrics_payload(
         "best_model_name": final_best_result["model_name"],
         "best_model_hyperparameters": copy.deepcopy(final_best_result["hyperparameters"]),
         "validation_summary": build_validation_summary(validation_report),
-        "validation_metrics": copy.deepcopy(final_best_result.get("val_metrics", final_best_result.get("test_metrics", {}))),
+        "validation_metrics": copy.deepcopy(
+            final_best_result.get(
+                "selection_metrics",
+                final_best_result.get("val_metrics", final_best_result.get("test_metrics", {})),
+            )
+        ),
     }
 
 
@@ -944,7 +952,10 @@ def _build_repaired_trial_record(
     best_trial_number = None if best_result is None else _safe_int(best_result.get("trial_number", best_result.get("best_trial")))
     if best_result is not None and best_trial_number == trial_number:
         validation_report = best_result.get("validation_report", {})
-        test_metrics = best_result.get("val_metrics", best_result.get("test_metrics", {}))
+        test_metrics = best_result.get(
+            "selection_metrics",
+            best_result.get("val_metrics", best_result.get("test_metrics", {})),
+        )
         base_row.update(
             {
                 "model_name": best_result.get("model_name", base_row["model_name"]),

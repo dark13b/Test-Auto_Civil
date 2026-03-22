@@ -6,12 +6,14 @@ import hashlib
 import json
 import logging
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from llm_backend import BackendUnavailableError, LLMBackend, extract_text_channels, resolve_prompt_variant
 from model_routing import resolve_model_for_backend
-from research_protocol import build_family_state_summary, gate_proposal
+from research_protocol import build_family_state_summary, gate_proposal, gate_research_proposal
 
 
 LOGGER = logging.getLogger("proposal_engine")
@@ -48,6 +50,10 @@ class ProposalParseFailure(ProposalGenerationError):
 
 class ProposalSchemaFailure(ProposalGenerationError):
     """Raised when the parsed JSON fails strict proposal-schema validation."""
+
+
+class ProposalSemanticFailure(ProposalGenerationError):
+    """Raised when a schema-valid proposal fails semantic governance checks."""
 
 
 class ProposalPreflightFailure(ProposalGenerationError):
@@ -311,6 +317,9 @@ class ProposalEngine:
 
                 interaction["duplicate_rejected"] = duplicate_rejected
                 interaction["rejection_reason"] = rejection_reason
+                interaction["semantic_validation_result"] = "not_run"
+                interaction["semantic_validation_error"] = None
+                interaction["semantic_rejection_reason"] = None
                 interaction["final_parsed_candidate"] = (
                     validated[0] if len(validated) == 1 else validated or interaction.get("final_parsed_candidate")
                 )
@@ -392,32 +401,64 @@ class ProposalEngine:
                     interaction=interaction,
                 ) from exc
             interaction["schema_validation_result"] = "passed"
+            semantic_result = gate_research_proposal(
+                proposal=proposal,
+                available_models=available_models,
+                current_run_signatures=set(),
+                memory_payload=experiment_memory,
+                trial_history=trial_history or [],
+                family_state=family_state,
+                duplicate_settings=self.llm_config.get("duplicate_similarity_thresholds", {}),
+                current_best=current_best,
+                archive_records=archive_records or [],
+            )
+            interaction["semantic_validation_result"] = semantic_result.get("semantic_validation_result")
+            interaction["semantic_rejection_reason"] = semantic_result.get("semantic_rejection_reason")
+            interaction["semantic_validation_error"] = (
+                None
+                if semantic_result.get("accepted", False)
+                else str((semantic_result.get("semantic_rejection_reason") or {}).get("message", ""))
+            )
+            interaction["duplicate_rejected"] = bool(semantic_result.get("duplicate_rejected", False))
+            interaction["rejection_reason"] = semantic_result.get("semantic_rejection_reason")
             interaction["final_parsed_candidate"] = proposal
-            interaction["proposal_status"] = "llm_success"
+            interaction["proposal_status"] = (
+                "llm_success"
+                if semantic_result.get("accepted", False)
+                else str((semantic_result.get("semantic_rejection_reason") or {}).get("code", "semantic_rejection"))
+            )
             interaction["proposal_source"] = "llm"
             self._write_interaction_log(interaction)
-            return {
-                "ok": True,
-                "status": "llm_success",
-                "backend": interaction.get("backend", self.backend_name),
-                "model": interaction.get("model", resolved_model_hint),
-                "prompt_hash": interaction.get("prompt_hash"),
-                "proposal_preview": proposal,
-                "error": None,
-            }
+            if not semantic_result.get("accepted", False):
+                raise ProposalSemanticFailure(
+                    str((semantic_result.get("semantic_rejection_reason") or {}).get("message", "Semantic validation failed.")),
+                    failure_kind=str((semantic_result.get("semantic_rejection_reason") or {}).get("code", "semantic_rejection")),
+                    interaction=interaction,
+                )
+            return self._build_smoke_test_result(
+                interaction=interaction,
+                ok=True,
+                status="llm_success",
+                proposal_preview=proposal,
+                error=None,
+                failure_class=None,
+            )
         except ProposalGenerationError as exc:
             interaction = dict(getattr(exc, "interaction", {}) or {})
             if interaction:
                 self._write_interaction_log(interaction)
-            return {
-                "ok": False,
-                "status": exc.failure_kind,
-                "backend": interaction.get("backend", self.backend_name),
-                "model": interaction.get("model", resolved_model_hint),
-                "prompt_hash": interaction.get("prompt_hash"),
-                "proposal_preview": None,
-                "error": str(exc),
-            }
+            failure_class = exc.failure_kind
+            extracted_from = str(interaction.get("extracted_from_channel", "response"))
+            if exc.failure_kind == "llm_parse_failure" and extracted_from in {"thinking", "repaired_thinking"}:
+                failure_class = "hidden_channel_only"
+            return self._build_smoke_test_result(
+                interaction=interaction,
+                ok=False,
+                status=exc.failure_kind,
+                proposal_preview=None,
+                error=str(exc),
+                failure_class=failure_class,
+            )
 
     def generate_research_proposals(
         self,
@@ -523,28 +564,38 @@ class ProposalEngine:
                     model=str(interaction.get("model", resolved_model_hint)),
                     prompt_hash=str(interaction.get("prompt_hash", "")),
                 )
-                gate_result = gate_proposal(
-                    proposal={
-                        "model_name": candidate["model_name"],
-                        "params": candidate["params"],
-                    },
+                gate_result = gate_research_proposal(
+                    proposal=proposal,
                     available_models=available_models,
                     current_run_signatures=seen_signatures,
                     memory_payload=experiment_memory,
                     trial_history=trial_history,
                     family_state=family_state,
                     duplicate_settings=self.llm_config.get("duplicate_similarity_thresholds", {}),
+                    current_best=current_best,
+                    archive_records=archive_records or [],
                 )
                 interaction["schema_validation_result"] = "passed"
                 interaction["schema_validation_error"] = None
-                interaction["rejection_reason"] = gate_result.get("reason")
+                interaction["semantic_validation_result"] = gate_result.get("semantic_validation_result")
+                interaction["semantic_validation_error"] = (
+                    None
+                    if gate_result.get("accepted", False)
+                    else str((gate_result.get("semantic_rejection_reason") or {}).get("message", ""))
+                )
+                interaction["semantic_rejection_reason"] = gate_result.get("semantic_rejection_reason")
+                interaction["rejection_reason"] = gate_result.get("semantic_rejection_reason")
                 interaction["final_parsed_candidate"] = candidate
                 interaction["proposal_source"] = "llm"
-                interaction["proposal_status"] = "llm_success"
+                interaction["proposal_status"] = (
+                    "llm_success"
+                    if gate_result.get("accepted", False)
+                    else str((gate_result.get("semantic_rejection_reason") or {}).get("code", "semantic_rejection"))
+                )
                 if not gate_result.get("accepted", False):
                     interaction["duplicate_rejected"] = bool(gate_result.get("duplicate_rejected", False))
                     interaction["regeneration_attempted"] = attempt_index < max_attempts
-                    last_rejection_reason = gate_result.get("reason")
+                    last_rejection_reason = dict(gate_result.get("semantic_rejection_reason") or {})
                     self._write_interaction_log(interaction)
                     continue
 
@@ -565,6 +616,21 @@ class ProposalEngine:
         if not selected_candidates:
             if last_error is not None:
                 raise last_error
+            if last_rejection_reason is not None:
+                raise ProposalSemanticFailure(
+                    str(last_rejection_reason.get("message", "Semantic validation failed.")),
+                    failure_kind=str(last_rejection_reason.get("code", "semantic_rejection")),
+                    interaction={
+                        "backend": self.backend_name,
+                        "model": resolved_model_hint,
+                        "prompt_variant": prompt_variant,
+                        "schema_validation_result": "passed",
+                        "semantic_validation_result": "failed",
+                        "semantic_rejection_reason": last_rejection_reason,
+                        "proposal_source": "llm",
+                        "proposal_status": str(last_rejection_reason.get("code", "semantic_rejection")),
+                    },
+                )
             self.last_interaction_summary = {
                 "backend": self.backend_name,
                 "model": resolved_model_hint,
@@ -572,7 +638,7 @@ class ProposalEngine:
                 "parse_success": True,
             }
             return {
-                "status": "llm_success",
+                "status": str(last_rejection_reason.get("code", "llm_success")) if last_rejection_reason else "llm_success",
                 "backend": self.backend_name,
                 "model": resolved_model_hint,
                 "prompt_variant": prompt_variant,
@@ -728,6 +794,7 @@ class ProposalEngine:
             "extracted_from_channel": "response",
             "parse_success": False,
             "repair_used": False,
+            "visible_response_empty": True,
             "duplicate_rejected": False,
             "rejection_reason": None,
             "schema_validation_result": "not_run",
@@ -740,6 +807,7 @@ class ProposalEngine:
             "error": None,
             "parsed_json": None,
         }
+        started_at = time.perf_counter()
         try:
             payload = self.backend.generate_text(
                 prompt,
@@ -749,6 +817,7 @@ class ProposalEngine:
             )
         except Exception as exc:
             interaction["error"] = str(exc)
+            interaction["latency_seconds"] = round(time.perf_counter() - started_at, 6)
             self.last_interaction_summary = {
                 "backend": self.backend_name,
                 "model": model_hint,
@@ -764,8 +833,10 @@ class ProposalEngine:
         interaction["backend"] = payload.get("backend", self.backend_name)
         interaction["model"] = payload.get("model", model_hint)
         channels = extract_text_channels(payload)
+        interaction["latency_seconds"] = round(time.perf_counter() - started_at, 6)
         interaction["raw_response_text"] = self._truncate_text(channels["response_text"], limit=4000)
         interaction["raw_thinking_text"] = self._truncate_text(channels["thinking_text"], limit=4000)
+        interaction["visible_response_empty"] = not bool(str(channels["response_text"]).strip())
         try:
             final_text, extracted_from, parsed_json, repair_used = self._extract_structured_output(
                 channels=channels,
@@ -1217,6 +1288,7 @@ class ProposalEngine:
             "extracted_from_channel": "response",
             "parse_success": False,
             "repair_used": False,
+            "visible_response_empty": True,
             "duplicate_rejected": False,
             "rejection_reason": None,
             "regeneration_attempted": False,
@@ -1225,6 +1297,7 @@ class ProposalEngine:
             "error": None,
             "parsed_json": None,
         }
+        started_at = time.perf_counter()
         try:
             payload = self.backend.generate_text(
                 prompt,
@@ -1234,6 +1307,7 @@ class ProposalEngine:
             )
         except Exception as exc:
             interaction["error"] = str(exc)
+            interaction["latency_seconds"] = round(time.perf_counter() - started_at, 6)
             self.last_interaction_summary = {
                 "backend": self.backend_name,
                 "model": model_hint,
@@ -1245,8 +1319,10 @@ class ProposalEngine:
         interaction["backend"] = payload.get("backend", self.backend_name)
         interaction["model"] = payload.get("model", model_hint)
         channels = extract_text_channels(payload)
+        interaction["latency_seconds"] = round(time.perf_counter() - started_at, 6)
         interaction["raw_response_text"] = channels["response_text"]
         interaction["raw_thinking_text"] = channels["thinking_text"]
+        interaction["visible_response_empty"] = not bool(str(channels["response_text"]).strip())
         try:
             final_text, extracted_from, parsed_json, repair_used = self._extract_structured_output(
                 channels=channels,
@@ -1293,12 +1369,17 @@ class ProposalEngine:
             "raw_thinking_text": interaction.get("raw_thinking_text", ""),
             "final_extracted_text": interaction.get("final_extracted_text", ""),
             "extracted_from_channel": interaction.get("extracted_from_channel", "response"),
+            "visible_response_empty": bool(interaction.get("visible_response_empty", False)),
             "parse_success": bool(interaction.get("parse_success", False)),
             "repair_used": bool(interaction.get("repair_used", False)),
+            "latency_seconds": interaction.get("latency_seconds"),
             "duplicate_rejected": bool(interaction.get("duplicate_rejected", False)),
             "rejection_reason": interaction.get("rejection_reason"),
             "schema_validation_result": interaction.get("schema_validation_result"),
             "schema_validation_error": interaction.get("schema_validation_error"),
+            "semantic_validation_result": interaction.get("semantic_validation_result"),
+            "semantic_validation_error": interaction.get("semantic_validation_error"),
+            "semantic_rejection_reason": interaction.get("semantic_rejection_reason"),
             "proposal_status": interaction.get("proposal_status"),
             "proposal_source": interaction.get("proposal_source"),
             "regeneration_attempted": bool(interaction.get("regeneration_attempted", False)),
@@ -1308,6 +1389,40 @@ class ProposalEngine:
         }
         with self.interaction_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+    def _build_smoke_test_result(
+        self,
+        *,
+        interaction: dict[str, Any],
+        ok: bool,
+        status: str,
+        proposal_preview: dict[str, Any] | None,
+        error: str | None,
+        failure_class: str | None,
+    ) -> dict[str, Any]:
+        schema_success = interaction.get("schema_validation_result") == "passed"
+        semantic_success = interaction.get("semantic_validation_result") == "passed"
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "ok": bool(ok),
+            "status": status,
+            "backend": interaction.get("backend", self.backend_name),
+            "model": interaction.get("model"),
+            "prompt_hash": interaction.get("prompt_hash"),
+            "prompt_variant": interaction.get("prompt_variant"),
+            "proposal_preview": proposal_preview,
+            "error": error,
+            "extracted_from_channel": interaction.get("extracted_from_channel", "response"),
+            "visible_response_empty": bool(interaction.get("visible_response_empty", False)),
+            "parse_success": bool(interaction.get("parse_success", False)),
+            "schema_success": bool(schema_success),
+            "semantic_success": bool(semantic_success),
+            "semantic_validation_result": interaction.get("semantic_validation_result"),
+            "semantic_rejection_reason": interaction.get("semantic_rejection_reason"),
+            "repair_used": bool(interaction.get("repair_used", False)),
+            "latency_seconds": interaction.get("latency_seconds"),
+            "failure_class": failure_class,
+        }
 
     def _build_experiment_prompt(
         self,

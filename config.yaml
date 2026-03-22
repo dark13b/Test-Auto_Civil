@@ -504,14 +504,14 @@ llm:
   enabled: true
   backend_mode: ollama
   allow_deterministic_fallback: false
-  default_local_proposal_model: qwen3:8b
+  default_local_proposal_model: qwen3-coder:480b-cloud
   default_openai_model: gpt-4o
   qwen_thinking_mode: false
   ollama_base_url: http://localhost:11434
   temperature: 0.3
   num_predict: 2048
-  request_timeout_seconds: 120
-  compact_prompt_models: [qwen3:4b, qwen3:8b]
+  request_timeout_seconds: 600
+  compact_prompt_models: [qwen3:4b]
   enable_regeneration_on_reject: true
   max_regeneration_attempts: 1
   duplicate_similarity_thresholds:
@@ -528,13 +528,13 @@ llm:
   interaction_log_filename: llm_interactions.jsonl
   ollama:
     base_url: http://localhost:11434
-    model: qwen3:8b
-    fast_model: qwen3:4b
-    smart_model: qwen3:8b
+    model: qwen3-coder:480b-cloud
+    fast_model: qwen3-coder:480b-cloud
+    smart_model: qwen3-coder:480b-cloud
     options:
       num_ctx: 2048
       num_gpu: 1
-    timeout_seconds: 120
+    timeout_seconds: 600
     use_cli_fallback: true
   openai:
     base_url: https://api.openai.com/v1/responses
@@ -559,8 +559,8 @@ search:
     interval_trials: 15
     interaction_interval_minutes: 5
     smart_model_after_progress: 0.67
-    fast_model: "qwen3:4b"
-    smart_model: "qwen3:8b"
+    fast_model: "qwen3-coder:480b-cloud"
+    smart_model: "qwen3-coder:480b-cloud"
     ollama_base_url: "http://localhost:11434"
     include_no_think_directive: false
     log_interactions: true

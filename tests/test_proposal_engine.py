@@ -8,6 +8,7 @@ from proposal_engine import (
     ProposalEngine,
     ProposalExtractionError,
     ProposalParseFailure,
+    ProposalSemanticFailure,
     ProposalSchemaFailure,
 )
 
@@ -493,8 +494,8 @@ class ProposalEngineTests(unittest.TestCase):
                             "hypothesis": "Reducing LightGBM num_leaves should reduce variance on this dataset.",
                             "rationale": "Recent boosted-tree runs plateaued while showing instability in high-strength mixes.",
                             "change_type": "hyperparameter",
-                            "target_component": "LGBMRegressor",
-                            "proposed_change": "Set num_leaves=24 and min_child_samples=18 while keeping learning_rate near 0.08.",
+                            "target_component": "ModelFamilyA",
+                            "proposed_change": "Set depth=3 and learning_rate=0.1 while keeping the tree family fixed.",
                             "expected_direction": "improve",
                             "expected_metric_effect": {
                                 "metric": "rmse",
@@ -502,7 +503,7 @@ class ProposalEngineTests(unittest.TestCase):
                                 "magnitude_estimate": "0.05-0.12 MPa",
                             },
                             "confidence": 0.64,
-                            "novelty_claim": "Recent accepted trials used num_leaves 31-37, not 24 with higher min_child_samples.",
+                            "novelty_claim": "Recent accepted trials used different depth values, so this is a new setting.",
                             "risk_notes": "May underfit low-strength regime if regularization is too strong.",
                             "candidate_config": {
                                 "model_name": "ModelFamilyA",
@@ -608,6 +609,209 @@ class ProposalEngineTests(unittest.TestCase):
 
         self.assertFalse(smoke_result["ok"])
         self.assertEqual(smoke_result["status"], "llm_backend_failure")
+
+    def test_run_proposal_smoke_test_returns_reliability_metadata_on_success(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": json.dumps(
+                        {
+                            "hypothesis": "Reducing depth should improve generalization.",
+                            "rationale": "Recent runs show mild overfitting.",
+                            "change_type": "hyperparameter",
+                            "target_component": "ModelFamilyA",
+                            "proposed_change": "depth=3",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "0.05-0.10 MPa",
+                            },
+                            "confidence": 0.61,
+                            "novelty_claim": "Depth 3 has not been tried in the latest runs.",
+                            "risk_notes": "Could underfit if the current best is already shallow.",
+                            "candidate_config": {
+                                "model_name": "ModelFamilyA",
+                                "params": {"depth": 3, "learning_rate": 0.1},
+                            },
+                        }
+                    )
+                }
+            ]
+        )
+        engine = self._make_engine(backend)
+
+        smoke_result = engine.run_proposal_smoke_test(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            model_hint="qwen3:8b",
+        )
+
+        self.assertTrue(smoke_result["ok"])
+        self.assertEqual(smoke_result["status"], "llm_success")
+        self.assertEqual(smoke_result["extracted_from_channel"], "response")
+        self.assertFalse(smoke_result["visible_response_empty"])
+        self.assertTrue(smoke_result["parse_success"])
+        self.assertTrue(smoke_result["schema_success"])
+        self.assertFalse(smoke_result["repair_used"])
+        self.assertIsNone(smoke_result["failure_class"])
+        self.assertIsInstance(smoke_result["timestamp"], str)
+        self.assertGreaterEqual(smoke_result["latency_seconds"], 0.0)
+
+    def test_run_proposal_smoke_test_surfaces_semantic_rejection_metadata(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": json.dumps(
+                        {
+                            "hypothesis": "Try to improve performance somehow.",
+                            "rationale": "The model should do better.",
+                            "change_type": "hyperparameter",
+                            "target_component": "ModelFamilyA",
+                            "proposed_change": "Use a better configuration.",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "0.05-0.10 MPa",
+                            },
+                            "confidence": 0.61,
+                            "novelty_claim": "This is new.",
+                            "risk_notes": "This might be risky.",
+                            "candidate_config": {
+                                "model_name": "ModelFamilyA",
+                                "params": {},
+                            },
+                        }
+                    )
+                }
+            ]
+        )
+        engine = self._make_engine(backend)
+
+        smoke_result = engine.run_proposal_smoke_test(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            model_hint="qwen3:8b",
+        )
+
+        self.assertFalse(smoke_result["ok"])
+        self.assertEqual(smoke_result["status"], "semantically_invalid_candidate_config")
+        self.assertFalse(smoke_result["semantic_success"])
+        self.assertEqual(smoke_result["semantic_validation_result"], "failed")
+        self.assertEqual(smoke_result["failure_class"], "semantically_invalid_candidate_config")
+
+    def test_generate_research_proposals_raises_semantic_failure_for_meaningless_candidate(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": json.dumps(
+                        {
+                            "hypothesis": "Try to improve performance somehow.",
+                            "rationale": "The model should do better.",
+                            "change_type": "hyperparameter",
+                            "target_component": "ModelFamilyA",
+                            "proposed_change": "Use a better configuration.",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "0.05-0.10 MPa",
+                            },
+                            "confidence": 0.61,
+                            "novelty_claim": "This is new.",
+                            "risk_notes": "This might be risky.",
+                            "candidate_config": {
+                                "model_name": "ModelFamilyA",
+                                "params": {},
+                            },
+                        }
+                    )
+                }
+            ]
+        )
+        engine = self._make_engine(
+            backend,
+            llm_config={
+                "compact_prompt_models": ["qwen3:4b"],
+                "enable_regeneration_on_reject": False,
+                "max_regeneration_attempts": 0,
+                "duplicate_similarity_thresholds": {
+                    "numeric_tolerance": 0.05,
+                    "float_round_digits": 4,
+                },
+                "temporarily_block_saturated_families": True,
+                "diversity": {"max_family_share": 0.35},
+            },
+        )
+
+        with self.assertRaises(ProposalSemanticFailure) as ctx:
+            engine.generate_research_proposals(
+                available_models=self.available_models,
+                research_brief=self.research_brief,
+                current_best=self.current_best,
+                experiment_memory=self.experiment_memory,
+                diversity_state={},
+                proposal_count=1,
+                model_hint="qwen3:8b",
+            )
+
+        self.assertEqual(ctx.exception.failure_kind, "semantically_invalid_candidate_config")
+
+    def test_run_proposal_smoke_test_surfaces_hidden_channel_failures(self) -> None:
+        backend = RecordingBackend(
+            [
+                {
+                    "response_text": "",
+                    "thinking_text": json.dumps(
+                        {
+                            "hypothesis": "Reducing depth should improve generalization.",
+                            "rationale": "Recent runs show mild overfitting.",
+                            "change_type": "hyperparameter",
+                            "target_component": "ModelFamilyA",
+                            "proposed_change": "depth=3",
+                            "expected_direction": "improve",
+                            "expected_metric_effect": {
+                                "metric": "rmse",
+                                "direction": "down",
+                                "magnitude_estimate": "0.05-0.10 MPa",
+                            },
+                            "confidence": 0.61,
+                            "novelty_claim": "Depth 3 has not been tried in the latest runs.",
+                            "risk_notes": "Could underfit if the current best is already shallow.",
+                            "candidate_config": {
+                                "model_name": "ModelFamilyA",
+                                "params": {"depth": 3, "learning_rate": 0.1},
+                            },
+                        }
+                    ),
+                }
+            ]
+        )
+        engine = self._make_engine(backend)
+
+        smoke_result = engine.run_proposal_smoke_test(
+            available_models=self.available_models,
+            research_brief=self.research_brief,
+            current_best=self.current_best,
+            experiment_memory=self.experiment_memory,
+            diversity_state={},
+            model_hint="qwen3:8b",
+        )
+
+        self.assertFalse(smoke_result["ok"])
+        self.assertEqual(smoke_result["status"], "llm_parse_failure")
+        self.assertEqual(smoke_result["extracted_from_channel"], "thinking")
+        self.assertTrue(smoke_result["visible_response_empty"])
+        self.assertTrue(smoke_result["parse_success"])
+        self.assertFalse(smoke_result["schema_success"])
+        self.assertEqual(smoke_result["failure_class"], "hidden_channel_only")
 
 
 if __name__ == "__main__":
