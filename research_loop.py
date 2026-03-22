@@ -19,6 +19,7 @@ from hypothesis_archive import HypothesisArchive
 from knowledge_base import get_knowledge_context
 import research_lab
 from llm_backend import get_llm_config, resolve_backend
+from llm_admission_policy import evaluate_llm_admission_policy
 from proposal_engine import (
     ProposalBackendFailure,
     ProposalEngine,
@@ -216,7 +217,10 @@ def _build_run_manifest_payload(
         manifest["smoke_test_summary"] = smoke_summary
         failure_counts = smoke_summary.get("failure_class_counts", {})
         manifest["llm_failure_counts"] = dict(sorted(failure_counts.items())) if isinstance(failure_counts, dict) else dict(sorted(llm_failure_counts.items()))
+        admission_policy = smoke_summary.get("admission_policy", {})
         manifest["smoke_test_status"] = smoke_summary.get("compatibility", {}).get("interpretation", smoke_test_status)
+        manifest["smoke_test_verdict"] = admission_policy.get("verdict")
+        manifest["smoke_test_admission_policy"] = admission_policy
     if isinstance(final_metrics, dict):
         holdout_metrics = final_metrics.get("holdout_metrics")
         if isinstance(holdout_metrics, dict) and holdout_metrics:
@@ -872,17 +876,25 @@ def summarize_smoke_test_trials(
     *,
     requested_backend: str | None = None,
     requested_model: str | None = None,
+    admission_policy_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     total_trials = len(trials)
     if total_trials == 0:
-        return {
+        summary = {
             "total_trials": 0,
             "success_count": 0,
             "success_rate": 0.0,
+            "backend_failure_count": 0,
+            "backend_failure_rate": 0.0,
+            "parse_failure_count": 0,
             "parse_failure_rate": 0.0,
+            "schema_failure_count": 0,
             "schema_failure_rate": 0.0,
+            "semantic_failure_count": 0,
             "semantic_failure_rate": 0.0,
+            "hidden_channel_count": 0,
             "hidden_channel_incidence": 0.0,
+            "empty_visible_count": 0,
             "empty_visible_response_incidence": 0.0,
             "repair_usage_rate": 0.0,
             "median_latency_seconds": None,
@@ -891,12 +903,19 @@ def summarize_smoke_test_trials(
             "backend_counts": {},
             "model_counts": {},
             "backend_model_counts": {},
-            "compatibility": {
-                "issue_codes": ["no_trials"],
-                "issues": [{"code": "no_trials", "count": 1}],
-                "interpretation": "incompatible for control tasks",
-            },
+            "failure_class_counts": {},
+            "unexpected_backend_model_pairs": {},
         }
+        admission_policy = evaluate_llm_admission_policy(summary, admission_policy_config=admission_policy_config)
+        summary["admission_policy"] = admission_policy
+        summary["compatibility"] = {
+            "issue_codes": admission_policy["issue_codes"],
+            "issues": [check for check in admission_policy["checks"] if check["status"] != "passed"],
+            "interpretation": admission_policy["interpretation"],
+            "verdict": admission_policy["verdict"],
+            "eligible_for_control_tasks": admission_policy["eligible_for_control_tasks"],
+        }
+        return summary
 
     status_counts: dict[str, int] = {}
     backend_counts: dict[str, int] = {}
@@ -905,6 +924,7 @@ def summarize_smoke_test_trials(
     failure_class_counts: dict[str, int] = {}
     unexpected_pairs: dict[str, int] = {}
     success_count = 0
+    backend_failure_count = 0
     parse_failure_count = 0
     schema_failure_count = 0
     semantic_failure_count = 0
@@ -932,6 +952,8 @@ def summarize_smoke_test_trials(
 
         if bool(trial.get("ok", False)):
             success_count += 1
+        if status == "llm_backend_failure":
+            backend_failure_count += 1
         if status == "llm_parse_failure":
             parse_failure_count += 1
         if status == "llm_schema_failure":
@@ -963,31 +985,8 @@ def summarize_smoke_test_trials(
             unexpected_pairs[pair] = unexpected_pairs.get(pair, 0) + 1
 
     latencies.sort()
-    issue_codes: list[str] = []
-    issues: list[dict[str, Any]] = []
-
-    backend_failures = status_counts.get("llm_backend_failure", 0)
-    if backend_failures:
-        issue_codes.append("backend_or_model_failure")
-        issues.append({"code": "backend_or_model_failure", "count": backend_failures})
-    hidden_failures = failure_class_counts.get("hidden_channel_only", 0)
-    if hidden_failures:
-        issue_codes.append("hidden_channel_output")
-        issues.append({"code": "hidden_channel_output", "count": hidden_failures})
-    if semantic_failure_count:
-        issue_codes.append("semantic_rejection")
-        issues.append({"code": "semantic_rejection", "count": semantic_failure_count})
-    if unexpected_pairs:
-        issue_codes.append("unexpected_backend_model_pair")
-        issues.append(
-            {
-                "code": "unexpected_backend_model_pair",
-                "count": sum(unexpected_pairs.values()),
-                "pairs": unexpected_pairs,
-            }
-        )
-
     success_rate = success_count / total_trials
+    backend_failure_rate = backend_failure_count / total_trials
     parse_failure_rate = parse_failure_count / total_trials
     schema_failure_rate = schema_failure_count / total_trials
     semantic_failure_rate = semantic_failure_count / total_trials
@@ -995,31 +994,21 @@ def summarize_smoke_test_trials(
     empty_visible_response_incidence = empty_visible_count / total_trials
     repair_usage_rate = repair_count / total_trials
 
-    if (
-        not issue_codes
-        and success_rate >= 0.9
-        and parse_failure_count == 0
-        and schema_failure_count == 0
-        and semantic_failure_count == 0
-        and hidden_channel_count == 0
-    ):
-        interpretation = "usable"
-    elif (backend_failures > 0 and success_rate < 0.8) or success_rate < 0.5:
-        interpretation = "incompatible for control tasks"
-    else:
-        interpretation = "unstable"
-
-    return {
+    summary = {
         "total_trials": total_trials,
         "success_count": success_count,
         "success_rate": success_rate,
+        "backend_failure_count": backend_failure_count,
+        "backend_failure_rate": backend_failure_rate,
         "parse_failure_count": parse_failure_count,
         "parse_failure_rate": parse_failure_rate,
         "schema_failure_count": schema_failure_count,
         "schema_failure_rate": schema_failure_rate,
         "semantic_failure_count": semantic_failure_count,
         "semantic_failure_rate": semantic_failure_rate,
+        "hidden_channel_count": hidden_channel_count,
         "hidden_channel_incidence": hidden_channel_incidence,
+        "empty_visible_count": empty_visible_count,
         "empty_visible_response_incidence": empty_visible_response_incidence,
         "repair_usage_rate": repair_usage_rate,
         "median_latency_seconds": _percentile(latencies, 0.5),
@@ -1030,12 +1019,17 @@ def summarize_smoke_test_trials(
         "backend_model_counts": backend_model_counts,
         "failure_class_counts": failure_class_counts,
         "unexpected_backend_model_pairs": unexpected_pairs,
-        "compatibility": {
-            "issue_codes": issue_codes,
-            "issues": issues,
-            "interpretation": interpretation,
-        },
     }
+    admission_policy = evaluate_llm_admission_policy(summary, admission_policy_config=admission_policy_config)
+    summary["admission_policy"] = admission_policy
+    summary["compatibility"] = {
+        "issue_codes": admission_policy["issue_codes"],
+        "issues": [check for check in admission_policy["checks"] if check["status"] != "passed"],
+        "interpretation": admission_policy["interpretation"],
+        "verdict": admission_policy["verdict"],
+        "eligible_for_control_tasks": admission_policy["eligible_for_control_tasks"],
+    }
+    return summary
 
 
 def run_repeated_llm_smoke_test(
@@ -1052,6 +1046,7 @@ def run_repeated_llm_smoke_test(
     summary_path: Path | None = None,
     requested_backend: str | None = None,
     model_hint: str | None = None,
+    admission_policy_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested_trials = max(1, int(trials))
     timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1104,6 +1099,7 @@ def run_repeated_llm_smoke_test(
         normalized_trials,
         requested_backend=requested_backend or (proposal_engine.backend_name if proposal_engine is not None else None),
         requested_model=model_hint,
+        admission_policy_config=admission_policy_config,
     )
     report = {
         "generated_at": timestamp,
@@ -2070,12 +2066,14 @@ def main() -> int:
                     summary_path=summary_path,
                     requested_backend=args.llm_backend_mode,
                     model_hint=args.llm_model,
+                    admission_policy_config=llm_config.get("admission_policy"),
                 )
                 log_status(
                     "LLM smoke reliability | "
                     f"trials={report['requested_trials']} | "
                     f"success_rate={report['summary']['success_rate']:.3f} | "
                     f"semantic_failure_rate={report['summary'].get('semantic_failure_rate', 0.0):.3f} | "
+                    f"verdict={report['summary']['admission_policy']['verdict']} | "
                     f"interpretation={report['summary']['compatibility']['interpretation']} | "
                     f"summary={summary_path}"
                 )

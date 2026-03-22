@@ -520,6 +520,19 @@ llm:
   temporarily_block_saturated_families: true
   diversity:
     max_family_share: 0.35
+  admission_policy:
+    policy_name: backend_admission
+    version: 1
+    warning_band_fraction: 0.8
+    thresholds:
+      min_success_rate: 0.9
+      max_backend_failure_rate: 0.1
+      max_parse_failure_rate: 0.1
+      max_schema_failure_rate: 0.1
+      max_semantic_failure_rate: 0.1
+      max_hidden_channel_incidence: 0.05
+      max_empty_visible_response_incidence: 0.1
+      max_p95_latency_seconds: 5.0
   interval_trials: 15
   interaction_interval_minutes: 5
   smart_model_after_progress: 0.67

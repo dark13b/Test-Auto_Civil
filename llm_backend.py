@@ -43,6 +43,7 @@ DEFAULT_LLM_CONFIG: dict[str, Any] = {
             "max_backend_failure_rate": 0.1,
             "max_parse_failure_rate": 0.1,
             "max_schema_failure_rate": 0.1,
+            "max_semantic_failure_rate": 0.1,
             "max_hidden_channel_incidence": 0.05,
             "max_empty_visible_response_incidence": 0.1,
             "max_p95_latency_seconds": 5.0,

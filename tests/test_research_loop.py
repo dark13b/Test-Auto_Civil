@@ -1134,9 +1134,10 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
         self.assertAlmostEqual(summary["repair_usage_rate"], 0.2)
         self.assertEqual(summary["median_latency_seconds"], 1.5)
         self.assertEqual(summary["p95_latency_seconds"], 3.0)
-        self.assertEqual(summary["compatibility"]["interpretation"], "incompatible for control tasks")
-        self.assertIn("backend_or_model_failure", summary["compatibility"]["issue_codes"])
-        self.assertIn("semantic_rejection", summary["compatibility"]["issue_codes"])
+        self.assertEqual(summary["admission_policy"]["verdict"], "blocked_for_control_tasks")
+        self.assertEqual(summary["compatibility"]["interpretation"], "blocked for control tasks")
+        self.assertIn("backend_failure_rate_exceeded", summary["compatibility"]["issue_codes"])
+        self.assertIn("semantic_failure_rate_exceeded", summary["compatibility"]["issue_codes"])
 
     def test_summarize_smoke_test_trials_reports_usable_when_all_trials_are_clean(self) -> None:
         summary = research_loop.summarize_smoke_test_trials(
@@ -1181,6 +1182,8 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
         self.assertEqual(summary["repair_usage_rate"], 0.0)
         self.assertEqual(summary["compatibility"]["issue_codes"], [])
         self.assertEqual(summary["compatibility"]["interpretation"], "usable")
+        self.assertEqual(summary["admission_policy"]["verdict"], "usable")
+        self.assertEqual(summary["admission_policy"]["thresholds"]["min_success_rate"], 0.9)
 
     def test_summarize_smoke_test_trials_surfaces_unexpected_backend_model_pair(self) -> None:
         summary = research_loop.summarize_smoke_test_trials(
@@ -1205,7 +1208,8 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
 
         self.assertEqual(summary["unexpected_backend_model_pairs"], {"openai::gpt-5.1-mini": 1})
         self.assertIn("unexpected_backend_model_pair", summary["compatibility"]["issue_codes"])
-        self.assertEqual(summary["compatibility"]["interpretation"], "unstable")
+        self.assertEqual(summary["admission_policy"]["verdict"], "blocked_for_control_tasks")
+        self.assertEqual(summary["compatibility"]["interpretation"], "blocked for control tasks")
 
     def test_run_repeated_llm_smoke_test_writes_summary_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1279,9 +1283,12 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
         self.assertEqual(report["requested_trials"], 3)
         self.assertEqual(len(report["trials"]), 3)
         self.assertEqual(report["summary"]["total_trials"], 3)
-        self.assertEqual(report["summary"]["compatibility"]["interpretation"], "incompatible for control tasks")
+        self.assertEqual(report["summary"]["admission_policy"]["verdict"], "blocked_for_control_tasks")
+        self.assertEqual(report["summary"]["compatibility"]["interpretation"], "blocked for control tasks")
         self.assertAlmostEqual(persisted["summary"]["hidden_channel_incidence"], 1 / 3)
         self.assertAlmostEqual(persisted["summary"]["semantic_failure_rate"], 1 / 3)
+        self.assertIn("thresholds", persisted["summary"]["admission_policy"])
+        self.assertEqual(persisted["summary"]["admission_policy"]["verdict"], "blocked_for_control_tasks")
 
     def test_run_repeated_llm_smoke_test_reports_disabled_engine_as_incompatible(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1310,7 +1317,8 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
         self.assertEqual(report["trials"][0]["failure_class"], "llm_backend_failure")
         self.assertFalse(report["trials"][0]["parse_success"])
         self.assertFalse(report["trials"][0]["schema_success"])
-        self.assertEqual(report["summary"]["compatibility"]["interpretation"], "incompatible for control tasks")
+        self.assertEqual(report["summary"]["admission_policy"]["verdict"], "blocked_for_control_tasks")
+        self.assertEqual(report["summary"]["compatibility"]["interpretation"], "blocked for control tasks")
         self.assertEqual(persisted["summary"]["status_counts"]["aborted_due_to_preflight_failure"], 2)
 
     def test_run_repeated_llm_smoke_test_persists_unicode_backend_errors(self) -> None:
@@ -1390,6 +1398,45 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
         self.assertIsNone(payload["smoke_test_status"])
         self.assertIsNone(payload["archive_update_summary"])
         self.assertEqual(payload["final_run_status"], "success")
+
+    def test_run_manifest_payload_includes_smoke_admission_policy_snapshot(self) -> None:
+        payload = _build_run_manifest_payload(
+            run_id="run-1",
+            run_started_at="2026-03-22T10:00:00Z",
+            run_finished_at="2026-03-22T10:05:00Z",
+            config={"experiment": {"random_seed": 7}},
+            brief={"acceptance_metric": "composite_score"},
+            llm_config={"enabled": True, "backend_mode": "ollama"},
+            allow_deterministic_fallback=False,
+            preflight_result=None,
+            proposal_metadata=None,
+            smoke_summary={
+                "admission_policy": {
+                    "verdict": "usable",
+                    "interpretation": "usable",
+                    "issue_codes": [],
+                },
+                "compatibility": {
+                    "interpretation": "usable",
+                },
+                "failure_class_counts": {},
+            },
+            proposal_status_counts={},
+            semantic_rejection_counts={},
+            llm_failure_counts={},
+            archive_update_summary={},
+            number_of_candidates_evaluated=0,
+            holdout_touched_during_search=False,
+            final_abort_reason=None,
+            final_run_status="success",
+            final_metrics=None,
+            acceptance=None,
+            validation_report=None,
+        )
+
+        self.assertEqual(payload["smoke_test_status"], "usable")
+        self.assertEqual(payload["smoke_test_verdict"], "usable")
+        self.assertEqual(payload["smoke_test_admission_policy"]["verdict"], "usable")
 
 
 if __name__ == "__main__":

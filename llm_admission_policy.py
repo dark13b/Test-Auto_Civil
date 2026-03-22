@@ -13,6 +13,7 @@ DEFAULT_LLM_ADMISSION_POLICY = {
         "max_backend_failure_rate": 0.1,
         "max_parse_failure_rate": 0.1,
         "max_schema_failure_rate": 0.1,
+        "max_semantic_failure_rate": 0.1,
         "max_hidden_channel_incidence": 0.05,
         "max_empty_visible_response_incidence": 0.1,
         "max_p95_latency_seconds": 5.0,
@@ -32,6 +33,8 @@ _HARD_BLOCK_CODES = {
     "no_trials",
     "success_rate_below_minimum",
     "backend_failure_rate_exceeded",
+    "semantic_failure_rate_exceeded",
+    "unexpected_backend_model_pair",
     "p95_latency_unavailable",
 }
 
@@ -66,6 +69,9 @@ def _normalize_thresholds(raw_thresholds: dict[str, Any] | None) -> dict[str, fl
         ),
         "max_schema_failure_rate": _to_float(
             raw_thresholds.get("max_schema_failure_rate"), defaults["max_schema_failure_rate"]
+        ),
+        "max_semantic_failure_rate": _to_float(
+            raw_thresholds.get("max_semantic_failure_rate"), defaults["max_semantic_failure_rate"]
         ),
         "max_hidden_channel_incidence": _to_float(
             raw_thresholds.get("max_hidden_channel_incidence"), defaults["max_hidden_channel_incidence"]
@@ -135,6 +141,16 @@ def _evaluate_maximum(
             "status": "failed",
             "issue_code": f"{metric_name}_exceeded",
         }
+    if measured_value == threshold:
+        return {
+            "metric": metric_name,
+            "comparison": "<=",
+            "measured": measured_value,
+            "threshold": threshold,
+            "warning_threshold": warning_threshold,
+            "status": "passed",
+            "issue_code": None,
+        }
     if measured_value > warning_threshold:
         return {
             "metric": metric_name,
@@ -185,6 +201,16 @@ def _evaluate_minimum(
             "status": "failed",
             "issue_code": f"{metric_name}_below_minimum",
         }
+    if measured_value == threshold:
+        return {
+            "metric": metric_name,
+            "comparison": ">=",
+            "measured": measured_value,
+            "threshold": threshold,
+            "warning_threshold": warning_floor,
+            "status": "passed",
+            "issue_code": None,
+        }
     if measured_value < warning_floor:
         return {
             "metric": metric_name,
@@ -225,8 +251,13 @@ def evaluate_llm_admission_policy(
     )
     parse_failure_count = int(summary.get("parse_failure_count", 0) or 0)
     schema_failure_count = int(summary.get("schema_failure_count", 0) or 0)
+    semantic_failure_count = int(summary.get("semantic_failure_count", 0) or 0)
     hidden_channel_count = int(summary.get("hidden_channel_count", 0) or 0)
     empty_visible_count = int(summary.get("empty_visible_count", 0) or 0)
+    unexpected_pairs = summary.get("unexpected_backend_model_pairs", {})
+    unexpected_pair_count = 0
+    if isinstance(unexpected_pairs, dict):
+        unexpected_pair_count = sum(int(value) for value in unexpected_pairs.values() if isinstance(value, (int, float)))
 
     metrics = {
         "total_trials": total_trials,
@@ -234,10 +265,37 @@ def evaluate_llm_admission_policy(
         "backend_failure_rate": _ratio(backend_failure_count, total_trials),
         "parse_failure_rate": _to_float(summary.get("parse_failure_rate"), 0.0),
         "schema_failure_rate": _to_float(summary.get("schema_failure_rate"), 0.0),
+        "semantic_failure_rate": _to_float(summary.get("semantic_failure_rate"), 0.0),
         "hidden_channel_incidence": _to_float(summary.get("hidden_channel_incidence"), 0.0),
         "empty_visible_response_incidence": _to_float(summary.get("empty_visible_response_incidence"), 0.0),
         "p95_latency_seconds": summary.get("p95_latency_seconds"),
     }
+
+    if total_trials <= 0:
+        verdict = "blocked_for_control_tasks"
+        interpretation = VERDICT_INTERPRETATIONS[verdict]
+        no_trial_check = {
+            "metric": "total_trials",
+            "comparison": ">",
+            "measured": 0,
+            "threshold": 0,
+            "warning_threshold": 0,
+            "status": "failed",
+            "issue_code": "no_trials",
+        }
+        return {
+            "policy_name": policy["policy_name"],
+            "policy_version": policy["version"],
+            "verdict": verdict,
+            "interpretation": interpretation,
+            "eligible_for_control_tasks": False,
+            "thresholds": thresholds,
+            "metrics": metrics,
+            "checks": [no_trial_check],
+            "issue_codes": ["no_trials"],
+            "warning_issue_codes": [],
+            "failure_issue_codes": ["no_trials"],
+        }
 
     checks = [
         _evaluate_minimum(
@@ -265,6 +323,12 @@ def evaluate_llm_admission_policy(
             warning_band_fraction=warning_band_fraction,
         ),
         _evaluate_maximum(
+            metric_name="semantic_failure_rate",
+            measured=metrics["semantic_failure_rate"],
+            threshold=thresholds["max_semantic_failure_rate"],
+            warning_band_fraction=warning_band_fraction,
+        ),
+        _evaluate_maximum(
             metric_name="hidden_channel_incidence",
             measured=metrics["hidden_channel_incidence"],
             threshold=thresholds["max_hidden_channel_incidence"],
@@ -285,6 +349,19 @@ def evaluate_llm_admission_policy(
     ]
 
     issue_codes = [str(check["issue_code"]) for check in checks if check.get("issue_code")]
+    if unexpected_pair_count > 0:
+        issue_codes.append("unexpected_backend_model_pair")
+        checks.append(
+            {
+                "metric": "unexpected_backend_model_pair",
+                "comparison": "==",
+                "measured": unexpected_pair_count,
+                "threshold": 0,
+                "warning_threshold": 0,
+                "status": "failed",
+                "issue_code": "unexpected_backend_model_pair",
+            }
+        )
     warning_checks = [check for check in checks if check["status"] == "warning"]
     failed_checks = [check for check in checks if check["status"] == "failed"]
     hard_block_detected = any(code in _HARD_BLOCK_CODES for code in issue_codes)
