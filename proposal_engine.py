@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from llm_backend import BackendUnavailableError, LLMBackend, extract_text_channels, resolve_prompt_variant
+import research_lab
+
+from llm_backend import BackendUnavailableError, LLMBackend, extract_text_channels, resolve_backend, resolve_prompt_variant
 from model_routing import resolve_model_for_backend
 from research_protocol import build_family_state_summary, gate_proposal, gate_research_proposal
 
@@ -19,6 +21,85 @@ from research_protocol import build_family_state_summary, gate_proposal, gate_re
 LOGGER = logging.getLogger("proposal_engine")
 JSON_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 INVALID_PARAM = object()
+
+
+def get_proposals(
+    context: dict,
+    config: dict,
+    logger: logging.Logger,
+    *,
+    n: int = 5,
+) -> list[dict]:
+    """Return up to `n` candidate proposals for the next scout round."""
+    llm_config = dict(config.get("llm", {})) if isinstance(config, dict) else {}
+    normalized_n = max(1, int(n))
+    if not llm_config.get("enabled", False):
+        return _deterministic_proposals_from_context(context, normalized_n)
+
+    outputs_dir_value = context.get("outputs_dir")
+    outputs_dir = Path(outputs_dir_value) if outputs_dir_value is not None else None
+    interaction_log_path = None
+    if outputs_dir is not None:
+        interaction_log_name = str(llm_config.get("interaction_log_filename", "llm_interactions.jsonl"))
+        interaction_log_path = outputs_dir / interaction_log_name
+
+    engine = ProposalEngine(
+        backend=resolve_backend(config),
+        interaction_log_path=interaction_log_path,
+        log_interactions=bool(llm_config.get("log_interactions", True)),
+        include_no_think_directive=bool(llm_config.get("include_no_think_directive", False)),
+        llm_config=llm_config,
+    )
+
+    if not engine.is_available():
+        logger.info("Proposal backend unavailable; using deterministic fallback.")
+        return _deterministic_proposals_from_context(context, normalized_n)
+
+    try:
+        llm_result = engine.generate_experiment_proposals(
+            available_models=dict(context.get("available_models", {})),
+            research_brief=dict(context.get("brief", {})),
+            current_best=dict(context.get("current_best", {})),
+            experiment_memory=dict(context.get("memory_payload", {})),
+            diversity_state=dict(context.get("diversity_state", {})),
+            proposal_count=normalized_n,
+            trial_history=list(context.get("trial_history", [])),
+            search_progress=dict(context.get("search_progress", {})),
+            failure_patterns=dict(context.get("failure_patterns", {})),
+            knowledge_context=str(context.get("knowledge_context", "") or ""),
+            archive_records=list(context.get("archive_records", [])),
+            model_hint=context.get("model_hint"),
+        )
+        proposals = list(llm_result.get("proposals", []))
+        if proposals:
+            return proposals[:normalized_n]
+        logger.info("LLM proposal engine returned no proposals; using deterministic fallback.")
+    except (BackendUnavailableError, ProposalBackendFailure, ProposalParseFailure, ProposalSchemaFailure, ProposalSemanticFailure) as exc:
+        logger.warning("LLM proposal generation failed: %s", exc)
+    except Exception as exc:
+        logger.exception("Unexpected proposal generation failure: %s", exc)
+
+    return _deterministic_proposals_from_context(context, normalized_n)
+
+
+def _deterministic_proposals_from_context(context: dict, n: int) -> list[dict]:
+    brief = dict(context.get("brief", {}))
+    lab_state = dict(context.get("lab_state", {}))
+    available_models = dict(context.get("available_models", {}))
+    memory_payload = dict(context.get("memory_payload", {}))
+    current_best = dict(context.get("current_best", {}))
+    exploit_delta_ratio = float(context.get("exploit_delta_ratio", 0.15))
+    scout_limit = max(1, int(context.get("scout_limit", n)))
+    candidates = research_lab.scout_experiments(
+        brief=brief,
+        lab_state=lab_state,
+        available_models=available_models,
+        experiment_memory=memory_payload,
+        current_best=current_best,
+        scout_limit=max(scout_limit, n),
+        exploit_delta_ratio=exploit_delta_ratio,
+    )
+    return list(candidates)[:n]
 
 
 class ProposalExtractionError(RuntimeError):

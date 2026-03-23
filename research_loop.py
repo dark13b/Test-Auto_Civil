@@ -20,6 +20,7 @@ from knowledge_base import get_knowledge_context
 import research_lab
 from llm_backend import get_llm_config, resolve_backend
 from llm_admission_policy import evaluate_llm_admission_policy
+from loop_candidate_selection import select_scout_candidates
 from proposal_engine import (
     ProposalBackendFailure,
     ProposalEngine,
@@ -1135,206 +1136,51 @@ def _select_scout_candidates(
     preflight_result: dict[str, Any] | None = None,
     exploit_delta_ratio: float = 0.15,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if preflight_result is not None and not bool(preflight_result.get("ok", False)):
-        if not allow_deterministic_fallback:
-            raise ProposalPreflightFailure(
-                str(preflight_result.get("error") or "LLM proposal smoke test failed."),
-                failure_kind="aborted_due_to_preflight_failure",
-                interaction=preflight_result,
-            )
-        deterministic_candidates = research_lab.scout_experiments(
-            brief=brief,
-            lab_state=lab_state,
-            available_models=available_models,
-            experiment_memory=memory_payload,
-            current_best=current_best,
-            scout_limit=scout_limit * 2,
-            exploit_delta_ratio=exploit_delta_ratio,
-        )
-        deterministic_candidates = _mark_fallback_candidates(
-            filter_diverse_candidates(
-                candidates=deterministic_candidates,
-                memory_payload=memory_payload,
-                current_run_signatures=current_run_signatures,
-                family_limit=family_limit,
-                scout_limit=scout_limit,
-            ),
-            status="aborted_due_to_preflight_failure",
-        )
-        return deterministic_candidates, {
-            "proposal_mode": "fallback_used",
-            "proposal_status": "aborted_due_to_preflight_failure",
-            "proposal_backend": "fallback",
-            "proposal_count": len(deterministic_candidates),
-            "proposal_model": None,
-            "prompt_variant": None,
-            "proposal_error": preflight_result.get("error"),
-        }
-
-    if proposal_engine is not None and not proposal_engine.is_available():
-        if not allow_deterministic_fallback:
-            raise ProposalBackendFailure(
-                "Configured LLM backend is unavailable.",
-                failure_kind="llm_backend_failure",
-                interaction={"backend": getattr(proposal_engine, "backend_name", "unknown"), "model": None},
-            )
-        deterministic_candidates = research_lab.scout_experiments(
-            brief=brief,
-            lab_state=lab_state,
-            available_models=available_models,
-            experiment_memory=memory_payload,
-            current_best=current_best,
-            scout_limit=scout_limit * 2,
-            exploit_delta_ratio=exploit_delta_ratio,
-        )
-        deterministic_candidates = _mark_fallback_candidates(
-            filter_diverse_candidates(
-                candidates=deterministic_candidates,
-                memory_payload=memory_payload,
-                current_run_signatures=current_run_signatures,
-                family_limit=family_limit,
-                scout_limit=scout_limit,
-            ),
-            status="llm_backend_failure",
-        )
-        return deterministic_candidates, {
-            "proposal_mode": "fallback_used",
-            "proposal_status": "llm_backend_failure",
-            "proposal_backend": "fallback",
-            "proposal_count": len(deterministic_candidates),
-            "proposal_model": None,
-            "prompt_variant": None,
-            "proposal_error": "Configured LLM backend is unavailable.",
-        }
-
-    if proposal_engine is not None and proposal_engine.is_available():
-        try:
-            llm_result = proposal_engine.generate_research_proposals(
-                available_models=available_models,
-                research_brief=brief,
-                current_best=current_best,
-                experiment_memory=memory_payload,
-                diversity_state=_build_diversity_state(memory_payload),
-                proposal_count=scout_limit,
-                trial_history=trial_history or [],
-                search_progress=search_progress or {},
-                failure_patterns=failure_patterns or {},
-                knowledge_context=knowledge_context or "",
-                archive_records=archive_records or [],
-            )
-            llm_candidates = _normalize_llm_candidates(
-                list(llm_result.get("proposals", [])),
-                available_models,
-            )
-            llm_candidates = filter_diverse_candidates(
-                candidates=llm_candidates,
-                memory_payload=memory_payload,
-                current_run_signatures=current_run_signatures,
-                family_limit=family_limit,
-                scout_limit=scout_limit,
-            )
-            if llm_candidates:
-                return llm_candidates, {
-                    "proposal_mode": "llm",
-                    "proposal_status": str(llm_result.get("status", "llm_success")),
-                    "proposal_backend": llm_result.get("backend", proposal_engine.backend_name),
-                    "proposal_count": len(llm_candidates),
-                    "proposal_model": llm_result.get("model"),
-                    "prompt_variant": llm_result.get("prompt_variant"),
-                    "proposal_error": None,
-                }
-            if allow_deterministic_fallback:
-                deterministic_candidates = research_lab.scout_experiments(
-                    brief=brief,
-                    lab_state=lab_state,
-                    available_models=available_models,
-                    experiment_memory=memory_payload,
-                    current_best=current_best,
-                    scout_limit=scout_limit * 2,
-                    exploit_delta_ratio=exploit_delta_ratio,
-                )
-                deterministic_candidates = _mark_fallback_candidates(
-                    filter_diverse_candidates(
-                        candidates=deterministic_candidates,
-                        memory_payload=memory_payload,
-                        current_run_signatures=current_run_signatures,
-                        family_limit=family_limit,
-                        scout_limit=scout_limit,
-                    ),
-                    status="fallback_used",
-                )
-                return deterministic_candidates, {
-                    "proposal_mode": "fallback_used",
-                    "proposal_status": "fallback_used",
-                    "proposal_backend": "fallback",
-                    "proposal_count": len(deterministic_candidates),
-                    "proposal_model": None,
-                    "prompt_variant": llm_result.get("prompt_variant"),
-                    "proposal_error": "LLM proposals were rejected by novelty/diversity gates.",
-                }
-            return [], {
-                "proposal_mode": "llm",
-                "proposal_status": str(llm_result.get("status", "llm_success")),
-                "proposal_backend": llm_result.get("backend", proposal_engine.backend_name),
-                "proposal_count": 0,
-                "proposal_model": llm_result.get("model"),
-                "prompt_variant": llm_result.get("prompt_variant"),
-                "proposal_error": "LLM proposals were rejected by novelty/diversity gates.",
-            }
-        except (ProposalBackendFailure, ProposalParseFailure, ProposalSchemaFailure, ProposalSemanticFailure) as exc:
-            if not allow_deterministic_fallback:
-                raise
-            deterministic_candidates = research_lab.scout_experiments(
-                brief=brief,
-                lab_state=lab_state,
-                available_models=available_models,
-                experiment_memory=memory_payload,
-                current_best=current_best,
-                scout_limit=scout_limit * 2,
-                exploit_delta_ratio=exploit_delta_ratio,
-            )
-            deterministic_candidates = _mark_fallback_candidates(
-                filter_diverse_candidates(
-                    candidates=deterministic_candidates,
-                    memory_payload=memory_payload,
-                    current_run_signatures=current_run_signatures,
-                    family_limit=family_limit,
-                    scout_limit=scout_limit,
-                ),
-                status="fallback_used",
-            )
-            return deterministic_candidates, {
-                "proposal_mode": "fallback_used",
-                "proposal_status": exc.failure_kind,
-                "proposal_backend": "fallback",
-                "proposal_count": len(deterministic_candidates),
-                "proposal_model": None,
-                "prompt_variant": None,
-                "proposal_error": str(exc),
-            }
-
-    deterministic_candidates = research_lab.scout_experiments(
-        brief=brief,
-        lab_state=lab_state,
-        available_models=available_models,
-        experiment_memory=memory_payload,
-        current_best=current_best,
-        scout_limit=scout_limit * 2,
-        exploit_delta_ratio=exploit_delta_ratio,
+    llm_config = dict(getattr(proposal_engine, "llm_config", {}) or {})
+    context = {
+        "brief": brief,
+        "lab_state": lab_state,
+        "available_models": available_models,
+        "memory_payload": memory_payload,
+        "current_best": current_best,
+        "diversity_state": _build_diversity_state(memory_payload),
+        "scout_limit": scout_limit,
+        "trial_history": trial_history or [],
+        "search_progress": search_progress or {},
+        "failure_patterns": failure_patterns or {},
+        "knowledge_context": knowledge_context or "",
+        "archive_records": archive_records or [],
+        "exploit_delta_ratio": exploit_delta_ratio,
+    }
+    llm_candidates = get_proposals(
+        context,
+        {"llm": llm_config},
+        logger=LOGGER,
+        n=scout_limit,
     )
-    deterministic_candidates = filter_diverse_candidates(
-        candidates=deterministic_candidates,
+    llm_candidates = _normalize_llm_candidates(list(llm_candidates), available_models)
+    llm_candidates = filter_diverse_candidates(
+        candidates=llm_candidates,
         memory_payload=memory_payload,
         current_run_signatures=current_run_signatures,
         family_limit=family_limit,
         scout_limit=scout_limit,
     )
-    deterministic_candidates = _mark_fallback_candidates(deterministic_candidates, status="fallback_used")
-    return deterministic_candidates, {
+    if llm_candidates:
+        return llm_candidates, {
+            "proposal_mode": "llm",
+            "proposal_status": "llm_success",
+            "proposal_backend": "proposal_engine",
+            "proposal_count": len(llm_candidates),
+            "proposal_model": None,
+            "prompt_variant": None,
+            "proposal_error": None,
+        }
+    return [], {
         "proposal_mode": "fallback_used",
         "proposal_status": "fallback_used",
         "proposal_backend": "fallback",
-        "proposal_count": len(deterministic_candidates),
+        "proposal_count": 0,
         "proposal_model": None,
         "prompt_variant": None,
         "proposal_error": None,
