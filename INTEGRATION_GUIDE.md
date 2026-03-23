@@ -1,4 +1,5 @@
-# AutoCivil Track B — Integration Guide
+# AutoCivil Track B — Legacy Integration Guide
+> Legacy reference only. The active runtime path now uses the refactored modules directly; this document is retained for historical context and should not be treated as the source of truth.
 ## Exact patches for research_loop.py · proposal_engine.py · research_protocol.py · generate_data.py
 
 ---

@@ -3,6 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import run_qwen_only
+
+from loop_candidate_selection import select_scout_candidates
 from research_protocol import (
     DuplicateExperimentError,
     apply_keep_to_research_surface,
@@ -751,6 +754,95 @@ class ResearchProtocolTests(unittest.TestCase):
 
         self.assertFalse(report["consistent"])
         self.assertTrue(any(item["field"] == "run_id" for item in report["mismatches"]))
+
+    def test_validate_final_artifact_consistency_accepts_report_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "best_search_model.pkl").write_bytes(b"placeholder")
+            (outputs_dir / "best_search_result.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_id": "best-artifact",
+                        "artifact_metadata": {
+                            "artifact_id": "best-artifact",
+                            "run_id": "run-123",
+                            "model_artifact_id": "model-artifact",
+                        },
+                        "model_name": "LGBMRegressor",
+                        "hyperparameters": {"n_estimators": 300},
+                        "composite_score": 0.83,
+                        "validation_verdict": "WARN",
+                        "model_artifact_id": "model-artifact",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "final_metrics.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_id": "final-artifact",
+                        "artifact_metadata": {
+                            "artifact_id": "final-artifact",
+                            "run_id": "run-123",
+                            "model_artifact_id": "model-artifact",
+                        },
+                        "baseline_metrics": {"composite_score": 0.8},
+                        "best_search_metrics": {
+                            "artifact_id": "best-artifact",
+                            "model_name": "LGBMRegressor",
+                            "hyperparameters": {"n_estimators": 300},
+                            "composite_score": 0.83,
+                            "validation_verdict": "WARN",
+                            "model_artifact_id": "model-artifact",
+                        },
+                        "best_model_name": "LGBMRegressor",
+                        "best_model_hyperparameters": {"n_estimators": 300},
+                        "validation_verdict": "WARN",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_final_artifact_consistency(outputs_dir)
+
+        self.assertTrue(report["consistent"], report["mismatches"])
+
+    def test_qwen_only_config_enables_deterministic_fallback(self) -> None:
+        config = run_qwen_only._build_qwen_only_config()
+        self.assertTrue(config["llm"]["allow_deterministic_fallback"])
+        self.assertEqual(config["llm"]["backend_mode"], "ollama")
+
+    def test_select_scout_candidates_falls_back_when_llm_returns_no_candidates(self) -> None:
+        class EmptyProvider:
+            llm_config = {"enabled": True}
+
+            def get_proposals(self, context, n=3):
+                return []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            candidates, metadata = select_scout_candidates(
+                brief={"goal": "Improve composite_score"},
+                lab_state={},
+                available_models=self.available_models,
+                memory_payload={"runs": []},
+                current_best={"model_name": "ModelFamilyA", "composite_score": 0.9},
+                scout_limit=2,
+                family_limit=1,
+                current_run_signatures=set(),
+                proposal_engine=EmptyProvider(),
+                trial_history=[],
+                search_progress={},
+                failure_patterns={},
+                knowledge_context="",
+                archive_records=[],
+                preflight_result=None,
+                allow_deterministic_fallback=True,
+                exploit_delta_ratio=0.15,
+            )
+
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertEqual(metadata["proposal_mode"], "fallback_used")
 
 
 if __name__ == "__main__":

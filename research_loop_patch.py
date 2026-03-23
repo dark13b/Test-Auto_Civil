@@ -1,8 +1,8 @@
 """
-research_loop_patch.py — AutoCivil Track B
-============================================
-This file documents and provides all the code snippets needed to integrate
-the Track B modules into research_loop.py.
+research_loop_patch.py — Legacy Track B Notes
+=============================================
+Legacy reference only. The active runtime path no longer depends on this patch
+module; it is retained for historical context and test fixtures.
 
 It is structured as a fully working standalone module that wraps the
 existing research loop. You can either:

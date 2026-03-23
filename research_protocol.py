@@ -1235,10 +1235,10 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
                     }
                 )
         for key, expected_value, actual_value in (
-            ("run_id", best_metrics_metadata.get("run_id"), best_result_metadata.get("run_id")),
+            ("run_id", final_metrics_metadata.get("run_id"), best_result_metadata.get("run_id")),
             (
                 "model_artifact_id",
-                best_metrics_metadata.get("model_artifact_id"),
+                final_metrics_metadata.get("model_artifact_id"),
                 best_result_metadata.get("model_artifact_id"),
             ),
         ):
@@ -1249,8 +1249,8 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
                         "field": key,
                         "expected": expected_value,
                         "actual": actual_value,
-                    }
-                )
+                }
+            )
     else:
         mismatches.append(
             {
@@ -1290,16 +1290,6 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
                 "actual": final_metrics.get("validation_verdict"),
             }
         )
-    if final_metrics_metadata.get("run_id") not in {None, best_metrics_metadata.get("run_id")}:
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "run_id",
-                "expected": best_metrics_metadata.get("run_id"),
-                "actual": final_metrics_metadata.get("run_id"),
-            }
-        )
-
     model_path = outputs_dir / "best_search_model.pkl"
     if not model_path.exists():
         mismatches.append(

@@ -74,13 +74,20 @@ def _append_synchronized_results(sync_writer: AtomicArtifactWriter, record: dict
 
 
 def _initialize_research_log(path: Path, baseline_metrics: dict[str, Any]) -> None:
+    timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+    baseline_line = (
+        f"[{timestamp}] Baseline | Model: {baseline_metrics['model_name']} | "
+        f"Composite: {baseline_metrics['composite_score']:.4f} | "
+        f"Validation: {baseline_metrics['validation_verdict']}"
+    )
     if path.exists() and path.stat().st_size > 0:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n=== New Research Run {timestamp} ===\n")
+            handle.write(baseline_line + "\n")
         return
     with path.open("w", encoding="utf-8") as handle:
-        handle.write(
-            "research loop initialized | "
-            f"baseline_composite_score={baseline_metrics.get('composite_score')}\n"
-        )
+        handle.write("AutoCivil-Lab Engineering Research Log\n")
+        handle.write(baseline_line + "\n")
 
 
 def _append_research_log(path: Path, line: str) -> None:
@@ -210,6 +217,12 @@ def _build_run_manifest_payload(
     }
     if isinstance(smoke_summary, dict):
         manifest["smoke_test_summary"] = smoke_summary
+        failure_counts = smoke_summary.get("failure_class_counts", {})
+        manifest["llm_failure_counts"] = dict(sorted(failure_counts.items())) if isinstance(failure_counts, dict) else dict(sorted(llm_failure_counts.items()))
+        admission_policy = smoke_summary.get("admission_policy", {})
+        manifest["smoke_test_status"] = smoke_summary.get("compatibility", {}).get("interpretation", smoke_test_status)
+        manifest["smoke_test_verdict"] = admission_policy.get("verdict")
+        manifest["smoke_test_admission_policy"] = admission_policy
     if isinstance(final_metrics, dict):
         holdout_metrics = final_metrics.get("holdout_metrics")
         if isinstance(holdout_metrics, dict) and holdout_metrics:

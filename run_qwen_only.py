@@ -42,7 +42,7 @@ def _build_qwen_only_config() -> dict[str, Any]:
 
     llm_config["enabled"] = True
     llm_config["backend_mode"] = "ollama"
-    llm_config["allow_deterministic_fallback"] = False
+    llm_config["allow_deterministic_fallback"] = True
     llm_config["default_local_proposal_model"] = FAST_MODEL
     llm_config["compact_prompt_models"] = [FAST_MODEL]
     llm_config["include_no_think_directive"] = False

@@ -1,9 +1,8 @@
 """
-proposal_engine_patch.py — AutoCivil Track B
-==============================================
-This module PATCHES the existing proposal_engine.py with Track B enhancements.
-It does NOT replace proposal_engine.py — it provides drop-in functions you can
-call from _build_experiment_prompt() and generate_experiment_proposals().
+proposal_engine_patch.py — Legacy Track B Notes
+===============================================
+Legacy reference only. The active runtime path no longer depends on this patch
+module; it is retained for historical context and test fixtures.
 
 HOW TO INTEGRATE (proposal_engine.py):
 ---------------------------------------
