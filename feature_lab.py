@@ -219,21 +219,29 @@ class FeatureLab:
 
     def __init__(
         self,
-        config: dict,
-        outputs_dir: Path,
-        llm_backend: Any,
+        config_or_outputs_dir: dict | Path,
+        outputs_dir: Path | None = None,
+        llm_backend: Any | None = None,
+        *,
+        timeout_seconds: float | None = None,
+        min_delta_rmse: float | None = None,
     ):
-        self.config      = config
-        self.outputs_dir = Path(outputs_dir)
-        self.backend     = llm_backend
+        if isinstance(config_or_outputs_dir, (str, Path)) and outputs_dir is None:
+            self.config = {}
+            self.outputs_dir = Path(config_or_outputs_dir)
+            self.backend = llm_backend
+        else:
+            self.config = config_or_outputs_dir if isinstance(config_or_outputs_dir, dict) else {}
+            self.outputs_dir = Path(outputs_dir or ".")
+            self.backend = llm_backend
         self.sandbox_dir = self.outputs_dir / "feature_lab"
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         self.hypothesis_log_path = self.sandbox_dir / "feature_hypotheses.json"
         self._log: list[dict] = self._load_log()
 
-        rc = config.get("research", {})
-        self.min_delta  = rc.get("feature_lab_min_delta_rmse", MIN_DELTA_RMSE)
-        self.timeout    = rc.get("feature_lab_sandbox_timeout", SANDBOX_TIMEOUT_SECONDS)
+        rc = self.config.get("research", {})
+        self.min_delta  = min_delta_rmse if min_delta_rmse is not None else rc.get("feature_lab_min_delta_rmse", MIN_DELTA_RMSE)
+        self.timeout    = timeout_seconds if timeout_seconds is not None else rc.get("feature_lab_sandbox_timeout", SANDBOX_TIMEOUT_SECONDS)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -511,6 +519,35 @@ class FeatureLab:
             with open(self.hypothesis_log_path, "r", encoding="utf-8") as fh:
                 return json.load(fh)
         return []
+
+    def validate_feature_code(self, code: str) -> dict[str, Any]:
+        if "import " in code or "from " in code:
+            return {"accepted": False, "reason": "Import statements are not allowed."}
+        if any(name in code for name in ("os.", "sys.", "subprocess", "open(", "exec(", "eval(")):
+            return {"accepted": False, "reason": "Unsafe names or operations are not allowed."}
+        try:
+            safe_code = _sanitise_code(code)
+        except Exception as exc:
+            return {"accepted": False, "reason": str(exc)}
+        return {"accepted": True, "reason": "safe", "sanitized_code": safe_code}
+
+    def execute_feature_code(self, *, code: str, frame) -> dict[str, Any]:
+        validation = self.validate_feature_code(code)
+        if not validation.get("accepted", False):
+            return validation
+        namespace = _build_sandbox_namespace()
+        success, error = _exec_with_timeout(code, namespace, timeout=self.timeout)
+        if not success:
+            return {"accepted": False, "reason": error}
+        feature_func: Callable | None = namespace.get(FEATURE_FUNC_NAME)
+        if feature_func is None or not callable(feature_func):
+            return {"accepted": False, "reason": f"No callable '{FEATURE_FUNC_NAME}' found after exec"}
+        series = feature_func(frame.copy())
+        return {
+            "accepted": True,
+            "series_name": FEATURE_FUNC_NAME,
+            "values": list(series),
+        }
 
     def _append_log(self, entry: dict) -> None:
         entry["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

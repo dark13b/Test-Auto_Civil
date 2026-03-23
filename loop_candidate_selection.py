@@ -5,12 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import research_lab
-
-from proposal_engine import ProposalEngine, get_proposals
+from proposal_engine import ProposalContext, ProposalProvider
 from research_protocol import filter_diverse_candidates
 
-from loop_artifacts import _build_diversity_state, _mark_fallback_candidates, _normalize_llm_candidates
+from loop_artifacts import _build_diversity_state, _normalize_llm_candidates
 
 
 LOGGER = logging.getLogger("loop_candidate_selection")
@@ -26,8 +24,7 @@ def select_scout_candidates(
     scout_limit: int,
     family_limit: int,
     current_run_signatures: set[tuple[str, str]],
-    proposal_engine: ProposalEngine | None,
-    allow_deterministic_fallback: bool = False,
+    proposal_engine: ProposalProvider | None,
     trial_history: list[dict[str, Any]] | None = None,
     search_progress: dict[str, Any] | None = None,
     failure_patterns: dict[str, Any] | None = None,
@@ -36,6 +33,16 @@ def select_scout_candidates(
     preflight_result: dict[str, Any] | None = None,
     exploit_delta_ratio: float = 0.15,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if proposal_engine is None:
+        return [], {
+            "proposal_mode": "fallback_used",
+            "proposal_status": "fallback_used",
+            "proposal_backend": "fallback",
+            "proposal_count": 0,
+            "proposal_model": None,
+            "prompt_variant": None,
+            "proposal_error": None,
+        }
     context = {
         "brief": brief,
         "lab_state": lab_state,
@@ -51,10 +58,14 @@ def select_scout_candidates(
         "archive_records": archive_records or [],
         "exploit_delta_ratio": exploit_delta_ratio,
     }
-    proposals = get_proposals(
-        context,
-        {"llm": getattr(proposal_engine, "llm_config", {}) if proposal_engine is not None else {}},
-        logger=LOGGER,
+    proposals = proposal_engine.get_proposals(
+        ProposalContext(
+            brief=brief,
+            recent_results=list(trial_history or []),
+            best_metrics=current_best,
+            config=context,
+            trial_budget_remaining=int(scout_limit),
+        ),
         n=scout_limit,
     )
     if proposals:
@@ -70,34 +81,17 @@ def select_scout_candidates(
             return llm_candidates, {
                 "proposal_mode": "llm",
                 "proposal_status": "llm_success",
-                "proposal_backend": getattr(proposal_engine, "backend_name", "llm") if proposal_engine is not None else "llm",
+                "proposal_backend": "proposal_provider",
                 "proposal_count": len(llm_candidates),
                 "proposal_model": None,
                 "prompt_variant": None,
                 "proposal_error": None,
             }
-    deterministic_candidates = research_lab.scout_experiments(
-        brief=brief,
-        lab_state=lab_state,
-        available_models=available_models,
-        experiment_memory=memory_payload,
-        current_best=current_best,
-        scout_limit=scout_limit * 2,
-        exploit_delta_ratio=exploit_delta_ratio,
-    )
-    deterministic_candidates = filter_diverse_candidates(
-        candidates=deterministic_candidates,
-        memory_payload=memory_payload,
-        current_run_signatures=current_run_signatures,
-        family_limit=family_limit,
-        scout_limit=scout_limit,
-    )
-    deterministic_candidates = _mark_fallback_candidates(deterministic_candidates, status="fallback_used")
-    return deterministic_candidates, {
+    return [], {
         "proposal_mode": "fallback_used",
         "proposal_status": "fallback_used",
         "proposal_backend": "fallback",
-        "proposal_count": len(deterministic_candidates),
+        "proposal_count": 0,
         "proposal_model": None,
         "prompt_variant": None,
         "proposal_error": None,

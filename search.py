@@ -30,7 +30,7 @@ from research_protocol import (
     trial_budget_status,
     validate_final_artifact_consistency,
 )
-from train import (
+from train_impl import (
     EngineeringValidator,
     artifact_id,
     artifact_run_id,

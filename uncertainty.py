@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from feature_engineering import build_engineering_features
-from train import (
+from train_impl import (
     artifact_id,
     compute_file_hash,
     create_run_id,

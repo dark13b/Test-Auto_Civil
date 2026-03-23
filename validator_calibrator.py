@@ -55,6 +55,23 @@ class ValidatorCalibrator:
     'normal' samples.
     """
 
+    def suggest_thresholds(self, dataset, config: dict) -> dict[str, float]:
+        try:
+            return self.calibrate_from_dataset(dataset, config)
+        except Exception:
+            suggestions: dict[str, float] = {}
+            if hasattr(dataset, "__getitem__"):
+                if "cement" in dataset and "slag" in dataset and "fly_ash" in dataset:
+                    binder = dataset["cement"] + dataset["slag"] + dataset["fly_ash"]
+                    suggestions["total_binder_low_warn"] = float(binder.quantile(0.25))
+                if "water" in dataset and "cement" in dataset:
+                    ratio = dataset["water"] / dataset["cement"].replace(0, 1)
+                    suggestions["suspicious_water_cement_ratio"] = float(ratio.quantile(0.90))
+                if "fly_ash" in dataset and "cement" in dataset:
+                    ratio = dataset["fly_ash"] / (dataset["cement"] + dataset["fly_ash"]).replace(0, 1)
+                    suggestions["fly_ash_replacement_warn"] = float(ratio.quantile(0.90))
+            return suggestions
+
     def calibrate_from_dataset(
         self,
         dataset,   # pd.DataFrame

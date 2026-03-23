@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from sklearn.inspection import permutation_importance
 
-from train import (
+from train_impl import (
     artifact_id,
     artifact_run_id,
     compute_regression_metrics,

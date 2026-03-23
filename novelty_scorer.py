@@ -153,8 +153,20 @@ class NoveltyScorer:
                     "model_name": item.get("model_name"),
                     "params": item.get("params", {}),
                     "proposal_family": item.get("proposal_family", ""),
-                }
+            }
             archive.append({"proposal": past_proposal})
+
+        for candidate in archive:
+            past = candidate.get("proposal", {})
+            if str(past.get("model_name", "")) == str(proposal.get("model_name", "")) and dict(
+                past.get("params", {})
+            ) == dict(proposal.get("params", {})):
+                return {
+                    "novelty_score": 0.0,
+                    "max_similarity": 1.0,
+                    "closest_match": past,
+                    "accepted": False,
+                }
 
         novelty_score = self.compute_novelty_score(proposal, archive)
         max_similarity = round(1.0 - novelty_score, 4)
@@ -173,6 +185,7 @@ class NoveltyScorer:
             "novelty_score": novelty_score,
             "max_similarity": max_similarity,
             "closest_match": closest_match,
+            "accepted": novelty_score >= float(self.threshold),
         }
 
     def enforce_diversity_budget(

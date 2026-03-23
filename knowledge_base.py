@@ -344,6 +344,34 @@ CONCRETE_KNOWLEDGE: dict[str, Any] = {
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+class KnowledgeBase:
+    """Compatibility wrapper around the structured concrete knowledge registry."""
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, list[dict[str, Any]]] = {}
+        for family, entry in CONCRETE_KNOWLEDGE.items():
+            if not isinstance(entry, dict):
+                continue
+            rows: list[dict[str, Any]] = []
+            for section_name, section_value in entry.items():
+                if isinstance(section_value, dict):
+                    for item_name, item_value in section_value.items():
+                        if isinstance(item_value, dict):
+                            rows.append({"name": item_name, **item_value})
+                elif isinstance(section_value, list):
+                    for item in section_value:
+                        if isinstance(item, dict):
+                            rows.append(dict(item))
+            payload[family] = rows
+        return payload
+
+    def format_for_prompt(self, *, model_family: str, feature_area: str | None = None) -> str:
+        feature_list = [feature_area] if feature_area else None
+        prompt = get_knowledge_context(model_family, feature_list=feature_list)
+        prompt = prompt.replace("Empirical best hyperparameter ranges:", "Empirical Best Ranges:")
+        return prompt + "\n[source: registry]"
+
+
 def get_knowledge_context(
     model_name: str,
     feature_list: list[str] | None = None,

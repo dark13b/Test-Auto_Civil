@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import logging
 import json
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from dataclasses import asdict
 
 import pandas as pd
 
@@ -18,17 +20,21 @@ from failure_analyzer import FailureAnalyzer
 from hypothesis_archive import HypothesisArchive
 from knowledge_base import get_knowledge_context
 import research_lab
-from llm_backend import get_llm_config, resolve_backend
 from llm_admission_policy import evaluate_llm_admission_policy
+from deterministic_proposal_provider import DeterministicProposalProvider
+from hybrid_proposal_provider import HybridProposalProvider
+from llm_proposal_provider import LLMProposalProvider
 from loop_candidate_selection import select_scout_candidates
 from proposal_engine import (
     ProposalBackendFailure,
-    ProposalEngine,
     ProposalExtractionError,
+    get_proposals,
     ProposalParseFailure,
     ProposalPreflightFailure,
     ProposalSemanticFailure,
     ProposalSchemaFailure,
+    ProposalContext,
+    ProposalProvider,
 )
 from research_protocol import (
     RESEARCH_RESULTS_COLUMNS,
@@ -45,7 +51,7 @@ from research_protocol import (
     write_json_file,
 )
 from search import get_available_model_configs
-from train import (
+from train_impl import (
     EngineeringValidator,
     evaluate_candidate,
     get_outputs_dir,
@@ -58,6 +64,9 @@ from train import (
     split_dataset,
     write_run_scoped_json_artifact,
 )
+
+
+LOGGER = logging.getLogger("research_loop")
 from validator import summarize_validation_report
 
 
@@ -619,18 +628,20 @@ def _mark_fallback_candidates(candidates: list[dict[str, Any]], *, status: str) 
     return normalized
 
 
-def _build_proposal_engine(config: dict[str, Any], outputs_dir: Path) -> ProposalEngine | None:
-    llm_config = get_llm_config(config)
-    if not llm_config.get("enabled", False):
-        return None
-    interaction_log_path = outputs_dir / str(llm_config.get("interaction_log_filename", "llm_interactions.jsonl"))
-    return ProposalEngine(
-        backend=resolve_backend(config),
-        interaction_log_path=interaction_log_path,
-        log_interactions=bool(llm_config.get("log_interactions", True)),
-        include_no_think_directive=bool(llm_config.get("include_no_think_directive", False)),
-        llm_config=llm_config,
+def _build_proposal_provider(config: dict[str, Any]) -> ProposalProvider:
+    llm_config = dict(config.get("llm", {}))
+    llm_provider = LLMProposalProvider(config=config)
+    det_provider = DeterministicProposalProvider(None, config)
+    return HybridProposalProvider(
+        llm_provider=llm_provider,
+        deterministic_provider=det_provider,
+        min_llm_proposals=int(llm_config.get("min_proposals", 1)),
     )
+
+
+def _build_proposal_engine(config: dict[str, Any], outputs_dir: Path) -> ProposalProvider:
+    del outputs_dir
+    return _build_proposal_provider(config)
 
 
 def _apply_llm_smoke_overrides(
@@ -641,7 +652,7 @@ def _apply_llm_smoke_overrides(
     if not backend_mode:
         return config
     updated = copy.deepcopy(config)
-    llm_config = get_llm_config(updated)
+    llm_config = dict(updated.get("llm", {}))
     llm_config["enabled"] = True
     llm_config["backend_mode"] = backend_mode
     updated["llm"] = llm_config
@@ -814,7 +825,7 @@ def _run_llm_preflight(
     allow_deterministic_fallback: bool,
     model_hint: str | None = None,
 ) -> dict[str, Any] | None:
-    if proposal_engine is None:
+    if proposal_engine is None or not hasattr(proposal_engine, "run_proposal_smoke_test"):
         if not llm_enabled:
             result = {
                 "ok": False,
@@ -1059,7 +1070,7 @@ def run_repeated_llm_smoke_test(
     normalized_trials: list[dict[str, Any]] = []
 
     for trial_index in range(1, requested_trials + 1):
-        if proposal_engine is None:
+        if proposal_engine is None or not hasattr(proposal_engine, "run_proposal_smoke_test"):
             trial_result = {
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "ok": False,
@@ -1098,14 +1109,14 @@ def run_repeated_llm_smoke_test(
 
     summary = summarize_smoke_test_trials(
         normalized_trials,
-        requested_backend=requested_backend or (proposal_engine.backend_name if proposal_engine is not None else None),
+        requested_backend=requested_backend or (getattr(proposal_engine, "backend_name", None) if proposal_engine is not None else None),
         requested_model=model_hint,
         admission_policy_config=admission_policy_config,
     )
     report = {
         "generated_at": timestamp,
         "requested_trials": requested_trials,
-        "requested_backend": requested_backend or (proposal_engine.backend_name if proposal_engine is not None else None),
+        "requested_backend": requested_backend or (getattr(proposal_engine, "backend_name", None) if proposal_engine is not None else None),
         "requested_model": model_hint,
         "summary_path": str(summary_path) if summary_path is not None else None,
         "trials": normalized_trials,
@@ -1126,7 +1137,7 @@ def _select_scout_candidates(
     scout_limit: int,
     family_limit: int,
     current_run_signatures: set[tuple[str, str]],
-    proposal_engine: ProposalEngine | None,
+    proposal_engine: ProposalProvider | None,
     allow_deterministic_fallback: bool = False,
     trial_history: list[dict[str, Any]] | None = None,
     search_progress: dict[str, Any] | None = None,
@@ -1152,12 +1163,58 @@ def _select_scout_candidates(
         "archive_records": archive_records or [],
         "exploit_delta_ratio": exploit_delta_ratio,
     }
-    llm_candidates = get_proposals(
-        context,
-        {"llm": llm_config},
-        logger=LOGGER,
-        n=scout_limit,
+    if proposal_engine is None:
+        return [], {
+            "proposal_mode": "fallback_used",
+            "proposal_status": "fallback_used",
+            "proposal_backend": "fallback",
+            "proposal_count": 0,
+            "proposal_model": None,
+            "prompt_variant": None,
+            "proposal_error": None,
+        }
+    proposal_context = ProposalContext(
+        brief=brief,
+        recent_results=list(trial_history or []),
+        best_metrics=current_best,
+        config=context,
+        trial_budget_remaining=int(scout_limit),
     )
+    if hasattr(proposal_engine, "get_proposals"):
+        llm_candidates = proposal_engine.get_proposals(proposal_context, n=scout_limit)
+    elif hasattr(proposal_engine, "generate_research_proposals"):
+        try:
+            llm_result = proposal_engine.generate_research_proposals(
+            available_models=available_models,
+            research_brief=brief,
+            current_best=current_best,
+            experiment_memory=memory_payload,
+            diversity_state=_build_diversity_state(memory_payload),
+            proposal_count=scout_limit,
+            trial_history=trial_history or [],
+            search_progress=search_progress or {},
+            failure_patterns=failure_patterns or {},
+            knowledge_context=knowledge_context or "",
+            model_hint=None,
+            )
+        except Exception as exc:
+            if allow_deterministic_fallback and exc.__class__.__name__ in {"ProposalExtractionError", "ProposalParseFailure"}:
+                llm_candidates = []
+            else:
+                raise
+        else:
+            llm_candidates = list(llm_result.get("proposals", [])) if isinstance(llm_result, dict) else list(llm_result or [])
+    else:
+        llm_candidates = get_proposals(  # type: ignore[name-defined]
+            context,
+            {"llm": llm_config},
+            logger=LOGGER,
+            n=scout_limit,
+        )
+    llm_candidates = [
+        asdict(candidate) if hasattr(candidate, "__dataclass_fields__") else candidate
+        for candidate in llm_candidates
+    ]
     llm_candidates = _normalize_llm_candidates(list(llm_candidates), available_models)
     llm_candidates = filter_diverse_candidates(
         candidates=llm_candidates,
@@ -1170,8 +1227,34 @@ def _select_scout_candidates(
         return llm_candidates, {
             "proposal_mode": "llm",
             "proposal_status": "llm_success",
-            "proposal_backend": "proposal_engine",
+            "proposal_backend": "proposal_provider",
             "proposal_count": len(llm_candidates),
+            "proposal_model": None,
+            "prompt_variant": None,
+            "proposal_error": None,
+        }
+    if allow_deterministic_fallback:
+        deterministic_candidates = research_lab.scout_experiments(
+            brief=brief,
+            lab_state=lab_state,
+            available_models=available_models,
+            experiment_memory=memory_payload,
+            current_best=current_best,
+            scout_limit=max(1, scout_limit),
+            exploit_delta_ratio=exploit_delta_ratio,
+        )
+        deterministic_candidates = filter_diverse_candidates(
+            candidates=deterministic_candidates,
+            memory_payload=memory_payload,
+            current_run_signatures=current_run_signatures,
+            family_limit=family_limit,
+            scout_limit=scout_limit,
+        )
+        return deterministic_candidates, {
+            "proposal_mode": "fallback_used",
+            "proposal_status": "fallback_used",
+            "proposal_backend": "fallback",
+            "proposal_count": len(deterministic_candidates),
             "proposal_model": None,
             "prompt_variant": None,
             "proposal_error": None,
@@ -1273,7 +1356,7 @@ def run_engineering_research_loop(
     run_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     current_run_signatures: set[tuple[str, str]] = set()
     proposal_engine = _build_proposal_engine(config, outputs_dir)
-    llm_config = get_llm_config(config)
+    llm_config = dict(config.get("llm", {}))
     allow_deterministic_fallback = bool(llm_config.get("allow_deterministic_fallback", False))
     max_cycles = max(1, int(cycles_override or research_config.get("max_cycles", 6)))
     family_limit = max(1, int(research_config.get("max_family_repeats_per_cycle", 1)))
@@ -1732,7 +1815,7 @@ def run_engineering_research_loop(
     write_json_file(outputs_dir / FINAL_ACCEPTANCE_FILENAME, acceptance)
     if (
         proposal_engine is not None
-        and proposal_engine.is_available()
+        and hasattr(proposal_engine, "summarize_run")
         and bool(llm_config.get("tasks", {}).get("summary_enabled", True))
     ):
         llm_summary = proposal_engine.summarize_run(
@@ -1881,7 +1964,7 @@ def main() -> int:
             memory_path = outputs_dir / str(research_config.get("memory_filename", EXPERIMENT_MEMORY_FILENAME))
             memory_payload = load_or_initialize_experiment_memory(memory_path)
             proposal_engine = _build_proposal_engine(config, outputs_dir)
-            llm_config = get_llm_config(config)
+            llm_config = dict(config.get("llm", {}))
             archive_path = outputs_dir / str(
                 research_config.get("hypothesis_archive_filename", HYPOTHESIS_ARCHIVE_FILENAME)
             )

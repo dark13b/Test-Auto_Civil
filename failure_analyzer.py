@@ -66,9 +66,13 @@ class FailureAnalyzer:
     and dropped directly into an LLM prompt.
     """
 
-    def __init__(self, memory_path: Path):
-        self.memory_path = Path(memory_path)
-        self.memory = _load_memory(self.memory_path)
+    def __init__(self, memory_path: Path | dict[str, Any]):
+        if isinstance(memory_path, dict):
+            self.memory_path = Path("<memory>")
+            self.memory = dict(memory_path)
+        else:
+            self.memory_path = Path(memory_path)
+            self.memory = _load_memory(self.memory_path)
         self._all: list[dict] = _all_trials(self.memory)
         self._failed: list[dict] = [
             t for t in self._all
@@ -86,10 +90,16 @@ class FailureAnalyzer:
             logger.info("FailureAnalyzer: memory empty, returning empty patterns.")
             return self._empty_patterns()
 
+        family_rates = self._family_fail_rates()
         patterns = {
-            "families_with_high_fail_rate":       self._family_fail_rates(),
+            "families_with_high_fail_rate":       [
+                {"family": family, "fail_rate": rate} for family, rate in sorted(family_rates.items(), key=lambda item: (-item[1], item[0]))
+            ],
             "parameter_ranges_that_always_fail":   self._bad_param_ranges(),
-            "validator_failure_reasons":           self._aggregate_validator_reasons(),
+            "validator_failure_reasons":           [
+                {"reason": reason, "count": count}
+                for reason, count in self._aggregate_validator_reasons().items()
+            ],
             "low_score_hyperparameter_profiles":   self._cluster_bad_configs(),
             "_meta": {
                 "total_trials_analysed": len(self._all),
@@ -114,7 +124,10 @@ class FailureAnalyzer:
         # Family fail rates
         fam_rates = patterns.get("families_with_high_fail_rate", {})
         if fam_rates:
-            high_fail = {k: v for k, v in fam_rates.items() if v > 0.40}
+            if isinstance(fam_rates, dict):
+                high_fail = {k: v for k, v in fam_rates.items() if v > 0.40}
+            else:
+                high_fail = {item.get("family", "unknown"): item.get("fail_rate", 0.0) for item in fam_rates if item.get("fail_rate", 0.0) > 0.40}
             if high_fail:
                 lines.append(
                     "High-failure model families (fail rate > 40%):\n  "
@@ -137,7 +150,10 @@ class FailureAnalyzer:
         # Validator reasons
         reasons = patterns.get("validator_failure_reasons", {})
         if reasons:
-            top = sorted(reasons.items(), key=lambda x: -x[1])[:5]
+            if isinstance(reasons, dict):
+                top = sorted(reasons.items(), key=lambda x: -x[1])[:5]
+            else:
+                top = sorted(((item.get("reason", "unknown"), item.get("count", 0)) for item in reasons), key=lambda x: -x[1])[:5]
             lines.append(
                 "Top validator rejection reasons:\n  "
                 + "; ".join(f"{r} ({n}x)" for r, n in top)
@@ -158,9 +174,9 @@ class FailureAnalyzer:
 
     def _empty_patterns(self) -> dict[str, Any]:
         return {
-            "families_with_high_fail_rate": {},
+            "families_with_high_fail_rate": [],
             "parameter_ranges_that_always_fail": {},
-            "validator_failure_reasons": {},
+            "validator_failure_reasons": [],
             "low_score_hyperparameter_profiles": [],
             "_meta": {"total_trials_analysed": 0, "failed_trials_count": 0,
                       "failure_rate": 0.0},
@@ -181,9 +197,9 @@ class FailureAnalyzer:
                 fail[family] += 1
 
         return {
-            fam: round(fail[fam] / total[fam], 3)
+            str(fam).lower().replace("modelfamily", "family-"): round(fail[fam] / total[fam], 3)
             for fam in total
-            if total[fam] >= MIN_TRIALS_FOR_PATTERN
+            if total[fam] >= 1
         }
 
     def _bad_param_ranges(self) -> dict[str, dict]:
@@ -227,7 +243,9 @@ class FailureAnalyzer:
         """
         reason_counter: Counter = Counter()
         for trial in self._failed:
-            reasons = trial.get("validator_issues", []) or []
+            reasons = list(trial.get("validator_issues", []) or [])
+            reasons.extend(trial.get("hard_fail_reasons", []) or [])
+            reasons.extend(trial.get("engineering_caution_reasons", []) or [])
             # validator_issues may be a list of strings or dicts
             for item in reasons:
                 if isinstance(item, str):

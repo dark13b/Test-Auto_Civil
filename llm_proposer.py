@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+# DEPRECATED - use HybridProposalProvider instead.
+# This file is retained for reference only and will be removed in Stage 2.
+import warnings
+
+warnings.warn("llm_proposer is deprecated", DeprecationWarning, stacklevel=2)
+
 from pathlib import Path
 from typing import Any
 

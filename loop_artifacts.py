@@ -16,7 +16,7 @@ from research_protocol import (
     validate_final_artifact_consistency,
     write_json_file,
 )
-from train import save_json_artifact, write_run_scoped_json_artifact
+from train_impl import save_json_artifact, write_run_scoped_json_artifact
 from validator import summarize_validation_report
 
 RESEARCH_RESULTS_FILENAME = "research_results.csv"
