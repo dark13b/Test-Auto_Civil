@@ -509,6 +509,7 @@ def run_engineering_research_loop(
                         baseline_metrics=baseline_metrics,
                         best_result=current_best_result,
                         best_model_source_path=outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
+                        run_id=run_id,
                     )
                     apply_keep_to_research_surface(
                         research_lab_path=research_lab_path,
@@ -610,6 +611,7 @@ def run_engineering_research_loop(
             baseline_metrics=baseline_metrics,
             best_result=current_best_result,
             best_model_source_path=baseline_model_path,
+            run_id=run_id,
         )
 
     final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME

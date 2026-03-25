@@ -134,12 +134,37 @@ def _sync_final_artifacts_from_source_of_truth(
     baseline_metrics: dict[str, Any],
     best_result: dict[str, Any],
     best_model_source_path: Path,
+    run_id: str,
 ) -> dict[str, Any]:
     final_metrics_payload = _build_final_metrics_payload(baseline_metrics, best_result)
-    save_json_artifact(outputs_dir / FINAL_METRICS_FILENAME, final_metrics_payload)
+    write_run_scoped_json_artifact(
+        outputs_dir=outputs_dir,
+        filename=FINAL_METRICS_FILENAME,
+        payload=final_metrics_payload,
+        run_id=run_id,
+        source_mode="report",
+        model_artifact_id=best_result.get("model_artifact_id"),
+        model_id=str(best_result.get("model_name", "unknown")),
+    )
     best_from_truth = copy.deepcopy(final_metrics_payload["best_search_metrics"])
-    save_json_artifact(outputs_dir / BEST_RESULT_FILENAME, best_from_truth)
-    save_json_artifact(outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME, best_from_truth)
+    write_run_scoped_json_artifact(
+        outputs_dir=outputs_dir,
+        filename=BEST_RESULT_FILENAME,
+        payload=best_from_truth,
+        run_id=run_id,
+        source_mode="report",
+        model_artifact_id=best_result.get("model_artifact_id"),
+        model_id=str(best_result.get("model_name", "unknown")),
+    )
+    write_run_scoped_json_artifact(
+        outputs_dir=outputs_dir,
+        filename=SEARCH_STATE_BEST_RESULT_FILENAME,
+        payload=best_from_truth,
+        run_id=run_id,
+        source_mode="report",
+        model_artifact_id=best_result.get("model_artifact_id"),
+        model_id=str(best_result.get("model_name", "unknown")),
+    )
     if not best_model_source_path.exists():
         raise FileNotFoundError(f"Best model artifact is missing: {best_model_source_path}")
     best_model_bytes = best_model_source_path.read_bytes()
