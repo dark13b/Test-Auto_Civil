@@ -125,7 +125,7 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
     def test_load_current_best_result_prefers_best_search_result_over_holdout_augmented_final_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
-            (outputs_dir / research_loop.FINAL_METRICS_FILENAME).write_text(
+            (outputs_dir / "final_metrics.json").write_text(
                 json.dumps(
                     {
                         "best_search_metrics": {
@@ -428,14 +428,12 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 run_id: str,
             ) -> dict:
                 payload = {
+                    "artifact_kind": "search_selection",
+                    **best_result,
                     "baseline_metrics": baseline_metrics,
-                    "best_search_metrics": best_result,
                     "composite_improvement_pct": 7.5,
-                    "best_model_name": best_result["model_name"],
-                    "best_model_hyperparameters": best_result["hyperparameters"],
-                    "validation_verdict": best_result["validation_verdict"],
                 }
-                (outputs_dir / research_loop.FINAL_METRICS_FILENAME).write_text(
+                (outputs_dir / research_loop.BEST_RESULT_FILENAME).write_text(
                     json.dumps(payload),
                     encoding="utf-8",
                 )
@@ -551,13 +549,13 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 recalibrate_mock = stack.enter_context(patch("uncertainty.recalibrate_uncertainty_artifacts"))
                 best_result = research_loop.run_engineering_research_loop(cycles_override=1, with_report=False)
 
-            final_metrics = json.loads((outputs_dir / research_loop.FINAL_METRICS_FILENAME).read_text(encoding="utf-8"))
+            final_metrics = json.loads((outputs_dir / research_loop.BEST_RESULT_FILENAME).read_text(encoding="utf-8"))
             manifest = json.loads((outputs_dir / research_loop.RUN_MANIFEST_FILENAME).read_text(encoding="utf-8"))
             run_scoped_manifest = json.loads(
                 (outputs_dir / "runs" / manifest["run_id"] / research_loop.RUN_MANIFEST_FILENAME).read_text(encoding="utf-8")
             )
             self.assertEqual(best_result["composite_score"], 0.86)
-            self.assertEqual(final_metrics["best_search_metrics"]["composite_score"], 0.86)
+            self.assertEqual(final_metrics["composite_score"], 0.86)
             self.assertEqual(run_scoped_manifest["run_id"], manifest["run_id"])
             self.assertEqual(manifest["final_run_status"], "success")
             self.assertEqual(manifest["preflight_status"], "passed")
@@ -623,14 +621,12 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 run_id: str,
             ) -> dict:
                 payload = {
+                    "artifact_kind": "search_selection",
+                    **best_result,
                     "baseline_metrics": baseline_metrics,
-                    "best_search_metrics": best_result,
                     "composite_improvement_pct": 7.5,
-                    "best_model_name": best_result["model_name"],
-                    "best_model_hyperparameters": best_result["hyperparameters"],
-                    "validation_verdict": best_result["validation_verdict"],
                 }
-                (outputs_dir / research_loop.FINAL_METRICS_FILENAME).write_text(
+                (outputs_dir / research_loop.BEST_RESULT_FILENAME).write_text(
                     json.dumps(payload),
                     encoding="utf-8",
                 )
@@ -919,7 +915,11 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                     patch.object(
                         research_loop,
                         "_sync_final_artifacts_from_source_of_truth",
-                        return_value={"best_search_metrics": baseline_metrics},
+                        return_value={
+                            "artifact_kind": "search_selection",
+                            **baseline_metrics,
+                            "composite_improvement_pct": 0.0,
+                        },
                     )
                 )
                 stack.enter_context(patch.object(research_loop, "_build_results_sync_writer", return_value=Mock()))

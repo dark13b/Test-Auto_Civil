@@ -655,10 +655,10 @@ class ResearchProtocolTests(unittest.TestCase):
         self.assertEqual(trial_budget_status(elapsed_seconds=12.0, max_trial_seconds=30.0), "within_budget")
         self.assertEqual(trial_budget_status(elapsed_seconds=12.0, max_trial_seconds=0.0), "disabled")
 
-    def test_acceptance_decision_uses_final_metrics(self) -> None:
+    def test_acceptance_decision_uses_search_selection_artifact(self) -> None:
         final_metrics = {
-            "baseline_metrics": {"composite_score": 0.80},
-            "best_search_metrics": {"composite_score": 0.83, "model_name": "LGBMRegressor"},
+            "artifact_kind": "search_selection",
+            "model_name": "LGBMRegressor",
             "composite_improvement_pct": 3.75,
         }
         brief = {
@@ -670,37 +670,42 @@ class ResearchProtocolTests(unittest.TestCase):
 
         decision = build_acceptance_decision(final_metrics=final_metrics, brief=brief)
         self.assertFalse(decision["accepted"])
-        self.assertEqual(decision["source_of_truth"], "final_metrics.json")
+        self.assertEqual(decision["source_of_truth"], "best_search_result.json")
         self.assertEqual(decision["best_model_name"], "LGBMRegressor")
 
-    def test_validate_final_artifact_consistency_uses_final_metrics_as_truth(self) -> None:
+    def test_validate_final_artifact_consistency_uses_best_search_result_as_truth(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
             (outputs_dir / "best_search_model.pkl").write_bytes(b"placeholder")
-            (outputs_dir / "final_metrics.json").write_text(
+            (outputs_dir / "best_search_result.json").write_text(
                 json.dumps(
                     {
-                        "baseline_metrics": {"composite_score": 0.8},
-                        "best_search_metrics": {
-                            "model_name": "LGBMRegressor",
-                            "hyperparameters": {"n_estimators": 300},
-                            "composite_score": 0.83,
-                            "validation_verdict": "WARN",
-                        },
-                        "best_model_name": "LGBMRegressor",
-                        "best_model_hyperparameters": {"n_estimators": 300},
+                        "artifact_kind": "search_selection",
+                        "model_name": "LGBMRegressor",
+                        "hyperparameters": {"n_estimators": 300},
+                        "composite_score": 0.83,
                         "validation_verdict": "WARN",
                     }
                 ),
                 encoding="utf-8",
             )
-            (outputs_dir / "best_search_result.json").write_text(
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
                 json.dumps(
                     {
-                        "model_name": "XGBRegressor",
-                        "hyperparameters": {"n_estimators": 300},
-                        "composite_score": 0.83,
-                        "validation_verdict": "WARN",
+                        "artifact_kind": "final_holdout_evaluation",
+                        "selected_model": {
+                            "artifact_kind": "search_selection",
+                            "model_name": "XGBRegressor",
+                            "hyperparameters": {"n_estimators": 300},
+                            "composite_score": 0.83,
+                            "validation_verdict": "WARN",
+                        },
+                        "holdout_metrics": {
+                            "stage": "final_holdout",
+                            "partition": "holdout",
+                            "aggregate": {"rmse": 4.1, "mae": 3.2, "r2": 0.8, "composite_score": 0.84},
+                        },
+                        "holdout_validation_report": {"verdict": "PASS"},
                     }
                 ),
                 encoding="utf-8",
@@ -709,19 +714,34 @@ class ResearchProtocolTests(unittest.TestCase):
             report = validate_final_artifact_consistency(outputs_dir)
 
         self.assertFalse(report["consistent"])
-        self.assertEqual(report["source_of_truth"], "final_metrics.json")
-        self.assertEqual(report["mismatches"][0]["artifact"], "best_search_result.json")
+        self.assertEqual(report["source_of_truth"], "best_search_result.json")
+        self.assertEqual(report["mismatches"][0]["artifact"], "final_holdout_evaluation.json")
 
     def test_validate_final_artifact_consistency_detects_run_scope_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
             (outputs_dir / "best_search_model.pkl").write_bytes(b"placeholder")
-            (outputs_dir / "final_metrics.json").write_text(
+            (outputs_dir / "best_search_result.json").write_text(
                 json.dumps(
                     {
+                        "artifact_kind": "search_selection",
                         "run_id": "run-current",
-                        "baseline_metrics": {"composite_score": 0.8},
-                        "best_search_metrics": {
+                        "artifact_id": "best-current",
+                        "model_name": "LGBMRegressor",
+                        "hyperparameters": {"n_estimators": 300},
+                        "composite_score": 0.83,
+                        "validation_verdict": "WARN",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "final_holdout_evaluation",
+                        "run_id": "run-stale",
+                        "selected_model": {
+                            "artifact_kind": "search_selection",
                             "run_id": "run-current",
                             "artifact_id": "best-current",
                             "model_name": "LGBMRegressor",
@@ -729,22 +749,12 @@ class ResearchProtocolTests(unittest.TestCase):
                             "composite_score": 0.83,
                             "validation_verdict": "WARN",
                         },
-                        "best_model_name": "LGBMRegressor",
-                        "best_model_hyperparameters": {"n_estimators": 300},
-                        "validation_verdict": "WARN",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (outputs_dir / "best_search_result.json").write_text(
-                json.dumps(
-                    {
-                        "run_id": "run-stale",
-                        "artifact_id": "best-stale",
-                        "model_name": "LGBMRegressor",
-                        "hyperparameters": {"n_estimators": 300},
-                        "composite_score": 0.83,
-                        "validation_verdict": "WARN",
+                        "holdout_metrics": {
+                            "stage": "final_holdout",
+                            "partition": "holdout",
+                            "aggregate": {"rmse": 4.1, "mae": 3.2, "r2": 0.8, "composite_score": 0.84},
+                        },
+                        "holdout_validation_report": {"verdict": "PASS"},
                     }
                 ),
                 encoding="utf-8",
@@ -762,6 +772,7 @@ class ResearchProtocolTests(unittest.TestCase):
             (outputs_dir / "best_search_result.json").write_text(
                 json.dumps(
                     {
+                        "artifact_kind": "search_selection",
                         "artifact_id": "best-artifact",
                         "artifact_metadata": {
                             "artifact_id": "best-artifact",
@@ -777,17 +788,18 @@ class ResearchProtocolTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (outputs_dir / "final_metrics.json").write_text(
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
                 json.dumps(
                     {
+                        "artifact_kind": "final_holdout_evaluation",
                         "artifact_id": "final-artifact",
                         "artifact_metadata": {
                             "artifact_id": "final-artifact",
                             "run_id": "run-123",
                             "model_artifact_id": "model-artifact",
                         },
-                        "baseline_metrics": {"composite_score": 0.8},
-                        "best_search_metrics": {
+                        "selected_model": {
+                            "artifact_kind": "search_selection",
                             "artifact_id": "best-artifact",
                             "model_name": "LGBMRegressor",
                             "hyperparameters": {"n_estimators": 300},
@@ -795,9 +807,12 @@ class ResearchProtocolTests(unittest.TestCase):
                             "validation_verdict": "WARN",
                             "model_artifact_id": "model-artifact",
                         },
-                        "best_model_name": "LGBMRegressor",
-                        "best_model_hyperparameters": {"n_estimators": 300},
-                        "validation_verdict": "WARN",
+                        "holdout_metrics": {
+                            "stage": "final_holdout",
+                            "partition": "holdout",
+                            "aggregate": {"rmse": 4.1, "mae": 3.2, "r2": 0.8, "composite_score": 0.84},
+                        },
+                        "holdout_validation_report": {"verdict": "WARN"},
                     }
                 ),
                 encoding="utf-8",

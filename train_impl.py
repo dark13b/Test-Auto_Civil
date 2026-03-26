@@ -763,6 +763,20 @@ def evaluate_candidate(
     val_metrics = compute_regression_metrics(y_val, val_predictions, config, float(y_train.mean()))
     validation_report = validator.validate_predictions(val_predictions, x_val, y_val)
     validation_summary = summarize_validation_report(validation_report)
+    cross_validation = {
+        "stage": "cross_validation",
+        "partition": "train",
+        "folds": int(config["experiment"]["cv_folds"]),
+        "repeats": int(config["experiment"]["cv_repeats"]),
+        "splitter": "RepeatedKFold",
+        "random_seed": int(config["experiment"]["random_seed"]),
+        "aggregate": cv_metrics,
+    }
+    selection_validation = {
+        "stage": "selection_validation",
+        "partition": "validation",
+        "aggregate": val_metrics,
+    }
     result = {
         "model_name": model_name,
         "hyperparameters": params,
@@ -771,10 +785,9 @@ def evaluate_candidate(
         "r2": cv_metrics["r2"],
         "composite_score": cv_metrics["composite_score"],
         "cv_metrics": cv_metrics,
+        "cross_validation": cross_validation,
         "selection_partition": "validation",
-        "selection_metrics": val_metrics,
-        "val_metrics": val_metrics,
-        "test_metrics": val_metrics,
+        "selection_validation": selection_validation,
         "validation_verdict": validation_report["verdict"],
         "validation_report": validation_report,
     }
@@ -786,10 +799,10 @@ def evaluate_candidate(
             "cv_mae": cv_metrics["mae"],
             "cv_r2": cv_metrics["r2"],
             "cv_composite": cv_metrics["composite_score"],
-            "val_rmse": val_metrics["rmse"],
-            "val_mae": val_metrics["mae"],
-            "val_r2": val_metrics["r2"],
-            "val_composite": val_metrics["composite_score"],
+            "validation_rmse": val_metrics["rmse"],
+            "validation_mae": val_metrics["mae"],
+            "validation_r2": val_metrics["r2"],
+            "validation_composite": val_metrics["composite_score"],
             "validator_context_type": validation_report.get("context_type", "general"),
             "validation_pass_rate": validation_report["pass_rate"],
             "failed_count": validation_summary["failed_count"],
@@ -909,6 +922,20 @@ def build_stacking_ensemble(
     val_metrics = compute_regression_metrics(y_val, val_predictions, config, float(y_train.mean()))
     validation_report = validator.validate_predictions(val_predictions, x_val, y_val)
     validation_summary = summarize_validation_report(validation_report)
+    cross_validation = {
+        "stage": "cross_validation",
+        "partition": "train",
+        "folds": int(config["experiment"]["cv_folds"]),
+        "repeats": int(config["experiment"]["cv_repeats"]),
+        "splitter": "RepeatedKFold",
+        "random_seed": int(config["experiment"]["random_seed"]),
+        "aggregate": cv_metrics,
+    }
+    selection_validation = {
+        "stage": "selection_validation",
+        "partition": "validation",
+        "aggregate": val_metrics,
+    }
     result = {
         "model_name": "StackingRegressor",
         "hyperparameters": {
@@ -921,10 +948,9 @@ def build_stacking_ensemble(
         "r2": cv_metrics["r2"],
         "composite_score": cv_metrics["composite_score"],
         "cv_metrics": cv_metrics,
+        "cross_validation": cross_validation,
         "selection_partition": "validation",
-        "selection_metrics": val_metrics,
-        "val_metrics": val_metrics,
-        "test_metrics": val_metrics,
+        "selection_validation": selection_validation,
         "validation_verdict": validation_report["verdict"],
         "validation_report": validation_report,
     }
@@ -934,10 +960,10 @@ def build_stacking_ensemble(
             "cv_mae": cv_metrics["mae"],
             "cv_r2": cv_metrics["r2"],
             "cv_composite": cv_metrics["composite_score"],
-            "val_rmse": val_metrics["rmse"],
-            "val_mae": val_metrics["mae"],
-            "val_r2": val_metrics["r2"],
-            "val_composite": val_metrics["composite_score"],
+            "validation_rmse": val_metrics["rmse"],
+            "validation_mae": val_metrics["mae"],
+            "validation_r2": val_metrics["r2"],
+            "validation_composite": val_metrics["composite_score"],
             "validator_context_type": validation_report.get("context_type", "general"),
             "validation_pass_rate": validation_report["pass_rate"],
             "failed_count": validation_summary["failed_count"],
@@ -1676,7 +1702,8 @@ def main() -> int:
             + format_metrics_summary(baseline_result["cv_metrics"])
             + f" | Validation={baseline_result['validation_verdict']}"
         )
-        log_status("Baseline validation metrics: " + format_metrics_summary(baseline_result["val_metrics"]))
+        baseline_validation = baseline_result["selection_validation"]["aggregate"]
+        log_status("Baseline validation metrics: " + format_metrics_summary(baseline_validation))
         return 0
     except Exception as exc:
         log_status(f"Baseline training failed: {exc}")

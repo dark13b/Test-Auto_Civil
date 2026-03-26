@@ -58,10 +58,10 @@ RESEARCH_RESULTS_COLUMNS = [
     "mae",
     "r2",
     "composite_score",
-    "test_rmse",
-    "test_mae",
-    "test_r2",
-    "test_composite_score",
+    "validation_rmse",
+    "validation_mae",
+    "validation_r2",
+    "validation_composite_score",
     "validation_pass_rate",
     "failed_count",
     "hard_failed_count",
@@ -431,7 +431,7 @@ def record_experiment_memory(memory_path: Path, run_id: str, trial_record: dict[
             "validation_verdict": trial_record.get("validation_verdict"),
             "composite_score": trial_record.get("composite_score"),
             "rmse": trial_record.get("rmse"),
-            "val_rmse": trial_record.get("test_rmse", trial_record.get("val_rmse")),
+            "validation_rmse": trial_record.get("validation_rmse", trial_record.get("val_rmse", trial_record.get("test_rmse"))),
             "scout_improvement_pct": trial_record.get("scout_improvement_pct"),
             "confirm_improvement_pct": trial_record.get("confirm_improvement_pct"),
             "novelty_score": trial_record.get("novelty_score"),
@@ -1184,11 +1184,10 @@ def apply_keep_to_research_surface(research_lab_path: Path, accepted_entry: dict
 
 
 def build_acceptance_decision(final_metrics: dict[str, Any], brief: dict[str, Any]) -> dict[str, Any]:
-    """Build a final acceptance decision from final_metrics.json and brief thresholds."""
+    """Build a final acceptance decision from the canonical search-selection artifact."""
     minimum_improvement_pct = _to_float(brief.get("min_improvement_pct"), 0.0)
     improvement_pct = _to_float(final_metrics.get("composite_improvement_pct"), 0.0)
-    best_metrics = final_metrics.get("best_search_metrics", {})
-    best_model_name = str(best_metrics.get("model_name", "unknown")) if isinstance(best_metrics, dict) else "unknown"
+    best_model_name = str(final_metrics.get("model_name", "unknown"))
     final_metrics_metadata = _artifact_metadata(final_metrics)
     stale_inputs = bool(final_metrics_metadata.get("stale", False))
 
@@ -1203,7 +1202,7 @@ def build_acceptance_decision(final_metrics: dict[str, Any], brief: dict[str, An
         )
     )
     return {
-        "source_of_truth": "final_metrics.json",
+        "source_of_truth": "best_search_result.json",
         "run_id": final_metrics_metadata.get("run_id", final_metrics.get("run_id")),
         "source_mode": "acceptance",
         "acceptance_metric": str(brief.get("acceptance_metric", "composite_score")),
@@ -1216,85 +1215,13 @@ def build_acceptance_decision(final_metrics: dict[str, Any], brief: dict[str, An
 
 
 def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
-    """Validate that final artifacts agree with final_metrics.json as source of truth."""
-    final_metrics = load_json_file(outputs_dir / "final_metrics.json")
-    best_search_metrics = final_metrics.get("best_search_metrics", {})
-    if not isinstance(best_search_metrics, dict) or not best_search_metrics:
-        raise ValueError("final_metrics.json must contain best_search_metrics.")
+    """Validate that selection and terminal evaluation artifacts agree on the chosen model."""
+    best_result = load_json_file(outputs_dir / "best_search_result.json")
+    if not isinstance(best_result, dict) or not best_result:
+        raise ValueError("best_search_result.json must contain the canonical search-selection artifact.")
 
     mismatches: list[dict[str, Any]] = []
-    final_metrics_metadata = _artifact_metadata(final_metrics)
-    best_metrics_metadata = _artifact_metadata(best_search_metrics)
-    best_result_path = outputs_dir / "best_search_result.json"
-    if best_result_path.exists():
-        best_result = load_json_file(best_result_path)
-        best_result_metadata = _artifact_metadata(best_result)
-        for key in ("model_name", "hyperparameters", "composite_score", "validation_verdict"):
-            if _to_serializable(best_result.get(key)) != _to_serializable(best_search_metrics.get(key)):
-                mismatches.append(
-                    {
-                        "artifact": "best_search_result.json",
-                        "field": key,
-                        "expected": best_search_metrics.get(key),
-                        "actual": best_result.get(key),
-                    }
-                )
-        for key, expected_value, actual_value in (
-            ("run_id", final_metrics_metadata.get("run_id"), best_result_metadata.get("run_id")),
-            (
-                "model_artifact_id",
-                final_metrics_metadata.get("model_artifact_id"),
-                best_result_metadata.get("model_artifact_id"),
-            ),
-        ):
-            if expected_value != actual_value:
-                mismatches.append(
-                    {
-                        "artifact": "best_search_result.json",
-                        "field": key,
-                        "expected": expected_value,
-                        "actual": actual_value,
-                }
-            )
-    else:
-        mismatches.append(
-            {
-                "artifact": "best_search_result.json",
-                "field": "exists",
-                "expected": True,
-                "actual": False,
-            }
-        )
-
-    if final_metrics.get("best_model_name") != best_search_metrics.get("model_name"):
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "best_model_name",
-                "expected": best_search_metrics.get("model_name"),
-                "actual": final_metrics.get("best_model_name"),
-            }
-        )
-    if _to_serializable(final_metrics.get("best_model_hyperparameters")) != _to_serializable(
-        best_search_metrics.get("hyperparameters")
-    ):
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "best_model_hyperparameters",
-                "expected": best_search_metrics.get("hyperparameters"),
-                "actual": final_metrics.get("best_model_hyperparameters"),
-            }
-        )
-    if final_metrics.get("validation_verdict") != best_search_metrics.get("validation_verdict"):
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "validation_verdict",
-                "expected": best_search_metrics.get("validation_verdict"),
-                "actual": final_metrics.get("validation_verdict"),
-            }
-        )
+    best_result_metadata = _artifact_metadata(best_result)
     model_path = outputs_dir / "best_search_model.pkl"
     if not model_path.exists():
         mismatches.append(
@@ -1306,8 +1233,41 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
             }
         )
 
+    final_holdout_path = outputs_dir / "final_holdout_evaluation.json"
+    if final_holdout_path.exists():
+        final_holdout = load_json_file(final_holdout_path)
+        selected_model = final_holdout.get("selected_model", {})
+        final_holdout_metadata = _artifact_metadata(final_holdout)
+        for key in ("model_name", "hyperparameters", "composite_score", "validation_verdict"):
+            if _to_serializable(selected_model.get(key)) != _to_serializable(best_result.get(key)):
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": f"selected_model.{key}",
+                        "expected": best_result.get(key),
+                        "actual": selected_model.get(key),
+                    }
+                )
+        for key, expected_value, actual_value in (
+            ("run_id", best_result_metadata.get("run_id"), final_holdout_metadata.get("run_id")),
+            (
+                "model_artifact_id",
+                best_result_metadata.get("model_artifact_id"),
+                final_holdout_metadata.get("model_artifact_id"),
+            ),
+        ):
+            if expected_value != actual_value:
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": key,
+                        "expected": expected_value,
+                        "actual": actual_value,
+                    }
+                )
+
     return {
-        "source_of_truth": "final_metrics.json",
+        "source_of_truth": "best_search_result.json",
         "consistent": not mismatches,
         "mismatches": mismatches,
     }

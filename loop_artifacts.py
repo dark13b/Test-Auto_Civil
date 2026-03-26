@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 
+from artifact_contracts import get_selection_validation_aggregate
 from artifact_sync import AtomicArtifactWriter
 from research_protocol import (
     RESEARCH_RESULTS_COLUMNS,
@@ -24,7 +25,7 @@ RESEARCH_LOG_FILENAME = "research_log.txt"
 PROPOSAL_DIVERSITY_FILENAME = "proposal_diversity.json"
 FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
 FINAL_ACCEPTANCE_FILENAME = "final_acceptance.json"
-FINAL_METRICS_FILENAME = "final_metrics.json"
+DEPRECATED_FINAL_METRICS_FILENAME = "final_metrics.json"
 BEST_RESULT_FILENAME = "best_search_result.json"
 BEST_MODEL_FILENAME = "best_search_model.pkl"
 SEARCH_STATE_BEST_RESULT_FILENAME = "search_state_best_result.json"
@@ -104,7 +105,7 @@ def _build_validation_summary(validation_report: dict[str, Any]) -> dict[str, An
     return summarize_validation_report(validation_report)
 
 
-def _build_final_metrics_payload(
+def _build_search_selection_payload(
     baseline_metrics: dict[str, Any],
     best_result: dict[str, Any],
 ) -> dict[str, Any]:
@@ -113,19 +114,21 @@ def _build_final_metrics_payload(
         _safe_float(best_result.get("composite_score")),
     )
     validation_report = dict(best_result.get("validation_report", {}))
-    return {
-        "baseline_metrics": copy.deepcopy(baseline_metrics),
-        "best_search_metrics": copy.deepcopy(best_result),
-        "improvement_percentage": improvement_pct,
-        "composite_improvement_pct": improvement_pct,
-        "validation_verdict": best_result["validation_verdict"],
-        "best_model_name": best_result["model_name"],
-        "best_model_hyperparameters": copy.deepcopy(best_result["hyperparameters"]),
-        "validation_summary": _build_validation_summary(validation_report),
-        "validation_metrics": copy.deepcopy(
-            best_result.get("selection_metrics", best_result.get("val_metrics", best_result.get("test_metrics", {})))
-        ),
-    }
+    payload = copy.deepcopy(best_result)
+    payload.update(
+        {
+            "artifact_kind": "search_selection",
+            "baseline_metrics": copy.deepcopy(baseline_metrics),
+            "improvement_percentage": improvement_pct,
+            "composite_improvement_pct": improvement_pct,
+            "selection_validation_report": copy.deepcopy(validation_report),
+            "selection_metric_name": str(best_result.get("selection_metric_name", "composite_score")),
+            "selection_decision_score": float(best_result.get("composite_score", 0.0)),
+            "validation_summary": _build_validation_summary(validation_report),
+            "validation_metrics": copy.deepcopy(get_selection_validation_aggregate(best_result)),
+        }
+    )
+    return payload
 
 
 def _sync_final_artifacts_from_source_of_truth(
@@ -136,17 +139,7 @@ def _sync_final_artifacts_from_source_of_truth(
     best_model_source_path: Path,
     run_id: str,
 ) -> dict[str, Any]:
-    final_metrics_payload = _build_final_metrics_payload(baseline_metrics, best_result)
-    write_run_scoped_json_artifact(
-        outputs_dir=outputs_dir,
-        filename=FINAL_METRICS_FILENAME,
-        payload=final_metrics_payload,
-        run_id=run_id,
-        source_mode="report",
-        model_artifact_id=best_result.get("model_artifact_id"),
-        model_id=str(best_result.get("model_name", "unknown")),
-    )
-    best_from_truth = copy.deepcopy(final_metrics_payload["best_search_metrics"])
+    best_from_truth = _build_search_selection_payload(baseline_metrics, best_result)
     write_run_scoped_json_artifact(
         outputs_dir=outputs_dir,
         filename=BEST_RESULT_FILENAME,
@@ -174,7 +167,7 @@ def _sync_final_artifacts_from_source_of_truth(
     write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
     if not validation_report["consistent"]:
         raise RuntimeError(f"Final artifact mismatch: {validation_report['mismatches']}")
-    return final_metrics_payload
+    return best_from_truth
 
 
 def _build_run_manifest_payload(
@@ -251,7 +244,9 @@ def _build_run_manifest_payload(
     if isinstance(final_metrics, dict):
         holdout_metrics = final_metrics.get("holdout_metrics")
         if isinstance(holdout_metrics, dict) and holdout_metrics:
-            manifest["final_holdout_metric_name"] = next(iter(holdout_metrics.keys()))
+            manifest["final_holdout_metric_name"] = str(
+                final_metrics.get("holdout_metric_name", "composite_score")
+            )
     if isinstance(acceptance, dict):
         manifest["acceptance_decision"] = {
             "accepted": acceptance.get("accepted"),

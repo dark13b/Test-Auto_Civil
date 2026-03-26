@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import pandas as pd
 
 import search
-from search import build_post_search_ensemble, finalize_search_artifacts, resolve_final_best_result
+from search import build_post_search_ensemble, build_trial_record, finalize_search_artifacts, resolve_final_best_result
 
 
 class SearchTests(unittest.TestCase):
@@ -116,10 +116,14 @@ class SearchTests(unittest.TestCase):
                         "cv_rmse": 1.1,
                         "cv_mae": 0.8,
                         "cv_metrics": {"r2": 0.72, "rmse": 1.1, "mae": 0.8, "composite_score": 0.50},
-                        "val_r2": 0.40,
-                        "val_rmse": 2.5,
-                        "val_mae": 1.7,
-                        "val_metrics": {"r2": 0.40, "rmse": 2.5, "mae": 1.7, "composite_score": 0.20},
+                        "validation_r2": 0.40,
+                        "validation_rmse": 2.5,
+                        "validation_mae": 1.7,
+                        "selection_validation": {
+                            "stage": "selection_validation",
+                            "partition": "validation",
+                            "aggregate": {"r2": 0.40, "rmse": 2.5, "mae": 1.7, "composite_score": 0.20},
+                        },
                         "composite_score": 0.50,
                         "validation_verdict": "PASS",
                         "validation_report": {
@@ -156,6 +160,52 @@ class SearchTests(unittest.TestCase):
         save_pickle_mock.assert_called_once()
         sync_writer.record_new_best.assert_called_once()
         recalibrate_mock.assert_called_once()
+
+    def test_build_trial_record_uses_validation_columns_not_test_columns(self) -> None:
+        result = {
+            "rmse": 1.4,
+            "mae": 1.1,
+            "r2": 0.73,
+            "composite_score": 0.62,
+            "validation_verdict": "PASS",
+            "selection_validation": {
+                "stage": "selection_validation",
+                "partition": "validation",
+                "aggregate": {
+                    "rmse": 2.5,
+                    "mae": 1.7,
+                    "r2": 0.40,
+                    "composite_score": 0.20,
+                },
+            },
+            "validation_report": {
+                "pass_rate": 1.0,
+                "failed_count": 0,
+                "hard_failed_count": 0,
+                "warning_count": 0,
+                "suspicious_count": 0,
+                "durability_caution_count": 0,
+                "dataset_anomaly_count": 0,
+            },
+        }
+
+        record = build_trial_record(
+            trial_number=7,
+            model_name="Ridge",
+            display_name="Ridge",
+            params={"alpha": 1.0},
+            result=result,
+            selection_status="new_best",
+        )
+
+        self.assertEqual(record["validation_rmse"], 2.5)
+        self.assertEqual(record["validation_mae"], 1.7)
+        self.assertEqual(record["validation_r2"], 0.40)
+        self.assertEqual(record["validation_composite_score"], 0.20)
+        self.assertNotIn("test_rmse", record)
+        self.assertNotIn("test_mae", record)
+        self.assertNotIn("test_r2", record)
+        self.assertNotIn("test_composite_score", record)
 
     def test_finalize_search_artifacts_rewrites_current_ensemble_metrics_for_ensemble_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -243,10 +293,18 @@ class SearchTests(unittest.TestCase):
                 "model_name": "StackingRegressor",
                 "composite_score": 0.91,
                 "source": "post_search_ensemble",
+                "cv_metrics": {"rmse": 5.0, "mae": 4.0, "r2": 0.61, "composite_score": 0.82},
+                "selection_metrics": {"rmse": 2.0, "mae": 1.0, "r2": 0.7, "composite_score": 0.8},
                 "validation_verdict": "PASS",
             }
             (outputs_dir / "final_metrics.json").write_text(
-                json.dumps({"best_search_metrics": final_best}),
+                json.dumps(
+                    {
+                        "best_search_metrics": final_best,
+                        "holdout_metrics": {"rmse": 4.5, "mae": 3.5, "r2": 0.8, "composite_score": 0.85},
+                        "holdout_validation_verdict": "PASS",
+                    }
+                ),
                 encoding="utf-8",
             )
 

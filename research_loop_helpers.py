@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 
+from artifact_contracts import get_selection_validation_aggregate, map_deprecated_artifact_payload
 from hypothesis_archive import HypothesisArchive
 from knowledge_base import get_knowledge_context
 from deterministic_proposal_provider import DeterministicProposalProvider
@@ -57,11 +58,11 @@ def _load_current_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any
 
     final_metrics_path = outputs_dir / "final_metrics.json"
     if final_metrics_path.exists():
-        final_metrics = load_json_file(final_metrics_path)
-        best_search_metrics = final_metrics.get("best_search_metrics")
-        if isinstance(best_search_metrics, dict) and best_search_metrics:
-            payload = copy.deepcopy(best_search_metrics)
-            payload.setdefault("source", "final_metrics")
+        final_metrics = map_deprecated_artifact_payload("final_metrics.json", load_json_file(final_metrics_path))
+        selected_model = final_metrics.get("selected_model")
+        if isinstance(selected_model, dict) and selected_model:
+            payload = copy.deepcopy(selected_model)
+            payload.setdefault("source", "deprecated_final_metrics")
             return payload
 
     payload = copy.deepcopy(baseline_metrics)
@@ -121,17 +122,17 @@ def _build_record(
         return record
 
     validation_report = result.get("validation_report", {})
-    val_metrics = result.get("selection_metrics", result.get("val_metrics", result.get("test_metrics", {})))
+    val_metrics = get_selection_validation_aggregate(result)
     record.update(
         {
             "rmse": result.get("rmse"),
             "mae": result.get("mae"),
             "r2": result.get("r2"),
             "composite_score": result.get("composite_score"),
-            "test_rmse": val_metrics.get("rmse"),
-            "test_mae": val_metrics.get("mae"),
-            "test_r2": val_metrics.get("r2"),
-            "test_composite_score": val_metrics.get("composite_score"),
+            "validation_rmse": val_metrics.get("rmse"),
+            "validation_mae": val_metrics.get("mae"),
+            "validation_r2": val_metrics.get("r2"),
+            "validation_composite_score": val_metrics.get("composite_score"),
             "validation_pass_rate": validation_report.get("pass_rate"),
             "failed_count": validation_report.get("failed_count"),
             "hard_failed_count": validation_report.get("hard_failed_count", validation_report.get("failed_count")),
@@ -232,8 +233,8 @@ def _compute_actual_delta_rmse(reference_result: dict[str, Any], candidate_resul
     def _extract_rmse(payload: dict[str, Any]) -> float | None:
         for value in (
             payload.get("rmse"),
-            payload.get("val_metrics", {}).get("rmse") if isinstance(payload.get("val_metrics"), dict) else None,
-            payload.get("test_metrics", {}).get("rmse") if isinstance(payload.get("test_metrics"), dict) else None,
+            payload.get("validation_rmse"),
+            get_selection_validation_aggregate(payload).get("rmse"),
         ):
             try:
                 if value is not None:

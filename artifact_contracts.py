@@ -221,6 +221,22 @@ def map_deprecated_artifact_payload(filename: str, payload: dict[str, Any]) -> d
     return mapped
 
 
+def get_selection_validation_aggregate(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Return selection-time validation metrics from new or legacy payload shapes."""
+    if not isinstance(payload, dict):
+        return {}
+    selection_validation = payload.get("selection_validation")
+    if isinstance(selection_validation, dict):
+        aggregate = selection_validation.get("aggregate")
+        if isinstance(aggregate, dict):
+            return dict(aggregate)
+    for key in ("validation_metrics", "selection_metrics", "val_metrics", "test_metrics"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
 def _map_legacy_search_selection(payload: dict[str, Any]) -> dict[str, Any]:
     _require_mapping(payload, "best_search_metrics")
     selection_metrics = (
@@ -230,36 +246,52 @@ def _map_legacy_search_selection(payload: dict[str, Any]) -> dict[str, Any]:
         or payload.get("test_metrics")
         or {}
     )
+    cv_metrics = _normalize_metric_aggregate_payload(
+        payload.get("cv_metrics"),
+        context="best_search_metrics.cv_metrics",
+    )
+    selection_aggregate = _normalize_metric_aggregate_payload(
+        selection_metrics,
+        context="best_search_metrics.selection_metrics",
+    )
     mapped = {
         "schema_version": 1,
         "artifact_kind": "search_selection",
+        "run_id": payload.get("run_id"),
+        "artifact_id": payload.get("artifact_id"),
+        "model_artifact_id": payload.get("model_artifact_id"),
         "model_name": payload.get("model_name"),
         "display_name": payload.get("display_name", payload.get("model_name")),
         "hyperparameters": dict(payload.get("hyperparameters", {})),
         "trial_number": payload.get("trial_number", payload.get("best_trial")),
+        "best_trial": payload.get("best_trial", payload.get("trial_number")),
         "experiment_id": payload.get("experiment_id", payload.get("trial_number")),
         "source": payload.get("source", "search"),
+        "composite_score": float(payload.get("composite_score", 0.0)),
+        "validation_verdict": payload.get("validation_verdict", "UNKNOWN"),
+        "cv_rmse": cv_metrics.get("rmse"),
+        "cv_mae": cv_metrics.get("mae"),
+        "cv_r2": cv_metrics.get("r2"),
+        "cv_composite": cv_metrics.get("composite_score"),
         "selection_metric_name": "composite_score",
         "selection_decision_score": float(payload.get("composite_score", 0.0)),
         "cross_validation": {
             "stage": "cross_validation",
             "partition": "train",
-            "aggregate": _normalize_metric_aggregate_payload(
-                payload.get("cv_metrics"),
-                context="best_search_metrics.cv_metrics",
-            ),
+            "aggregate": cv_metrics,
             "dispersion": _extract_legacy_cv_dispersion(payload),
         },
         "selection_validation": {
             "stage": "selection_validation",
             "partition": "validation",
-            "aggregate": _normalize_metric_aggregate_payload(
-                selection_metrics,
-                context="best_search_metrics.selection_metrics",
-            ),
+            "aggregate": selection_aggregate,
         },
-        "selection_validation_report": dict(payload.get("validation_report", {"verdict": payload.get("validation_verdict", "UNKNOWN")})),
+        "validation_metrics": selection_aggregate,
+        "selection_validation_report": dict(
+            payload.get("validation_report", {"verdict": payload.get("validation_verdict", "UNKNOWN")})
+        ),
     }
+    mapped["validation_report"] = dict(mapped["selection_validation_report"])
     validate_artifact_payload("search_selection.json", mapped)
     return mapped
 

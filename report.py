@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from sklearn.inspection import permutation_importance
 
+from artifact_contracts import map_deprecated_artifact_payload
 from train_impl import (
     artifact_id,
     artifact_run_id,
@@ -401,22 +402,24 @@ def main() -> int:
 
         baseline_metrics = load_json_artifact(outputs_dir / "baseline_metrics.json")
         baseline_model = load_pickle_artifact(outputs_dir / "baseline_model.pkl")
-        existing_final_metrics = (
-            load_json_artifact(outputs_dir / "final_metrics.json")
-            if (outputs_dir / "final_metrics.json").exists()
-            else {}
-        )
+        final_holdout_path = outputs_dir / "final_holdout_evaluation.json"
+        existing_final_metrics = load_json_artifact(final_holdout_path) if final_holdout_path.exists() else {}
+        if not existing_final_metrics and (outputs_dir / "final_metrics.json").exists():
+            existing_final_metrics = map_deprecated_artifact_payload(
+                "final_metrics.json",
+                load_json_artifact(outputs_dir / "final_metrics.json"),
+            )
         best_search_result = load_json_artifact(outputs_dir / "best_search_result.json")
         active_run_id = infer_active_run_id(outputs_dir, best_search_result, existing_final_metrics)
         if existing_final_metrics and artifact_run_id(existing_final_metrics) not in {None, active_run_id}:
             log_status(
-                "WARNING stale_final_metrics_ignored | "
-                f"final_metrics_run_id={artifact_run_id(existing_final_metrics)} | active_run_id={active_run_id}"
+                "WARNING stale_final_holdout_ignored | "
+                f"final_holdout_run_id={artifact_run_id(existing_final_metrics)} | active_run_id={active_run_id}"
             )
             mark_json_artifact_stale(
-                outputs_dir / "final_metrics.json",
+                final_holdout_path,
                 active_run_id=active_run_id,
-                reason="stale final metrics ignored during report generation",
+                reason="stale final holdout evaluation ignored during report generation",
             )
             existing_final_metrics = {}
         mark_json_artifact_stale(
@@ -510,28 +513,34 @@ def main() -> int:
         final_metrics = dict(existing_final_metrics) if isinstance(existing_final_metrics, dict) else {}
         final_metrics.update(
             {
+                "artifact_kind": "final_holdout_evaluation",
                 "baseline_metrics": baseline_metrics,
-                "best_search_metrics": dict(best_search_result),
+                "selected_model": dict(best_search_result),
                 "improvement_percentage": improvement_percentage,
                 "composite_improvement_pct": improvement_percentage,
                 "validation_verdict": best_search_result["validation_verdict"],
-                "best_model_name": best_search_result["model_name"],
-                "best_model_hyperparameters": best_search_result["hyperparameters"],
                 "validation_summary": selection_validation_summary,
                 "holdout_validation_verdict": holdout_validation_report["verdict"],
                 "holdout_validation_report": holdout_validation_report,
                 "holdout_validation_summary": holdout_validation_summary,
-                "holdout_metrics": holdout_metrics,
+                "holdout_metrics": {
+                    "stage": "final_holdout",
+                    "partition": "holdout",
+                    "aggregate": holdout_metrics,
+                    "rmse_by_strength_range": rmse_by_range,
+                },
+                "holdout_metric_name": "composite_score",
+                "selection_metric_name": best_search_result.get("selection_metric_name", "composite_score"),
                 "rmse_by_range": rmse_by_range,
                 "baseline_rmse_by_range": baseline_rmse_by_range,
                 "uncertainty_summary": uncertainty_summary,
-                "uncertainty_audit": uncertainty_audit.get("coverage_audit", {}),
+                "uncertainty_audit": uncertainty_audit,
                 "regime_specific_modeling": regime_specific_modeling,
             }
         )
         write_run_scoped_json_artifact(
             outputs_dir=outputs_dir,
-            filename="final_metrics.json",
+            filename="final_holdout_evaluation.json",
             payload=final_metrics,
             run_id=active_run_id,
             source_mode="report",

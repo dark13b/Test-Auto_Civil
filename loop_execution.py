@@ -12,7 +12,7 @@ from train import EngineeringValidator, evaluate_candidate
 
 def validate_before_keep(run_dir: Path, logger) -> bool:
     """Return True only if all required artifacts are present and non-empty."""
-    required = ["final_metrics.json", "best_search_result.json", "final_acceptance.json"]
+    required = ["final_holdout_evaluation.json", "best_search_result.json", "final_acceptance.json"]
     for fname in required:
         p = run_dir / fname
         if not p.exists() or p.stat().st_size == 0:
@@ -51,4 +51,3 @@ def _build_stage_config(base_config: dict[str, Any], cv_repeats: int) -> dict[st
     stage_config = copy.deepcopy(base_config)
     stage_config["experiment"]["cv_repeats"] = max(1, int(cv_repeats))
     return stage_config
-

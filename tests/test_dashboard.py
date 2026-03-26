@@ -58,6 +58,33 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(normalized["suspicious_count"], 2)
         self.assertEqual(normalized["dataset_anomaly_count"], 5)
 
+    def test_normalize_result_payload_reads_canonical_stage_metrics(self) -> None:
+        dashboard = importlib.import_module("dashboard")
+
+        payload = {
+            "cross_validation": {
+                "stage": "cross_validation",
+                "partition": "train",
+                "aggregate": {"rmse": 5.0, "mae": 4.0, "r2": 0.61, "composite_score": 0.82},
+            },
+            "selection_validation": {
+                "stage": "selection_validation",
+                "partition": "validation",
+                "aggregate": {"rmse": 2.0, "mae": 1.0, "r2": 0.7, "composite_score": 0.8},
+            },
+            "holdout_metrics": {
+                "stage": "final_holdout",
+                "partition": "holdout",
+                "aggregate": {"rmse": 1.0, "mae": 0.5, "r2": 0.8, "composite_score": 0.84},
+            },
+        }
+
+        normalized = dashboard.normalize_result_payload(payload)
+
+        self.assertEqual(normalized["cv_rmse"], 5.0)
+        self.assertEqual(normalized["validation_composite"], 0.8)
+        self.assertEqual(normalized["holdout_composite"], 0.84)
+
     def test_dashboard_requires_auth_even_without_env_password(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             dashboard = importlib.reload(importlib.import_module("dashboard"))
@@ -110,11 +137,28 @@ class DashboardTests(unittest.TestCase):
                 json.dumps({"model_name": "RandomForestRegressor", "composite_score": 0.9}),
                 encoding="utf-8",
             )
-            (outputs_dir / "final_metrics.json").write_text(
+            (outputs_dir / "best_search_result.json").write_text(
                 json.dumps(
                     {
+                        "artifact_kind": "search_selection",
+                        "model_name": "LGBMRegressor",
+                        "composite_score": 0.92,
                         "composite_improvement_pct": 1.2,
-                        "best_search_metrics": {"model_name": "LGBMRegressor", "composite_score": 0.92},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "final_holdout_evaluation",
+                        "selected_model": {"model_name": "LGBMRegressor", "composite_score": 0.92},
+                        "holdout_metrics": {
+                            "stage": "final_holdout",
+                            "partition": "holdout",
+                            "aggregate": {"rmse": 4.0, "mae": 3.0, "r2": 0.8, "composite_score": 0.9},
+                        },
+                        "composite_improvement_pct": 1.2,
                     }
                 ),
                 encoding="utf-8",
@@ -211,17 +255,17 @@ class DashboardTests(unittest.TestCase):
                 json.dumps({"model_name": "RandomForestRegressor", "composite_score": 0.9}),
                 encoding="utf-8",
             )
-            (outputs_dir / "final_metrics.json").write_text(
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
                 json.dumps(
                     {
                         "stale": True,
-                        "best_search_metrics": {"model_name": "OldModel", "composite_score": 0.7},
+                        "selected_model": {"model_name": "OldModel", "composite_score": 0.7},
                         "composite_improvement_pct": -3.0,
                     }
                 ),
                 encoding="utf-8",
             )
-            (outputs_dir / "search_state_best_result.json").write_text(
+            (outputs_dir / "best_search_result.json").write_text(
                 json.dumps({"model_name": "FreshModel", "composite_score": 0.95}),
                 encoding="utf-8",
             )

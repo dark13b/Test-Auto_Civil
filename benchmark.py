@@ -14,6 +14,7 @@ import numpy as np
 import optuna
 import pandas as pd
 
+from artifact_contracts import map_deprecated_artifact_payload
 from search import csv_is_stale, repair_optuna_results_csv, sync_check
 from train import (
     EngineeringValidator,
@@ -182,9 +183,34 @@ def load_reference_payload(outputs_dir: Path, config: dict[str, Any]) -> dict[st
     reference_uncertainty_path = outputs_dir / Path(str(benchmark_config["reference_uncertainty_path"])).name
     reference_result = load_json_artifact(reference_result_path) if reference_result_path.exists() else {}
     baseline_result = load_json_artifact(outputs_dir / "baseline_metrics.json")
-    final_metrics = load_json_artifact(outputs_dir / "final_metrics.json") if (outputs_dir / "final_metrics.json").exists() else {}
-    finalized_best = final_metrics.get("best_search_metrics", {}) if isinstance(final_metrics, dict) else {}
-    finalized_holdout = final_metrics.get("holdout_metrics", {}) if isinstance(final_metrics, dict) else {}
+    search_selection = (
+        load_json_artifact(outputs_dir / "best_search_result.json")
+        if (outputs_dir / "best_search_result.json").exists()
+        else {}
+    )
+    final_holdout = (
+        load_json_artifact(outputs_dir / "final_holdout_evaluation.json")
+        if (outputs_dir / "final_holdout_evaluation.json").exists()
+        else {}
+    )
+    if not search_selection and (outputs_dir / "final_metrics.json").exists():
+        mapped_legacy = map_deprecated_artifact_payload(
+            "final_metrics.json",
+            load_json_artifact(outputs_dir / "final_metrics.json"),
+        )
+        search_selection = mapped_legacy.get("selected_model", {})
+        final_holdout = mapped_legacy
+    finalized_best = search_selection if isinstance(search_selection, dict) else {}
+    finalized_holdout = (
+        final_holdout.get("holdout_metrics", {})
+        if isinstance(final_holdout, dict)
+        else {}
+    )
+    finalized_holdout_aggregate = (
+        finalized_holdout.get("aggregate", {})
+        if isinstance(finalized_holdout, dict)
+        else {}
+    )
     reference_uncertainty = load_json_artifact(reference_uncertainty_path) if reference_uncertainty_path.exists() else {}
 
     reference_payload = {
@@ -201,10 +227,13 @@ def load_reference_payload(outputs_dir: Path, config: dict[str, Any]) -> dict[st
                 "trial_number",
                 reference_result.get("best_trial", finalized_best.get("trial_number", finalized_best.get("best_trial"))),
             ),
-            "holdout_rmse": reference_result.get("holdout_rmse", finalized_holdout.get("rmse")),
-            "holdout_mae": reference_result.get("holdout_mae", finalized_holdout.get("mae")),
-            "holdout_r2": reference_result.get("holdout_r2", finalized_holdout.get("r2")),
-            "holdout_composite": reference_result.get("holdout_composite", finalized_holdout.get("composite_score")),
+            "holdout_rmse": reference_result.get("holdout_rmse", finalized_holdout_aggregate.get("rmse")),
+            "holdout_mae": reference_result.get("holdout_mae", finalized_holdout_aggregate.get("mae")),
+            "holdout_r2": reference_result.get("holdout_r2", finalized_holdout_aggregate.get("r2")),
+            "holdout_composite": reference_result.get(
+                "holdout_composite",
+                finalized_holdout_aggregate.get("composite_score"),
+            ),
             "cv_rmse": reference_result.get("cv_rmse", finalized_best.get("cv_rmse")),
             "cv_mae": reference_result.get("cv_mae", finalized_best.get("cv_mae")),
             "cv_r2": reference_result.get("cv_r2", finalized_best.get("cv_r2")),

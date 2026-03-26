@@ -56,6 +56,40 @@ class _FakeUncertaintyEstimator:
         )
 
 
+def _search_selection_payload(**overrides) -> dict:
+    payload = {
+        "artifact_kind": "search_selection",
+        "run_id": "run-current",
+        "artifact_id": "best-search-artifact",
+        "model_name": "Ridge",
+        "hyperparameters": {"alpha": 1.0},
+        "trial_number": 31,
+        "best_trial": 31,
+        "source": "search",
+        "composite_score": 0.82,
+        "cv_r2": 0.61,
+        "cv_rmse": 5.0,
+        "cv_mae": 4.0,
+        "validation_verdict": "PASS",
+        "cross_validation": {
+            "stage": "cross_validation",
+            "partition": "train",
+            "aggregate": {"rmse": 5.0, "mae": 4.0, "r2": 0.61, "composite_score": 0.82},
+        },
+        "selection_validation": {
+            "stage": "selection_validation",
+            "partition": "validation",
+            "aggregate": {"rmse": 2.0, "mae": 1.0, "r2": 0.7, "composite_score": 0.8},
+        },
+        "validation_report": {"verdict": "PASS"},
+        "selection_validation_report": {"verdict": "PASS"},
+        "selection_metric_name": "composite_score",
+        "selection_decision_score": 0.82,
+    }
+    payload.update(overrides)
+    return payload
+
+
 class ReportTests(unittest.TestCase):
     def tearDown(self) -> None:
         report.REPORT_CONTEXT = SimpleNamespace()
@@ -82,20 +116,7 @@ class ReportTests(unittest.TestCase):
         best_model = _RecordingModel(x_test, [30.0, 32.0, 34.0, 36.0, 38.0])
         saved_payloads: list[tuple[Path, dict]] = []
 
-        best_search_metrics = {
-            "run_id": "run-current",
-            "artifact_id": "best-search-artifact",
-            "model_name": "Ridge",
-            "hyperparameters": {"alpha": 1.0},
-            "trial_number": 31,
-            "best_trial": 31,
-            "source": "search",
-            "composite_score": 0.82,
-            "cv_r2": 0.61,
-            "cv_rmse": 5.0,
-            "cv_mae": 4.0,
-            "validation_verdict": "PASS",
-        }
+        best_search_metrics = _search_selection_payload()
 
         def _write_run_scoped_json_artifact(*, outputs_dir: Path, filename: str, payload: dict, **_kwargs):
             path = outputs_dir / filename
@@ -104,74 +125,72 @@ class ReportTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
-            (outputs_dir / "final_metrics.json").write_text("{}", encoding="utf-8")
             (outputs_dir / "final_acceptance.json").write_text("{}", encoding="utf-8")
 
             with patch("report.load_config", return_value=config), patch(
-            "report.get_outputs_dir",
-            return_value=outputs_dir,
-        ), patch(
-            "report.load_json_artifact",
-            side_effect=[
-                {"composite_score": 0.75},
-                {"best_search_metrics": best_search_metrics},
-                best_search_metrics,
-            ],
-        ), patch(
-            "report.load_pickle_artifact",
-            side_effect=[baseline_model, best_model],
-        ), patch(
-            "report.pd.read_csv",
-            return_value=pd.DataFrame([{"trial_number": 1, "composite_score": 0.82}]),
-        ), patch(
-            "report.load_dataset",
-            return_value=pd.DataFrame(),
-        ), patch(
-            "report.split_dataset",
-            return_value=(x_train, x_val, x_test, y_train, y_val, y_test),
-        ), patch(
-            "report.EngineeringValidator.from_config",
-            return_value=SimpleNamespace(
-                validate_model=lambda _model, features, target: (
-                    {"verdict": "PASS", "features_id": id(features), "target_id": id(target)}
-                )
-            ),
-        ), patch(
-            "report.compute_regression_metrics",
-            return_value={"rmse": 1.0, "mae": 0.5, "r2": 0.8, "composite_score": 0.84},
-        ), patch(
-            "report.create_search_progress_plot"
-        ), patch(
-            "report.create_actual_vs_predicted_plot"
-        ), patch(
-            "report.create_residuals_plot"
-        ), patch(
-            "report.compute_feature_importance",
-            return_value=pd.Series([0.5, 0.5], index=["cement", "water"]),
-        ), patch(
-            "report.create_feature_importance_plot"
-        ), patch(
-            "report.create_performance_by_range_plot",
-            return_value={"low": 1.0, "mid": 1.1, "high": 1.2},
-        ), patch(
-            "report.create_uncertainty_plot",
-            return_value={"mean_interval_width": 2.0, "label_counts": {"HIGH": 1, "MODERATE": 1}},
-        ), patch(
-            "report.UncertaintyEstimator",
-            _FakeUncertaintyEstimator,
-        ), patch(
-            "report.summarize_validation_report",
-            return_value={
-                "hard_constraint_count": 0,
-                "engineering_caution_count": 0,
-                "data_review_flag_count": 0,
-            },
-        ), patch(
-            "report.write_run_scoped_json_artifact",
-            side_effect=_write_run_scoped_json_artifact,
-        ), patch(
-            "report.log_status"
-        ):
+                "report.get_outputs_dir",
+                return_value=outputs_dir,
+            ), patch(
+                "report.load_json_artifact",
+                side_effect=[
+                    {"composite_score": 0.75},
+                    best_search_metrics,
+                ],
+            ), patch(
+                "report.load_pickle_artifact",
+                side_effect=[baseline_model, best_model],
+            ), patch(
+                "report.pd.read_csv",
+                return_value=pd.DataFrame([{"trial_number": 1, "composite_score": 0.82}]),
+            ), patch(
+                "report.load_dataset",
+                return_value=pd.DataFrame(),
+            ), patch(
+                "report.split_dataset",
+                return_value=(x_train, x_val, x_test, y_train, y_val, y_test),
+            ), patch(
+                "report.EngineeringValidator.from_config",
+                return_value=SimpleNamespace(
+                    validate_model=lambda _model, features, target: (
+                        {"verdict": "PASS", "features_id": id(features), "target_id": id(target)}
+                    )
+                ),
+            ), patch(
+                "report.compute_regression_metrics",
+                return_value={"rmse": 1.0, "mae": 0.5, "r2": 0.8, "composite_score": 0.84},
+            ), patch(
+                "report.create_search_progress_plot"
+            ), patch(
+                "report.create_actual_vs_predicted_plot"
+            ), patch(
+                "report.create_residuals_plot"
+            ), patch(
+                "report.compute_feature_importance",
+                return_value=pd.Series([0.5, 0.5], index=["cement", "water"]),
+            ), patch(
+                "report.create_feature_importance_plot"
+            ), patch(
+                "report.create_performance_by_range_plot",
+                return_value={"low": 1.0, "mid": 1.1, "high": 1.2},
+            ), patch(
+                "report.create_uncertainty_plot",
+                return_value={"mean_interval_width": 2.0, "label_counts": {"HIGH": 1, "MODERATE": 1}},
+            ), patch(
+                "report.UncertaintyEstimator",
+                _FakeUncertaintyEstimator,
+            ), patch(
+                "report.summarize_validation_report",
+                return_value={
+                    "hard_constraint_count": 0,
+                    "engineering_caution_count": 0,
+                    "data_review_flag_count": 0,
+                },
+            ), patch(
+                "report.write_run_scoped_json_artifact",
+                side_effect=_write_run_scoped_json_artifact,
+            ), patch(
+                "report.log_status"
+            ):
                 report.REPORT_CONTEXT = SimpleNamespace()
                 exit_code = report.main()
 
@@ -180,16 +199,17 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(best_model.seen_frames, [x_test])
         self.assertTrue(saved_payloads)
         final_metrics = saved_payloads[-1][1]
-        self.assertEqual(final_metrics["best_search_metrics"]["cv_r2"], 0.61)
-        self.assertEqual(final_metrics["best_search_metrics"]["trial_number"], 31)
-        self.assertEqual(final_metrics["best_search_metrics"]["best_trial"], 31)
-        self.assertEqual(final_metrics["best_search_metrics"]["source"], "search")
+        self.assertEqual(saved_payloads[-1][0].name, "final_holdout_evaluation.json")
+        self.assertEqual(final_metrics["selected_model"]["cv_r2"], 0.61)
+        self.assertEqual(final_metrics["selected_model"]["trial_number"], 31)
+        self.assertEqual(final_metrics["selected_model"]["best_trial"], 31)
+        self.assertEqual(final_metrics["selected_model"]["source"], "search")
         self.assertEqual(final_metrics["validation_verdict"], "PASS")
-        self.assertEqual(final_metrics["holdout_metrics"]["rmse"], 1.0)
-        self.assertEqual(final_metrics["holdout_metrics"]["mae"], 0.5)
-        self.assertEqual(final_metrics["holdout_metrics"]["r2"], 0.8)
-        self.assertEqual(final_metrics["holdout_metrics"]["composite_score"], 0.84)
-        self.assertEqual(final_metrics["best_model_name"], "Ridge")
+        self.assertEqual(final_metrics["holdout_metrics"]["aggregate"]["rmse"], 1.0)
+        self.assertEqual(final_metrics["holdout_metrics"]["aggregate"]["mae"], 0.5)
+        self.assertEqual(final_metrics["holdout_metrics"]["aggregate"]["r2"], 0.8)
+        self.assertEqual(final_metrics["holdout_metrics"]["aggregate"]["composite_score"], 0.84)
+        self.assertEqual(final_metrics["selected_model"]["model_name"], "Ridge")
         self.assertEqual(_FakeUncertaintyEstimator.last_kwargs["audit_partition"], "holdout")
         self.assertEqual(final_metrics["uncertainty_summary"]["coverage_audit"]["expected_partition"], "holdout")
         self.assertIn("regime_specific_modeling", final_metrics)
@@ -209,15 +229,7 @@ class ReportTests(unittest.TestCase):
         baseline_model = _RecordingModel(x_test, [29.0, 31.0])
         best_model = _RecordingModel(x_test, [30.0, 32.0])
         saved_payloads: list[tuple[Path, dict]] = []
-        best_search_metrics = {
-            "run_id": "run-current",
-            "artifact_id": "best-search-artifact",
-            "model_name": "Ridge",
-            "hyperparameters": {"alpha": 1.0},
-            "composite_score": 0.82,
-            "cv_r2": 0.61,
-            "validation_verdict": "PASS",
-        }
+        best_search_metrics = _search_selection_payload(trial_number=None, best_trial=None)
 
         def _write_run_scoped_json_artifact(*, outputs_dir: Path, filename: str, payload: dict, **_kwargs):
             path = outputs_dir / filename
@@ -226,7 +238,6 @@ class ReportTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
-            (outputs_dir / "final_metrics.json").write_text("{}", encoding="utf-8")
             (outputs_dir / "final_acceptance.json").write_text("{}", encoding="utf-8")
 
             with patch("report.load_config", return_value=config), patch(
@@ -236,7 +247,6 @@ class ReportTests(unittest.TestCase):
                 "report.load_json_artifact",
                 side_effect=[
                     {"composite_score": 0.75},
-                    {"best_search_metrics": best_search_metrics},
                     best_search_metrics,
                 ],
             ), patch(
@@ -287,7 +297,7 @@ class ReportTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         final_metrics = saved_payloads[-1][1]
-        self.assertEqual(final_metrics["best_search_metrics"]["validation_verdict"], "PASS")
+        self.assertEqual(final_metrics["selected_model"]["validation_verdict"], "PASS")
         self.assertEqual(final_metrics["validation_verdict"], "PASS")
         self.assertEqual(final_metrics["holdout_validation_verdict"], "FAIL")
 
@@ -328,20 +338,17 @@ class ReportTests(unittest.TestCase):
                 "hyperparameters": {"alpha": 9.0},
                 "composite_score": 0.40,
                 "cv_r2": 0.11,
+                "cv_metrics": {"rmse": 8.5, "mae": 7.5, "r2": 0.11, "composite_score": 0.4},
+                "selection_metrics": {"rmse": 7.0, "mae": 6.0, "r2": 0.2, "composite_score": 0.3},
                 "validation_verdict": "WARN",
             },
+            "holdout_metrics": {"rmse": 9.0, "mae": 8.0, "r2": 0.1, "composite_score": 0.2},
+            "holdout_validation_verdict": "FAIL",
         }
-        current_best_search_result = {
-            "run_id": "new-run",
-            "artifact_id": "new-best",
-            "model_name": "Ridge",
-            "hyperparameters": {"alpha": 1.0},
-            "composite_score": 0.82,
-            "cv_r2": 0.61,
-            "cv_rmse": 5.0,
-            "cv_mae": 4.0,
-            "validation_verdict": "PASS",
-        }
+        current_best_search_result = _search_selection_payload(
+            run_id="new-run",
+            artifact_id="new-best",
+        )
 
         def _write_run_scoped_json_artifact(*, outputs_dir: Path, filename: str, payload: dict, **_kwargs):
             path = outputs_dir / filename
@@ -411,8 +418,8 @@ class ReportTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         final_metrics = saved_payloads[-1][1]
-        self.assertEqual(final_metrics["best_search_metrics"]["run_id"], "new-run")
-        self.assertEqual(final_metrics["best_search_metrics"]["model_name"], "Ridge")
+        self.assertEqual(final_metrics["selected_model"]["run_id"], "new-run")
+        self.assertEqual(final_metrics["selected_model"]["model_name"], "Ridge")
 
     def test_report_marks_stale_search_state_artifact(self) -> None:
         config = {
@@ -429,17 +436,10 @@ class ReportTests(unittest.TestCase):
 
         baseline_model = _RecordingModel(x_test, [29.0, 31.0])
         best_model = _RecordingModel(x_test, [30.0, 32.0])
-        current_best_search_result = {
-            "run_id": "current-run",
-            "artifact_id": "new-best",
-            "model_name": "Ridge",
-            "hyperparameters": {"alpha": 1.0},
-            "composite_score": 0.82,
-            "cv_r2": 0.61,
-            "cv_rmse": 5.0,
-            "cv_mae": 4.0,
-            "validation_verdict": "PASS",
-        }
+        current_best_search_result = _search_selection_payload(
+            run_id="current-run",
+            artifact_id="new-best",
+        )
 
         def _write_run_scoped_json_artifact(*, outputs_dir: Path, filename: str, payload: dict, **_kwargs):
             path = outputs_dir / filename
@@ -447,7 +447,6 @@ class ReportTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
-            (outputs_dir / "final_metrics.json").write_text("{}", encoding="utf-8")
             (outputs_dir / "final_acceptance.json").write_text("{}", encoding="utf-8")
             (outputs_dir / "search_state_best_result.json").write_text(
                 '{"model_name": "OldState"}',
@@ -461,7 +460,6 @@ class ReportTests(unittest.TestCase):
                 "report.load_json_artifact",
                 side_effect=[
                     {"composite_score": 0.75},
-                    {},
                     current_best_search_result,
                 ],
             ), patch(

@@ -17,6 +17,7 @@ from typing import Any
 import optuna
 import pandas as pd
 
+from artifact_contracts import get_selection_validation_aggregate, map_deprecated_artifact_payload
 from artifact_sync import AtomicArtifactWriter, repair_on_startup as repair_synced_artifacts_on_startup
 from llm_backend import get_llm_config
 from research_protocol import (
@@ -66,10 +67,10 @@ OPTUNA_RESULTS_COLUMNS = [
     "mae",
     "r2",
     "composite_score",
-    "test_rmse",
-    "test_mae",
-    "test_r2",
-    "test_composite_score",
+    "validation_rmse",
+    "validation_mae",
+    "validation_r2",
+    "validation_composite_score",
     "validation_pass_rate",
     "failed_count",
     "hard_failed_count",
@@ -85,7 +86,7 @@ SEARCH_STATE_BEST_RESULT_FILENAME = "search_state_best_result.json"
 SEARCH_STATE_BEST_MODEL_FILENAME = "search_state_best_model.pkl"
 FINAL_BEST_RESULT_FILENAME = "best_search_result.json"
 FINAL_BEST_MODEL_FILENAME = "best_search_model.pkl"
-FINAL_METRICS_FILENAME = "final_metrics.json"
+DEPRECATED_FINAL_METRICS_FILENAME = "final_metrics.json"
 FINAL_ACCEPTANCE_FILENAME = "final_acceptance.json"
 EXPERIMENT_MEMORY_FILENAME = "experiment_memory.json"
 LEGACY_RUNTIME_MESSAGE = (
@@ -364,7 +365,7 @@ def initialize_search_state(
     state_model_path = outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME
     final_json_artifacts = (
         outputs_dir / FINAL_BEST_RESULT_FILENAME,
-        outputs_dir / FINAL_METRICS_FILENAME,
+        outputs_dir / DEPRECATED_FINAL_METRICS_FILENAME,
         outputs_dir / "ensemble_metrics.json",
     )
     for artifact_path in final_json_artifacts:
@@ -415,10 +416,10 @@ def build_trial_record(
                 "mae": None,
                 "r2": None,
                 "composite_score": None,
-                "test_rmse": None,
-                "test_mae": None,
-                "test_r2": None,
-                "test_composite_score": None,
+                "validation_rmse": None,
+                "validation_mae": None,
+                "validation_r2": None,
+                "validation_composite_score": None,
                 "validation_pass_rate": None,
                 "failed_count": None,
                 "hard_failed_count": None,
@@ -431,20 +432,17 @@ def build_trial_record(
         return base_record
 
     validation_report = result["validation_report"]
-    validation_metrics = result.get(
-        "selection_metrics",
-        result.get("val_metrics", result.get("test_metrics", {})),
-    )
+    validation_metrics = get_selection_validation_aggregate(result)
     base_record.update(
         {
             "rmse": result["rmse"],
             "mae": result["mae"],
             "r2": result["r2"],
             "composite_score": result["composite_score"],
-            "test_rmse": validation_metrics.get("rmse"),
-            "test_mae": validation_metrics.get("mae"),
-            "test_r2": validation_metrics.get("r2"),
-            "test_composite_score": validation_metrics.get("composite_score"),
+            "validation_rmse": validation_metrics.get("rmse"),
+            "validation_mae": validation_metrics.get("mae"),
+            "validation_r2": validation_metrics.get("r2"),
+            "validation_composite_score": validation_metrics.get("composite_score"),
             "validation_pass_rate": validation_report["pass_rate"],
             "failed_count": validation_report["failed_count"],
             "hard_failed_count": validation_report.get("hard_failed_count", validation_report["failed_count"]),
@@ -464,9 +462,9 @@ def write_final_acceptance_artifact(
     config: dict[str, Any],
     run_id: str,
 ) -> dict[str, Any]:
-    """Write final acceptance status derived from final_metrics.json as source of truth."""
-    final_metrics = load_json_artifact(outputs_dir / FINAL_METRICS_FILENAME)
-    decision = build_acceptance_decision(final_metrics=final_metrics, brief=brief)
+    """Write final acceptance status derived from best_search_result.json as source of truth."""
+    search_selection = load_json_artifact(outputs_dir / FINAL_BEST_RESULT_FILENAME)
+    decision = build_acceptance_decision(final_metrics=search_selection, brief=brief)
     consistency_report = validate_final_artifact_consistency(outputs_dir)
     if not consistency_report["consistent"]:
         decision["accepted"] = False
@@ -479,9 +477,9 @@ def write_final_acceptance_artifact(
         run_id=run_id,
         source_mode="acceptance",
         config=config,
-        model_artifact_id=final_metrics.get("best_search_metrics", {}).get("model_artifact_id"),
-        model_id=str(final_metrics.get("best_model_name", "unknown")),
-        parent_artifact_ids=[artifact_id(final_metrics)] if artifact_id(final_metrics) else [],
+        model_artifact_id=search_selection.get("model_artifact_id"),
+        model_id=str(search_selection.get("model_name", "unknown")),
+        parent_artifact_ids=[artifact_id(search_selection)] if artifact_id(search_selection) else [],
     )
     return enriched_decision
 
@@ -616,32 +614,31 @@ def build_validation_summary(validation_report: dict[str, Any]) -> dict[str, Any
     return summarize_validation_report(validation_report)
 
 
-def build_final_metrics_payload(
+def build_search_selection_payload(
     baseline_metrics: dict[str, Any],
     final_best_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build the canonical final-metrics artifact from the finalized winning result."""
+    """Build the canonical search-selection artifact from the finalized winning result."""
     improvement_percentage = calculate_improvement_percentage(
         float(baseline_metrics["composite_score"]),
         float(final_best_result["composite_score"]),
     )
     validation_report = dict(final_best_result.get("validation_report", {}))
-    return {
-        "baseline_metrics": copy.deepcopy(baseline_metrics),
-        "best_search_metrics": copy.deepcopy(final_best_result),
-        "improvement_percentage": improvement_percentage,
-        "composite_improvement_pct": improvement_percentage,
-        "validation_verdict": final_best_result["validation_verdict"],
-        "best_model_name": final_best_result["model_name"],
-        "best_model_hyperparameters": copy.deepcopy(final_best_result["hyperparameters"]),
-        "validation_summary": build_validation_summary(validation_report),
-        "validation_metrics": copy.deepcopy(
-            final_best_result.get(
-                "selection_metrics",
-                final_best_result.get("val_metrics", final_best_result.get("test_metrics", {})),
-            )
-        ),
-    }
+    payload = copy.deepcopy(final_best_result)
+    payload.update(
+        {
+            "artifact_kind": "search_selection",
+            "baseline_metrics": copy.deepcopy(baseline_metrics),
+            "improvement_percentage": improvement_percentage,
+            "composite_improvement_pct": improvement_percentage,
+            "selection_validation_report": copy.deepcopy(validation_report),
+            "selection_metric_name": str(final_best_result.get("selection_metric_name", "composite_score")),
+            "selection_decision_score": float(final_best_result.get("composite_score", 0.0)),
+            "validation_summary": build_validation_summary(validation_report),
+            "validation_metrics": copy.deepcopy(get_selection_validation_aggregate(final_best_result)),
+        }
+    )
+    return payload
 
 
 def _best_trial_id(payload: dict[str, Any]) -> int | None:
@@ -651,20 +648,23 @@ def _best_trial_id(payload: dict[str, Any]) -> int | None:
 
 def _load_best_result_for_repair(outputs_dir: Path) -> dict[str, Any] | None:
     """Load the most relevant best-result payload for CSV repair or backfill."""
+    final_best_path = outputs_dir / FINAL_BEST_RESULT_FILENAME
+    if final_best_path.exists():
+        return load_json_artifact(final_best_path)
+
     search_state_path = outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME
     if search_state_path.exists():
         return load_json_artifact(search_state_path)
 
-    final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME
+    final_metrics_path = outputs_dir / DEPRECATED_FINAL_METRICS_FILENAME
     if final_metrics_path.exists():
-        final_metrics = load_json_artifact(final_metrics_path)
-        best_search_metrics = final_metrics.get("best_search_metrics")
-        if isinstance(best_search_metrics, dict):
-            return best_search_metrics
-
-    final_best_path = outputs_dir / FINAL_BEST_RESULT_FILENAME
-    if final_best_path.exists():
-        return load_json_artifact(final_best_path)
+        final_metrics = map_deprecated_artifact_payload(
+            DEPRECATED_FINAL_METRICS_FILENAME,
+            load_json_artifact(final_metrics_path),
+        )
+        selected_model = final_metrics.get("selected_model")
+        if isinstance(selected_model, dict):
+            return selected_model
 
     return None
 
@@ -675,13 +675,6 @@ def resolve_final_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any
     csv_best = _csv_best_trial(outputs_dir / "optuna_results.csv")
     candidate_results: list[dict[str, Any]] = []
 
-    final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME
-    if final_metrics_path.exists():
-        final_metrics = load_json_artifact(final_metrics_path)
-        best_search_metrics = final_metrics.get("best_search_metrics")
-        if isinstance(best_search_metrics, dict):
-            candidate_results.append(best_search_metrics)
-
     final_best_path = outputs_dir / FINAL_BEST_RESULT_FILENAME
     if final_best_path.exists():
         candidate_results.append(load_json_artifact(final_best_path))
@@ -689,6 +682,16 @@ def resolve_final_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any
     search_state_path = outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME
     if search_state_path.exists():
         candidate_results.append(load_json_artifact(search_state_path))
+
+    final_metrics_path = outputs_dir / DEPRECATED_FINAL_METRICS_FILENAME
+    if final_metrics_path.exists():
+        final_metrics = map_deprecated_artifact_payload(
+            DEPRECATED_FINAL_METRICS_FILENAME,
+            load_json_artifact(final_metrics_path),
+        )
+        selected_model = final_metrics.get("selected_model")
+        if isinstance(selected_model, dict):
+            candidate_results.append(selected_model)
 
     search_state_result = next(
         (
@@ -790,22 +793,11 @@ def finalize_search_artifacts(
     final_best_result["run_id"] = run_id
     final_best_result["model_artifact_id"] = final_model_metadata["artifact_id"]
 
-    final_metrics = build_final_metrics_payload(baseline_metrics, final_best_result)
-    write_run_scoped_json_artifact(
-        outputs_dir=outputs_dir,
-        filename=FINAL_METRICS_FILENAME,
-        payload=final_metrics,
-        run_id=run_id,
-        source_mode="search",
-        config=config,
-        model_artifact_id=final_model_metadata["artifact_id"],
-        model_id=str(final_best_result["model_name"]),
-        parent_artifact_ids=[artifact_id(final_best_result)] if artifact_id(final_best_result) else [],
-    )
+    search_selection = build_search_selection_payload(baseline_metrics, final_best_result)
     write_run_scoped_json_artifact(
         outputs_dir=outputs_dir,
         filename=FINAL_BEST_RESULT_FILENAME,
-        payload=final_best_result,
+        payload=search_selection,
         run_id=run_id,
         source_mode="search",
         config=config,
@@ -833,16 +825,8 @@ def finalize_search_artifacts(
             reason="finalized winner is not the current ensemble artifact",
         )
 
-    written_final_metrics = load_json_artifact(outputs_dir / FINAL_METRICS_FILENAME)
     written_best_result = load_json_artifact(outputs_dir / FINAL_BEST_RESULT_FILENAME)
-    metrics_best_result = written_final_metrics.get("best_search_metrics", {})
-    metrics_trial_id = None if not isinstance(metrics_best_result, dict) else _best_trial_id(metrics_best_result)
     best_result_trial_id = _best_trial_id(written_best_result)
-    if metrics_trial_id != best_result_trial_id:
-        raise RuntimeError(
-            "Final artifact desync | "
-            f"final_metrics_trial={metrics_trial_id} | best_search_result_trial={best_result_trial_id}"
-        )
 
     if ensemble_metrics_path.exists():
         ensemble_payload = load_json_artifact(ensemble_metrics_path)
@@ -854,7 +838,7 @@ def finalize_search_artifacts(
                     f"ensemble_trial={ensemble_trial_id} | best_search_result_trial={best_result_trial_id}"
                 )
 
-    return final_best_result
+    return search_selection
 
 
 def _parse_param_value(raw_value: str) -> Any:
@@ -970,10 +954,7 @@ def _build_repaired_trial_record(
     best_trial_number = None if best_result is None else _safe_int(best_result.get("trial_number", best_result.get("best_trial")))
     if best_result is not None and best_trial_number == trial_number:
         validation_report = best_result.get("validation_report", {})
-        test_metrics = best_result.get(
-            "selection_metrics",
-            best_result.get("val_metrics", best_result.get("test_metrics", {})),
-        )
+        validation_metrics = get_selection_validation_aggregate(best_result)
         base_row.update(
             {
                 "model_name": best_result.get("model_name", base_row["model_name"]),
@@ -984,10 +965,13 @@ def _build_repaired_trial_record(
                 "mae": best_result.get("mae", base_row["mae"]),
                 "r2": best_result.get("r2", base_row["r2"]),
                 "composite_score": best_result.get("composite_score", base_row["composite_score"]),
-                "test_rmse": test_metrics.get("rmse", base_row["test_rmse"]),
-                "test_mae": test_metrics.get("mae", base_row["test_mae"]),
-                "test_r2": test_metrics.get("r2", base_row["test_r2"]),
-                "test_composite_score": test_metrics.get("composite_score", base_row["test_composite_score"]),
+                "validation_rmse": validation_metrics.get("rmse", base_row["validation_rmse"]),
+                "validation_mae": validation_metrics.get("mae", base_row["validation_mae"]),
+                "validation_r2": validation_metrics.get("r2", base_row["validation_r2"]),
+                "validation_composite_score": validation_metrics.get(
+                    "composite_score",
+                    base_row["validation_composite_score"],
+                ),
                 "validation_pass_rate": validation_report.get("pass_rate", base_row["validation_pass_rate"]),
                 "failed_count": validation_report.get("failed_count", base_row["failed_count"]),
                 "hard_failed_count": validation_report.get("hard_failed_count", base_row["hard_failed_count"]),
@@ -1298,7 +1282,7 @@ def build_post_search_ensemble(
             f"INFO ensemble_beats_best_cv_r2 | ensemble={ensemble_score:.4f} | previous_best={previous_best_score:.4f}"
         )
         mark_json_artifact_stale(
-            outputs_dir / FINAL_METRICS_FILENAME,
+            outputs_dir / DEPRECATED_FINAL_METRICS_FILENAME,
             active_run_id=run_id,
             reason="new best ensemble saved before final report refresh",
         )

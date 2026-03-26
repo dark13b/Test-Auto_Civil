@@ -88,7 +88,6 @@ from loop_artifacts import (
     BEST_RESULT_FILENAME,
     FINAL_ACCEPTANCE_FILENAME,
     FINAL_ARTIFACT_VALIDATION_FILENAME,
-    FINAL_METRICS_FILENAME,
     PROPOSAL_DIVERSITY_FILENAME,
     RESEARCH_LOG_FILENAME,
     RESEARCH_RESULTS_FILENAME,
@@ -98,7 +97,7 @@ from loop_artifacts import (
     _append_research_log,
     _append_results_row,
     _append_synchronized_results,
-    _build_final_metrics_payload,
+    _build_search_selection_payload,
     _build_results_sync_writer,
     _build_run_manifest_payload,
     _increment_count,
@@ -617,12 +616,12 @@ def run_engineering_research_loop(
             run_id=run_id,
         )
 
-    final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME
-    if final_metrics_path.exists():
-        final_metrics = load_json_file(final_metrics_path)
+    final_best_result_path = outputs_dir / BEST_RESULT_FILENAME
+    if final_best_result_path.exists():
+        final_metrics = load_json_file(final_best_result_path)
     else:
-        final_metrics = _build_final_metrics_payload(baseline_metrics, current_best_result)
-        write_json_file(final_metrics_path, final_metrics)
+        final_metrics = _build_search_selection_payload(baseline_metrics, current_best_result)
+        write_json_file(final_best_result_path, final_metrics)
     acceptance = build_acceptance_decision(final_metrics=final_metrics, brief=brief)
     write_json_file(outputs_dir / FINAL_ACCEPTANCE_FILENAME, acceptance)
     if (
@@ -686,7 +685,7 @@ def run_engineering_research_loop(
         validation_report=validation_report,
     )
     _write_run_manifest(outputs_dir, manifest)
-    return final_metrics["best_search_metrics"]
+    return final_metrics
 
 
 def main() -> int:

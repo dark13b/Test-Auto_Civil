@@ -7,6 +7,7 @@ import html
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, url_for
+from artifact_contracts import map_deprecated_artifact_payload
 
 app = Flask(__name__)
 
@@ -107,13 +108,8 @@ def log_share_event(event_name, *, token="", metadata=None):
 
 def build_share_snapshot_payload():
     baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
-    final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-    final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
-    best_source = first_fresh_payload(
-        final_raw.get("best_search_metrics"),
-        safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
-        safe_read_json(OUTPUTS_DIR / "best_search_result.json"),
-    )
+    final_raw = load_final_holdout_payload(OUTPUTS_DIR)
+    best_source = load_search_selection_payload(OUTPUTS_DIR, final_raw)
     best = normalize_result_payload(best_source)
     final = normalize_final_payload(final_raw)
 
@@ -169,20 +165,56 @@ def first_fresh_payload(*payloads):
             return payload
     return {}
 
+def load_final_holdout_payload(run_dir):
+    final_holdout = safe_read_json(run_dir / "final_holdout_evaluation.json") or {}
+    if isinstance(final_holdout, dict) and final_holdout and not artifact_payload_is_stale(final_holdout):
+        return final_holdout
+    legacy_payload = safe_read_json(run_dir / "final_metrics.json") or {}
+    if not isinstance(legacy_payload, dict) or not legacy_payload:
+        return {}
+    try:
+        mapped = map_deprecated_artifact_payload("final_metrics.json", legacy_payload)
+    except Exception:
+        return {}
+    return {} if artifact_payload_is_stale(mapped) else mapped
+
+def load_search_selection_payload(run_dir, final_payload=None):
+    if not isinstance(final_payload, dict):
+        final_payload = {}
+    return first_fresh_payload(
+        safe_read_json(run_dir / "best_search_result.json"),
+        safe_read_json(run_dir / "search_state_best_result.json"),
+        final_payload.get("selected_model"),
+        final_payload.get("best_search_metrics"),
+    )
+
 def normalize_result_payload(payload):
     if not isinstance(payload, dict):
         return {}
 
     normalized = dict(payload)
-    cv_metrics = normalized.get("cv_metrics") or {}
-    selection_metrics = (
-        normalized.get("selection_metrics")
-        or normalized.get("val_metrics")
-        or normalized.get("test_metrics")
+    cv_metrics = normalized.get("cv_metrics") or normalized.get("cross_validation") or {}
+    if isinstance(cv_metrics, dict) and isinstance(cv_metrics.get("aggregate"), dict):
+        cv_metrics = cv_metrics.get("aggregate") or {}
+    selection_metrics = normalized.get("selection_validation") or {}
+    if isinstance(selection_metrics, dict) and isinstance(selection_metrics.get("aggregate"), dict):
+        selection_metrics = selection_metrics.get("aggregate") or {}
+    if not selection_metrics:
+        selection_metrics = (
+            normalized.get("validation_metrics")
+            or normalized.get("selection_metrics")
+            or normalized.get("val_metrics")
+            or normalized.get("test_metrics")
+            or {}
+        )
+    holdout_metrics = normalized.get("holdout_metrics") or {}
+    if isinstance(holdout_metrics, dict) and isinstance(holdout_metrics.get("aggregate"), dict):
+        holdout_metrics = holdout_metrics.get("aggregate") or {}
+    validation_report = (
+        normalized.get("selection_validation_report")
+        or normalized.get("validation_report")
         or {}
     )
-    holdout_metrics = normalized.get("holdout_metrics") or {}
-    validation_report = normalized.get("validation_report") or {}
 
     normalized["validation"] = normalized.get("validation_verdict") or normalized.get("validation")
     normalized["cv_rmse"] = coerce_number(normalized.get("cv_rmse") or cv_metrics.get("rmse") or normalized.get("rmse"))
@@ -337,6 +369,191 @@ def normalize_final_payload(payload):
     )
     return normalized
 
+def _first_numeric(*values):
+    for value in values:
+        coerced = coerce_number(value)
+        if coerced is not None:
+            return coerced
+    return None
+
+def _best_result_from_payload(final_raw, run_dir):
+    if not isinstance(final_raw, dict):
+        final_raw = {}
+    return load_search_selection_payload(run_dir, final_raw)
+
+def summarize_run_manifest(manifest_path):
+    manifest = safe_read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        return None
+
+    artifact_metadata = manifest.get("artifact_metadata") or {}
+    run_scoped_path = artifact_metadata.get("run_scoped_path") or manifest_path
+    try:
+        run_dir = Path(run_scoped_path).parent
+    except Exception:
+        run_dir = manifest_path.parent
+
+    final_raw = load_final_holdout_payload(run_dir)
+    baseline = normalize_result_payload(
+        safe_read_json(run_dir / "baseline_metrics.json")
+        or final_raw.get("baseline_metrics")
+        or {}
+    )
+    best = normalize_result_payload(_best_result_from_payload(final_raw, run_dir))
+    final = normalize_final_payload(final_raw)
+    acceptance = manifest.get("acceptance_decision")
+    if not isinstance(acceptance, dict):
+        acceptance = final.get("acceptance_decision") if isinstance(final.get("acceptance_decision"), dict) else {}
+    validation_report = final_raw.get("final_artifact_validation") or manifest.get("final_artifact_validation") or {}
+    proposal_status_counts = manifest.get("proposal_status_counts") or {}
+    smoke_status = manifest.get("smoke_test_status") or manifest.get("preflight_status") or "unknown"
+    status = manifest.get("final_run_status") or "unknown"
+    selection_partition = manifest.get("selection_partition") or final_raw.get("selection_partition") or "validation"
+
+    baseline_composite = _first_numeric(
+        baseline.get("cv_composite"),
+        baseline.get("composite"),
+        baseline.get("selection_composite"),
+    )
+    best_composite = _first_numeric(
+        best.get("holdout_composite"),
+        best.get("validation_composite"),
+        best.get("cv_composite"),
+        best.get("composite"),
+    )
+    composite_improvement_pct = _first_numeric(
+        final.get("composite_improvement_pct"),
+        final_raw.get("composite_improvement_pct"),
+    )
+    delta_vs_baseline = None
+    if baseline_composite is not None and best_composite is not None:
+        delta_vs_baseline = round(best_composite - baseline_composite, 6)
+
+    timestamps = [
+        parse_utc_iso(manifest.get("timestamp")),
+        parse_utc_iso(manifest.get("updated_at")),
+        parse_utc_iso(artifact_metadata.get("timestamp")),
+    ]
+    run_timestamp = next((item for item in timestamps if item is not None), None)
+    run_timestamp_text = to_utc_iso(run_timestamp) if run_timestamp else str(manifest.get("timestamp") or "")
+
+    return {
+        "run_id": str(manifest.get("run_id") or artifact_metadata.get("run_id") or manifest_path.parent.name),
+        "run_timestamp": run_timestamp_text,
+        "run_timestamp_iso": run_timestamp_text,
+        "run_dir": str(run_dir),
+        "baseline_model": baseline.get("model_name") or "RandomForestRegressor",
+        "best_model": best.get("model_name") or manifest.get("model") or "N/A",
+        "best_trial": best.get("best_trial"),
+        "status": status,
+        "smoke_status": smoke_status,
+        "acceptance": acceptance,
+        "acceptance_decision": acceptance.get("decision_reason") if isinstance(acceptance, dict) else None,
+        "accepted": bool(acceptance.get("accepted")) if isinstance(acceptance, dict) else False,
+        "validation_verdict": best.get("validation_verdict") or best.get("validation") or "N/A",
+        "final_consistent": bool((validation_report or {}).get("consistent", True)),
+        "holdout_touched": bool(manifest.get("holdout_touched_during_search")),
+        "candidates": int(coerce_number(manifest.get("number_of_candidates_evaluated")) or 0),
+        "baseline_composite": baseline_composite,
+        "best_composite": best_composite,
+        "delta_vs_baseline": delta_vs_baseline,
+        "composite_improvement_pct": composite_improvement_pct,
+        "selection_partition": selection_partition,
+        "selection_metric_name": manifest.get("selection_metric_name")
+        or final_raw.get("selection_metric_name")
+        or "composite_score",
+        "backend": manifest.get("backend") or manifest.get("runtime_context", {}).get("backend_mode") or "N/A",
+        "model_hint": manifest.get("model") or "N/A",
+        "proposal_status_counts": proposal_status_counts,
+        "proposal_error_count": int(coerce_number(proposal_status_counts.get("error")) or 0),
+        "proposal_keep_count": int(coerce_number(proposal_status_counts.get("kept")) or 0),
+        "proposal_revert_count": int(coerce_number(proposal_status_counts.get("reverted")) or 0),
+        "proposal_promising_count": int(coerce_number(proposal_status_counts.get("scout_promising")) or 0),
+        "proposal_no_improvement_count": int(coerce_number(proposal_status_counts.get("scout_no_improvement")) or 0),
+        "proposal_smoke_status": smoke_status,
+        "final_run_status": status,
+        "timestamp_raw": manifest.get("timestamp") or artifact_metadata.get("timestamp") or "",
+        "source_mode": manifest.get("source_mode") or artifact_metadata.get("source_mode") or "manifest",
+        "artifact_id": manifest.get("artifact_id") or artifact_metadata.get("artifact_id") or "",
+    }
+
+def load_run_history():
+    run_dir = OUTPUTS_DIR / "runs"
+    if not run_dir.exists():
+        return []
+    run_history = []
+    for manifest_path in sorted(run_dir.glob("*/run_manifest.json")):
+        summary = summarize_run_manifest(manifest_path)
+        if summary:
+            run_history.append(summary)
+
+    def sort_key(row):
+        parsed = parse_utc_iso(row.get("run_timestamp"))
+        return parsed or datetime.min.replace(tzinfo=timezone.utc)
+
+    run_history.sort(key=sort_key)
+    previous_retained = None
+    for row in run_history:
+        if previous_retained is not None:
+            if row.get("best_composite") is not None and previous_retained.get("best_composite") is not None:
+                row["delta_vs_previous_best"] = round(
+                    float(row["best_composite"]) - float(previous_retained["best_composite"]),
+                    6,
+                )
+            else:
+                row["delta_vs_previous_best"] = None
+            if row.get("composite_improvement_pct") is not None and previous_retained.get("composite_improvement_pct") is not None:
+                row["delta_vs_previous_improvement_pct"] = round(
+                    float(row["composite_improvement_pct"]) - float(previous_retained["composite_improvement_pct"]),
+                    6,
+                )
+            else:
+                row["delta_vs_previous_improvement_pct"] = None
+            row["previous_run_id"] = previous_retained.get("run_id")
+        else:
+            row["delta_vs_previous_best"] = None
+            row["delta_vs_previous_improvement_pct"] = None
+            row["previous_run_id"] = None
+
+        if row.get("final_run_status") == "success" and row.get("final_consistent", True):
+            previous_retained = row
+
+    if run_history:
+        best_run = max(
+            run_history,
+            key=lambda row: row.get("best_composite") if row.get("best_composite") is not None else float("-inf"),
+        )
+        retained_runs = [
+            row for row in run_history if row.get("final_run_status") == "success" and row.get("final_consistent", True)
+        ]
+        previous_best = retained_runs[-2] if len(retained_runs) >= 2 else (retained_runs[-1] if retained_runs else {})
+        worst_retained = min(
+            retained_runs,
+            key=lambda row: row.get("best_composite") if row.get("best_composite") is not None else float("inf"),
+        ) if retained_runs else {}
+        for row in run_history:
+            row["is_latest"] = row is run_history[-1]
+            row["is_best"] = row is best_run
+        summary = {
+            "latest": run_history[-1],
+            "best": best_run,
+            "previous_best": previous_best,
+            "worst_retained": worst_retained,
+            "retained_count": len(retained_runs),
+            "run_count": len(run_history),
+        }
+    else:
+        summary = {
+            "latest": {},
+            "best": {},
+            "previous_best": {},
+            "worst_retained": {},
+            "retained_count": 0,
+            "run_count": 0,
+        }
+
+    return {"runs": run_history, "summary": summary}
+
 def normalize_optuna_rows(rows):
     normalized_rows = []
     for row in rows or []:
@@ -429,19 +646,19 @@ def health():
 def api_overview():
     try:
         baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
-        final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-        final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
-        best_source = first_fresh_payload(
-            final_raw.get("best_search_metrics"),
-            safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
-            safe_read_json(OUTPUTS_DIR / "best_search_result.json"),
-        )
+        final_raw = load_final_holdout_payload(OUTPUTS_DIR)
+        best_source = load_search_selection_payload(OUTPUTS_DIR, final_raw)
         best = normalize_result_payload(best_source)
         final = normalize_final_payload(final_raw)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
     dataset_rows = get_dataset_rows()
     return jsonify(sanitize_dashboard_payload({"baseline": baseline, "best": best, "final": final, "dataset_rows": dataset_rows}))
+
+@app.route("/api/run_history")
+def api_run_history():
+    history_payload = load_run_history()
+    return jsonify(sanitize_dashboard_payload(history_payload))
 
 @app.route("/api/research_log")
 def api_research_log():
@@ -456,11 +673,9 @@ def api_optuna_results():
 @app.route("/api/validation_details")
 def api_validation_details():
     try:
-        final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-        final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
+        final_raw = load_final_holdout_payload(OUTPUTS_DIR)
         best_source = first_fresh_payload(
-            final_raw.get("best_search_metrics"),
-            safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
+            load_search_selection_payload(OUTPUTS_DIR, final_raw),
             load_required_output_json("best_search_result.json"),
         )
         best = normalize_result_payload(best_source)
@@ -528,7 +743,7 @@ def api_plots():
 def api_status():
     required = [
         "baseline_metrics.json", "search_state_best_result.json", "best_search_result.json",
-        "final_metrics.json", "research_log.txt", "optuna_results.csv",
+        "final_holdout_evaluation.json", "research_log.txt", "optuna_results.csv",
     ]
     status = {}
     for name in required:
@@ -834,6 +1049,7 @@ nav a .icon{font-size:15px;width:20px;text-align:center}
 .badge.pass{background:rgba(21,128,61,.1);color:var(--green);border:1px solid rgba(21,128,61,.22)}
 .badge.warn{background:rgba(180,83,9,.1);color:var(--yellow);border:1px solid rgba(180,83,9,.22)}
 .badge.fail{background:rgba(180,35,24,.1);color:var(--red);border:1px solid rgba(180,35,24,.22)}
+.badge.neutral{background:rgba(102,112,133,.1);color:var(--muted);border:1px solid rgba(102,112,133,.22)}
 
 /* timeline */
 .log-controls{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap;align-items:center}
@@ -921,6 +1137,50 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 .chart-box p{font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:16px}
 .chart-box canvas{max-height:280px}
 .chart-full{grid-column:1/-1}
+
+/* run history */
+.run-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:20px}
+.run-history-head{
+  display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;
+  margin-bottom:16px;
+}
+.run-history-meta{
+  font-family:var(--mono);font-size:10px;color:var(--muted);line-height:1.7;
+}
+.run-diagram{
+  display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;
+}
+.run-node{
+  position:relative;min-width:180px;flex:1 1 180px;
+  background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;
+  box-shadow:var(--shadow-sm);
+}
+.run-node.latest{border-color:var(--green);box-shadow:0 0 0 1px rgba(21,128,61,.14), var(--shadow-sm)}
+.run-node.best{border-color:var(--accent);box-shadow:0 0 0 1px rgba(15,118,110,.14), var(--shadow-sm)}
+.run-node .mini{font-family:var(--mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
+.run-node .headline{font-size:13px;font-weight:800;margin:8px 0 10px}
+.run-node .stat{font-family:var(--mono);font-size:11px;line-height:1.7;color:var(--txt)}
+.run-arrow{
+  align-self:center;color:var(--border-strong);font-family:var(--mono);font-size:18px;font-weight:700;
+}
+.delta-up{color:var(--green)}
+.delta-down{color:var(--red)}
+.delta-flat{color:var(--muted)}
+.run-note{
+  font-family:var(--mono);font-size:10px;color:var(--muted);line-height:1.6;margin-top:12px
+}
+.comparison-table thead th{position:sticky;top:0;z-index:1}
+.comparison-table tbody tr.latest-row td{background:rgba(21,128,61,.05)}
+.comparison-table tbody tr.best-row td{background:rgba(15,118,110,.05)}
+.comparison-pill{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:3px 8px;border-radius:999px;border:1px solid var(--border);
+  background:rgba(255,255,255,.6);font-family:var(--mono);font-size:10px;
+}
+.comparison-pill strong{font-size:10px}
+.comparison-pill.good{border-color:rgba(21,128,61,.25);color:var(--green)}
+.comparison-pill.bad{border-color:rgba(180,35,24,.25);color:var(--red)}
+.comparison-pill.neutral{color:var(--muted)}
 
 /* gallery */
 .plot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
@@ -1022,6 +1282,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
     <a href="#validation"        ><span class="icon">◉</span> Engineering Validation</a>
     <a href="#design"            ><span class="icon">◧</span> Design Tool</a>
     <a href="#gallery"           ><span class="icon">◰</span> Plots Gallery</a>
+    <a href="#runs"              ><span class="icon">⟡</span> Run History</a>
   </nav>
 </aside>
 
@@ -1053,6 +1314,72 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 </section>
 
 <!-- ══ RESEARCH LOG ══════════════════════════════════════════════════════ -->
+<!-- ══ RUN HISTORY ═══════════════════════════════════════════════════════════ -->
+<section class="section" id="runs">
+  <div class="run-history-head">
+    <div>
+      <div class="section-title">Run History</div>
+      <div class="section-sub">Every retained run compared against the previous retained run, baseline, and best-ever result</div>
+    </div>
+    <div class="run-history-meta" id="run-history-meta">Loading historical run comparisons…</div>
+  </div>
+  <div class="run-summary-grid" id="run-summary-cards">
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box chart-full">
+      <h3>Composite Score Across Runs</h3>
+      <p>Latest retained run versus earlier runs, with baseline and best-ever references.</p>
+      <canvas id="chart-run-history"></canvas>
+    </div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box">
+      <h3>Delta vs Previous Retained Run</h3>
+      <p>Positive values mean the newer run improved over the prior retained result.</p>
+      <canvas id="chart-run-delta"></canvas>
+    </div>
+    <div class="chart-box">
+      <h3>Metric Comparison</h3>
+      <p>Baseline vs best composite, plus candidate count per run.</p>
+      <canvas id="chart-run-metrics"></canvas>
+    </div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box">
+      <h3>Run Outcome Mix</h3>
+      <p>How many runs were accepted, reverted, or rejected.</p>
+      <canvas id="chart-run-status"></canvas>
+    </div>
+    <div class="chart-box">
+      <h3>Run Lineage Diagram</h3>
+      <p>Visual sequence from baseline to current best and previous retained result.</p>
+      <div id="run-lineage" class="run-diagram"></div>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="comparison-table" id="run-table">
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th>Timestamp</th>
+          <th>Status</th>
+          <th>Baseline</th>
+          <th>Best</th>
+          <th>Delta vs Base</th>
+          <th>Delta vs Prev</th>
+          <th>Candidates</th>
+          <th>Best Model</th>
+          <th>Verdict</th>
+        </tr>
+      </thead>
+      <tbody id="run-history-tbody"></tbody>
+    </table>
+  </div>
+</section>
 <section class="section" id="log">
   <div class="section-title">Research Log</div>
   <div class="section-sub">Automated experiment timeline — every trial, every decision</div>
@@ -1176,7 +1503,9 @@ let allTrials = [];
 let allOptuna = [];
 let fieldValidationRecords = [];
 let overviewData = {};
+let runHistory = [];
 let chartProgress, chartFamilies, chartRmse, chartRange, chartImprovement;
+let chartRunHistory, chartRunDelta, chartRunMetrics, chartRunStatus;
 let tablePage = 0;
 const PAGE_SIZE = 20;
 let tableSortCol = 0;
@@ -1192,6 +1521,7 @@ async function loadAll() {
   await Promise.all([
     loadStatus(),
     loadOverview(),
+    loadRunHistory(),
     loadLog(),
     loadOptuna(),
     loadValidation(),
@@ -1350,6 +1680,280 @@ async function loadOverview() {
 }
 
 // ─── research log ────────────────────────────────────────────────────────────
+function numOrNull(value){
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtSigned(value, digits = 4){
+  const n = numOrNull(value);
+  if(n == null) return 'â€”';
+  const sign = n > 0 ? '+' : '';
+  return `${sign}${n.toFixed(digits)}`;
+}
+
+function runTrendColor(value){
+  if(value == null) return theme('--muted');
+  if(value > 0) return theme('--green');
+  if(value < 0) return theme('--red');
+  return theme('--muted');
+}
+
+function statusBadgeClass(status){
+  const value = String(status || 'unknown').toLowerCase();
+  if(value.includes('accept') || value.includes('keep') || value.includes('success')) return 'pass';
+  if(value.includes('revert') || value.includes('rejected') || value.includes('fail') || value.includes('error')) return 'fail';
+  if(value.includes('warn') || value.includes('pending') || value.includes('running')) return 'warn';
+  return 'neutral';
+}
+
+function compactRunLabel(run){
+  if(!run) return 'â€”';
+  return String(run.run_id || '').slice(-6) || 'â€”';
+}
+
+function latestAndPreviousRetained(runs){
+  const retained = runs.filter(r => r.final_run_status === 'success' && r.final_consistent);
+  return {
+    latest: runs.length ? runs[runs.length - 1] : null,
+    previous: retained.length >= 2 ? retained[retained.length - 2] : retained[retained.length - 1] || null,
+    best: retained.length ? [...retained].sort((a, b) => (numOrNull(b.best_composite) ?? -Infinity) - (numOrNull(a.best_composite) ?? -Infinity))[0] : null,
+    worst: retained.length ? [...retained].sort((a, b) => (numOrNull(a.best_composite) ?? Infinity) - (numOrNull(b.best_composite) ?? Infinity))[0] : null,
+    retained,
+  };
+}
+
+async function loadRunHistory() {
+  const payload = await fetch('/api/run_history').then(r=>r.json()).catch(()=>[]);
+  runHistory = Array.isArray(payload) ? payload : (payload.runs || []);
+  renderRunHistory(Array.isArray(payload) ? null : (payload.summary || null));
+}
+
+function renderRunHistory(summary){
+  const el = document.getElementById('run-history-meta');
+  const cardsEl = document.getElementById('run-summary-cards');
+  const tbody = document.getElementById('run-history-tbody');
+  const lineage = document.getElementById('run-lineage');
+  if(!runHistory.length){
+    if(el) el.textContent = 'No historical runs found in outputs/runs/.';
+    if(cardsEl) cardsEl.innerHTML = `
+      <div class="design-placeholder" style="grid-column:1/-1">
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px">No Run History Yet</div>
+        <div style="color:var(--muted);font-size:12px">This dashboard will populate once run manifests are archived under outputs/runs/.</div>
+      </div>`;
+    if(tbody) tbody.innerHTML = '';
+    if(lineage) lineage.innerHTML = '';
+    renderRunCharts();
+    return;
+  }
+
+  const computed = summary || latestAndPreviousRetained(runHistory);
+  const latest = computed.latest || runHistory[runHistory.length - 1];
+  const previous = computed.previous || null;
+  const best = computed.best || latest;
+  const worst = computed.worst || latest;
+  const retained = computed.retained || [];
+  const latestDelta = numOrNull(latest?.delta_vs_previous_best);
+  const latestImprovement = numOrNull(latest?.composite_improvement_pct);
+  if(el){
+    el.textContent = `${runHistory.length} run(s) found | ${retained.length} retained | latest ${latest?.run_id || 'â€”'} | best ${best?.run_id || 'â€”'}`;
+  }
+
+  if(cardsEl){
+    cardsEl.innerHTML = `
+      <div class="card">
+        <div class="card-label">Latest Retained</div>
+        <div class="card-title">${escapeHtml(latest?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${latest?.best_composite != null ? latest.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Delta vs Previous</div><div class="metric-value sm" style="color:${runTrendColor(latestDelta)}">${fmtSigned(latestDelta, 4)}</div></div>
+        <div class="metric"><div class="metric-label">Improvement %</div><div class="metric-value sm" style="color:${runTrendColor(latestImprovement)}">${fmtSigned(latestImprovement, 2)}%</div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Previous Retained</div>
+        <div class="card-title">${escapeHtml(previous?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${previous?.best_composite != null ? previous.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Validation</div><div class="metric-value sm">${escapeHtml(previous?.validation_verdict || 'â€”')}</div></div>
+        <div class="metric"><div class="metric-label">Candidates</div><div class="metric-value sm">${previous?.candidates ?? 'â€”'}</div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Best Ever</div>
+        <div class="card-title">${escapeHtml(best?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${best?.best_composite != null ? best.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Model</div><div class="metric-value sm">${escapeHtml(best?.best_model || 'â€”')}</div></div>
+        <div class="metric"><div class="metric-label">Status</div><div class="metric-value sm">${escapeHtml(best?.final_run_status || 'â€”')}</div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Worst Retained</div>
+        <div class="card-title">${escapeHtml(worst?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${worst?.best_composite != null ? worst.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Delta vs Baseline</div><div class="metric-value sm" style="color:${runTrendColor(worst?.delta_vs_baseline)}">${fmtSigned(worst?.delta_vs_baseline, 4)}</div></div>
+        <div class="metric"><div class="metric-label">Accepted</div><div class="metric-value sm">${worst?.accepted ? 'YES' : 'NO'}</div></div>
+      </div>
+    `;
+  }
+
+  if(lineage){
+    const nodes = [
+      { label: 'Baseline', value: latest?.baseline_composite, note: latest?.baseline_model || 'baseline model', cls: '' },
+      { label: 'Previous Retained', value: previous?.best_composite, note: previous?.run_id || 'previous result', cls: 'best' },
+      { label: 'Latest Retained', value: latest?.best_composite, note: latest?.run_id || 'current result', cls: 'latest' },
+      { label: 'Best Ever', value: best?.best_composite, note: best?.best_model || 'top model', cls: 'best' },
+    ];
+    lineage.innerHTML = nodes.map((node, index) => `
+      <div class="run-node ${node.cls}">
+        <div class="mini">${escapeHtml(node.label)}</div>
+        <div class="headline">${node.value != null ? Number(node.value).toFixed(4) : 'â€”'}</div>
+        <div class="stat">${escapeHtml(node.note)}</div>
+        ${index === 0 || !Number.isFinite(Number(node.value)) || !Number.isFinite(Number(nodes[index-1].value))
+          ? ''
+          : `<div class="run-note">${fmtSigned((Number(node.value) - Number(nodes[index-1].value)), 4)} vs prior node</div>`}
+      </div>
+      ${index < nodes.length - 1 ? '<div class="run-arrow">→</div>' : ''}
+    `).join('');
+  }
+
+  if(tbody){
+    tbody.innerHTML = [...runHistory].reverse().map(run => {
+      const baseline = run.baseline_composite;
+      const bestScore = run.best_composite;
+      const deltaBase = run.delta_vs_baseline;
+      const deltaPrev = run.delta_vs_previous_best;
+      const rowClass = `${run.is_latest ? 'latest-row' : ''} ${run.is_best ? 'best-row' : ''}`.trim();
+      return `
+        <tr class="${rowClass}">
+          <td>${escapeHtml(compactRunLabel(run))}</td>
+          <td>${escapeHtml(String(run.run_timestamp || '').replace('Z',''))}</td>
+          <td><span class="badge ${statusBadgeClass(run.final_run_status)}">${escapeHtml(run.final_run_status || 'â€”')}</span></td>
+          <td>${baseline != null ? Number(baseline).toFixed(4) : 'â€”'}</td>
+          <td>${bestScore != null ? Number(bestScore).toFixed(4) : 'â€”'}</td>
+          <td style="color:${runTrendColor(deltaBase)}">${fmtSigned(deltaBase, 4)}</td>
+          <td style="color:${runTrendColor(deltaPrev)}">${fmtSigned(deltaPrev, 4)}</td>
+          <td>${run.candidates ?? 'â€”'}</td>
+          <td>${escapeHtml(run.best_model || 'â€”')}</td>
+          <td><span class="comparison-pill ${run.accepted ? 'good' : (run.final_run_status === 'success' ? 'neutral' : 'bad')}">${escapeHtml(run.validation_verdict || 'â€”')}</span></td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  renderRunCharts();
+}
+
+function renderRunCharts(){
+  const defaults = chartDefaults();
+  const labels = runHistory.map(run => compactRunLabel(run));
+  const bestScores = runHistory.map(run => numOrNull(run.best_composite));
+  const baselineScores = runHistory.map(run => numOrNull(run.baseline_composite));
+  const runningBest = [];
+  let bestSeen = null;
+  for(const value of bestScores){
+    if(value == null){
+      runningBest.push(null);
+      continue;
+    }
+    bestSeen = bestSeen == null ? value : Math.max(bestSeen, value);
+    runningBest.push(bestSeen);
+  }
+  const deltas = runHistory.map(run => numOrNull(run.delta_vs_previous_best));
+  const candidates = runHistory.map(run => numOrNull(run.candidates));
+  const statuses = runHistory.reduce((acc, run) => {
+    const key = String(run.final_run_status || 'unknown');
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const statusLabels = Object.keys(statuses);
+  const statusValues = statusLabels.map(key => statuses[key]);
+  const statusColors = statusLabels.map(key => {
+    const lower = key.toLowerCase();
+    if(lower.includes('success') || lower.includes('keep')) return theme('--green');
+    if(lower.includes('fail') || lower.includes('error') || lower.includes('revert')) return theme('--red');
+    if(lower.includes('warn') || lower.includes('running') || lower.includes('pending')) return theme('--yellow');
+    return theme('--accent');
+  });
+  const accent = theme('--accent');
+  const green = theme('--green');
+  const yellow = theme('--yellow');
+
+  if(chartRunHistory) chartRunHistory.destroy();
+  chartRunHistory = new Chart(document.getElementById('chart-run-history'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Baseline Composite', data: baselineScores, borderColor: yellow, backgroundColor: withAlpha(yellow, .14), borderWidth: 1.5, pointRadius: 2, tension: .25, fill: false },
+        { label: 'Best Composite', data: bestScores, borderColor: accent, backgroundColor: withAlpha(accent, .14), borderWidth: 2, pointRadius: 3, tension: .25, fill: false },
+        { label: 'Running Best', data: runningBest, borderColor: green, backgroundColor: withAlpha(green, .12), borderWidth: 2, pointRadius: 2, tension: .15, fill: true },
+      ]
+    },
+    options: { ...defaults, plugins: { ...defaults.plugins, legend: chartLegendOptions() } }
+  });
+
+  if(chartRunDelta) chartRunDelta.destroy();
+  chartRunDelta = new Chart(document.getElementById('chart-run-delta'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Delta vs Previous Retained', data: deltas, backgroundColor: deltas.map(v => withAlpha(runTrendColor(v), .24)), borderColor: deltas.map(v => runTrendColor(v)), borderWidth: 1.5, borderRadius: 4 }
+      ]
+    },
+    options: {
+      ...defaults,
+      plugins: { ...defaults.plugins, legend: { display: false } },
+      scales: {
+        ...defaults.scales,
+        y: { ...defaults.scales.y, title: { display: true, text: 'Composite delta' } }
+      }
+    }
+  });
+
+  if(chartRunMetrics) chartRunMetrics.destroy();
+  chartRunMetrics = new Chart(document.getElementById('chart-run-metrics'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { type: 'bar', label: 'Baseline', data: baselineScores, backgroundColor: withAlpha(yellow, .22), borderColor: yellow, borderWidth: 1.2, borderRadius: 4 },
+        { type: 'bar', label: 'Best', data: bestScores, backgroundColor: withAlpha(green, .22), borderColor: green, borderWidth: 1.2, borderRadius: 4 },
+        { type: 'line', label: 'Candidates', data: candidates, yAxisID: 'y1', borderColor: accent, backgroundColor: withAlpha(accent, .16), borderWidth: 2, pointRadius: 3, tension: .2 }
+      ]
+    },
+    options: {
+      ...defaults,
+      plugins: { ...defaults.plugins, legend: chartLegendOptions() },
+      scales: {
+        x: { grid: { color: withAlpha(theme('--border'), .7) }, ticks: { color: theme('--muted'), font: { family: 'Space Mono', size: 10 } } },
+        y: { grid: { color: withAlpha(theme('--border'), .7) }, ticks: { color: theme('--muted'), font: { family: 'Space Mono', size: 10 } }, title: { display: true, text: 'Composite score' } },
+        y1: {
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          ticks: { color: theme('--muted'), font: { family: 'Space Mono', size: 10 } },
+          title: { display: true, text: 'Candidates' }
+        }
+      }
+    }
+  });
+
+  if(chartRunStatus) chartRunStatus.destroy();
+  chartRunStatus = new Chart(document.getElementById('chart-run-status'), {
+    type: 'doughnut',
+    data: {
+      labels: statusLabels.length ? statusLabels : ['none'],
+      datasets: [{
+        data: statusLabels.length ? statusValues : [1],
+        backgroundColor: statusLabels.length ? statusColors.map(c => withAlpha(c, .24)) : [withAlpha(theme('--muted'), .24)],
+        borderColor: statusLabels.length ? statusColors : [theme('--muted')],
+        borderWidth: 1.5
+      }]
+    },
+    options: {
+      ...defaults,
+      cutout: '68%',
+      plugins: { ...defaults.plugins, legend: chartLegendOptions() }
+    }
+  });
+}
+
 async function loadLog() {
   allTrials = await fetch('/api/research_log').then(r=>r.json()).catch(()=>[]);
   renderLog();

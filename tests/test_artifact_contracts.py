@@ -158,6 +158,9 @@ class ArtifactContractTests(unittest.TestCase):
         self.assertEqual(mapped["holdout_metrics"]["stage"], "final_holdout")
         self.assertEqual(mapped["holdout_metrics"]["partition"], "holdout")
         self.assertEqual(mapped["selected_model"]["artifact_kind"], "search_selection")
+        self.assertEqual(mapped["selected_model"]["composite_score"], 0.0)
+        self.assertEqual(mapped["selected_model"]["validation_verdict"], "PASS")
+        self.assertEqual(mapped["selected_model"]["validation_metrics"]["rmse"], 3.1)
         self.assertTrue(mapped["deprecations"])
         self.assertIn("final_metrics.json", mapped["deprecations"][0]["source"])
 
