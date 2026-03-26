@@ -1604,6 +1604,9 @@ def save_json_artifact(path: Path, payload: dict[str, Any]) -> None:
     """Serialize a dictionary to JSON with stable formatting."""
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized_payload = to_serializable(payload)
+    from artifact_contracts import validate_artifact_payload
+
+    validate_artifact_payload(path.name, serialized_payload)
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
