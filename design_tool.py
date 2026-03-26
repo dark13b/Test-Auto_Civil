@@ -50,7 +50,7 @@ class MixDesignOptimizer:
         self.model_path = self._resolve_model_path(model_path)
         if not self.model_path.exists():
             raise FileNotFoundError(
-                f"Best search model not found at {self.model_path}. Run search.py before design_tool.py."
+                f"Best search model not found at {self.model_path}. Run research_loop.py before design_tool.py."
             )
 
         self.seed = int(self.config["experiment"]["random_seed"])

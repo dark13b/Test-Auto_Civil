@@ -1,4 +1,4 @@
-"""Academic benchmark runner for AutoCivil-Lab."""
+"""Evaluation-only academic benchmark runner for AutoCivil-Lab."""
 
 from __future__ import annotations
 
@@ -740,7 +740,7 @@ def write_markdown_report(
 
 
 def main() -> int:
-    """Run the academic benchmark and save comparison artifacts."""
+    """Run the evaluation-only academic benchmark and save comparison artifacts."""
     try:
         config = load_config()
         set_global_seed(int(config["experiment"]["random_seed"]))

@@ -2,6 +2,18 @@
 
 AutoCivil-Lab now runs as an autoresearch-style engineering ML system for concrete compressive-strength regression. The repo uses a governed scout -> confirm -> keep/revert loop, with `research_lab.py` as the controlled research surface, `research_brief.md` as the human strategy input, and an internal LLM proposal stack that can run through Ollama/Qwen, OpenAI, or a hybrid fallback path.
 
+## Official runtime
+
+The official runtime for core research is `research_loop.py`.
+
+```bash
+python research_loop.py --with-report
+```
+
+- Use `search.py` only as a deprecated compatibility wrapper.
+- Use `run_qwen_only.py` only when you specifically want the Qwen-only local backend wrapper.
+- Use `benchmark.py` only for post-run evaluation, not for core research execution.
+
 ## What this system actually does
 
 This system preserves the existing concrete-specific ML pipeline, feature engineering, validator, uncertainty estimation, and reporting stack. The infrastructure owns orchestration and artifact governance; the research surface owns what gets explored.
@@ -62,7 +74,7 @@ Use Python 3.10+ and install the dependencies:
 pip install -r requirements.txt
 ```
 
-## Execution order
+## Contributor path
 
 ```bash
 python generate_data.py
@@ -71,6 +83,8 @@ python research_loop.py --with-report
 python benchmark.py
 python design_tool.py --target 35
 ```
+
+If you are looking for the old `search.py` path, treat it as legacy compatibility only. New runtime work belongs in `research_loop.py`.
 
 ## Engineering Upgrades
 
@@ -145,8 +159,8 @@ python uncertainty.py
 - `outputs/baseline_model.pkl`: saved baseline `RandomForestRegressor`.
 - `outputs/baseline_metrics.json`: baseline CV metrics, test metrics, and engineering validation report.
 - `outputs/best_search_model.pkl`: current best model after the search loop.
-- `outputs/best_search_result.json`: full metadata for the best retained result.
-- `outputs/research_results.csv`: one row per scout or confirm experiment with metrics and selection status.
+- `outputs/best_search_result.json`: synchronized derivative of the canonical final research result.
+- `outputs/research_results.csv`: canonical per-experiment ledger for scout and confirm execution.
 - `outputs/optuna_results.csv`: backward-compatible mirror for existing reports and dashboards.
 - `outputs/research_log.txt`: timestamped scout/confirm research timeline.
 - `outputs/final_metrics.json`: consolidated baseline, best-search, holdout, and improvement metrics.
@@ -217,6 +231,7 @@ confirm_top_k: 2
 - final acceptance is written to `outputs/final_acceptance.json`, computed from `outputs/final_metrics.json`.
 
 See [`docs/autoresearch_workflow.md`](docs/autoresearch_workflow.md) for the end-to-end governed loop.
+See [`ARCHITECTURE_V2.md`](ARCHITECTURE_V2.md) for the canonical runtime contract and compatibility policy.
 
 ## LLM proposal modes
 

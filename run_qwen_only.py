@@ -1,4 +1,4 @@
-"""Run AutoCivil-Lab with Ollama restricted to Qwen3 4B/8B models."""
+"""Compatibility wrapper that runs the canonical research_loop with Qwen-only Ollama settings."""
 
 from __future__ import annotations
 

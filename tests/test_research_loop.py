@@ -425,6 +425,7 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 baseline_metrics: dict,
                 best_result: dict,
                 best_model_source_path: Path,
+                run_id: str,
             ) -> dict:
                 payload = {
                     "baseline_metrics": baseline_metrics,
@@ -619,6 +620,7 @@ class ResearchLoopPersistenceTests(unittest.TestCase):
                 baseline_metrics: dict,
                 best_result: dict,
                 best_model_source_path: Path,
+                run_id: str,
             ) -> dict:
                 payload = {
                     "baseline_metrics": baseline_metrics,

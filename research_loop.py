@@ -125,9 +125,10 @@ def run_engineering_research_loop(
     *,
     cycles_override: int | None = None,
     with_report: bool = False,
+    config_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the governed scout-confirm-keep research loop."""
-    config = load_config()
+    config = copy.deepcopy(config_override) if config_override is not None else load_config()
     set_global_seed(int(config["experiment"]["random_seed"]))
     outputs_dir = get_outputs_dir(config)
     baseline_metrics = _read_baseline_metrics(outputs_dir, config)
