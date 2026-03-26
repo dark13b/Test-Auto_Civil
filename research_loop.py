@@ -503,6 +503,8 @@ def run_engineering_research_loop(
                         model,
                         config=confirm_config,
                         model_id=experiment["model_name"],
+                        run_id=run_id,
+                        source_mode="research_loop",
                     )
                     current_best_result = copy.deepcopy(result)
                     _sync_final_artifacts_from_source_of_truth(

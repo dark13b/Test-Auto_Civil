@@ -989,6 +989,75 @@ def compute_config_hash(config: dict[str, Any] | None) -> str | None:
     return sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _resolve_path_candidate(project_root: Path, raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    candidate = Path(str(raw_path))
+    if not candidate.is_absolute():
+        candidate = project_root / candidate
+    return candidate
+
+
+def resolve_dataset_source_path(
+    config: dict[str, Any] | None,
+    *,
+    project_root: Path | None = None,
+) -> Path | None:
+    """Resolve the most specific dataset source path available from config."""
+    if not isinstance(config, dict):
+        return None
+    resolved_root = get_project_root() if project_root is None else project_root
+    candidates: list[Path] = []
+    local_file_path = (
+        config.get("data", {}).get("local_file", {}).get("path")
+        if isinstance(config.get("data", {}), dict)
+        else None
+    )
+    local_candidate = _resolve_path_candidate(resolved_root, None if local_file_path is None else str(local_file_path))
+    if local_candidate is not None:
+        candidates.append(local_candidate)
+    paths = config.get("paths", {})
+    if isinstance(paths, dict):
+        data_dir = paths.get("data_dir")
+        dataset_filename = paths.get("dataset_filename")
+        if data_dir and dataset_filename:
+            candidates.append(resolved_root / str(data_dir) / str(dataset_filename))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else None
+
+
+def compute_dataset_hash(
+    config: dict[str, Any] | None,
+    *,
+    project_root: Path | None = None,
+) -> str | None:
+    """Return a stable fingerprint for the active dataset when the source file is available."""
+    dataset_path = resolve_dataset_source_path(config, project_root=project_root)
+    if dataset_path is None:
+        return None
+    return compute_file_hash(dataset_path)
+
+
+def compute_feature_hash(
+    config: dict[str, Any] | None,
+    *,
+    project_root: Path | None = None,
+) -> str | None:
+    """Return a stable fingerprint for the active feature surface."""
+    if not isinstance(config, dict):
+        return None
+    resolved_root = get_project_root() if project_root is None else project_root
+    feature_payload = {
+        "input_columns": list(config.get("task", {}).get("input_columns", [])),
+        "engineering": config.get("engineering", {}),
+        "feature_engineering_file_hash": compute_file_hash(resolved_root / "feature_engineering.py"),
+    }
+    normalized = json.dumps(to_serializable(feature_payload), sort_keys=True, separators=(",", ":"))
+    return sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def get_git_commit_hash(project_root: Path | None = None) -> str | None:
     """Return the current git commit hash when available."""
     resolved_root = get_project_root() if project_root is None else project_root
@@ -1129,21 +1198,31 @@ def build_json_artifact_metadata(
     timestamp = pd.Timestamp.now().isoformat()
     canonical_path = outputs_dir / filename
     run_path = outputs_dir / RUN_ARTIFACTS_DIRNAME / run_id / filename
+    project_root = outputs_dir.parent
+    dataset_hash = compute_dataset_hash(config, project_root=project_root)
+    feature_hash = compute_feature_hash(config, project_root=project_root)
+    normalized_parent_run_ids = [str(item) for item in (parent_run_ids or []) if str(item)]
+    parent_run_id = normalized_parent_run_ids[0] if normalized_parent_run_ids else None
+    model_fingerprint = model_artifact_id or model_id
     metadata = {
         "artifact_schema_version": 1,
         "artifact_name": filename,
         "artifact_type": "json",
         "run_id": run_id,
+        "parent_run_id": parent_run_id,
+        "parent_run_ids": normalized_parent_run_ids,
         "timestamp": timestamp,
         "source_mode": source_mode,
         "config_hash": compute_config_hash(config),
+        "dataset_hash": dataset_hash,
+        "feature_hash": feature_hash,
         "code_fingerprint": {
-            "git_commit": get_git_commit_hash(outputs_dir.parent),
+            "git_commit": get_git_commit_hash(project_root),
         },
         "model_artifact_id": model_artifact_id,
         "model_id": model_id,
+        "model_fingerprint": model_fingerprint,
         "parent_artifact_ids": list(parent_artifact_ids or []),
-        "parent_run_ids": list(parent_run_ids or []),
         "canonical_path": str(canonical_path),
         "run_scoped_path": str(run_path),
         "canonical_latest": True,
@@ -1184,13 +1263,23 @@ def _update_run_manifest(outputs_dir: Path, metadata: dict[str, Any]) -> None:
         }
     manifest.setdefault("artifacts", {})
     manifest["updated_at"] = metadata["timestamp"]
+    for key in ("config_hash", "dataset_hash", "feature_hash"):
+        if metadata.get(key) is not None:
+            manifest[key] = metadata.get(key)
     manifest["artifacts"][str(metadata["artifact_name"])] = {
         "artifact_id": metadata["artifact_id"],
         "source_mode": metadata["source_mode"],
         "timestamp": metadata["timestamp"],
         "canonical_path": metadata["canonical_path"],
         "run_scoped_path": metadata["run_scoped_path"],
+        "config_hash": metadata.get("config_hash"),
+        "dataset_hash": metadata.get("dataset_hash"),
+        "feature_hash": metadata.get("feature_hash"),
+        "model_id": metadata.get("model_id"),
         "model_artifact_id": metadata.get("model_artifact_id"),
+        "model_fingerprint": metadata.get("model_fingerprint"),
+        "parent_run_id": metadata.get("parent_run_id"),
+        "parent_run_ids": list(metadata.get("parent_run_ids", [])),
         "parent_artifact_ids": list(metadata.get("parent_artifact_ids", [])),
     }
     save_json_artifact(manifest_path, manifest)
@@ -1198,6 +1287,9 @@ def _update_run_manifest(outputs_dir: Path, metadata: dict[str, Any]) -> None:
         "run_id": run_id,
         "updated_at": metadata["timestamp"],
         "manifest_path": str(manifest_path),
+        "config_hash": metadata.get("config_hash"),
+        "dataset_hash": metadata.get("dataset_hash"),
+        "feature_hash": metadata.get("feature_hash"),
         "artifacts": manifest["artifacts"],
     }
     save_json_artifact(outputs_dir / "latest_run_manifest.json", latest_manifest)
@@ -1236,8 +1328,21 @@ def write_run_scoped_json_artifact(
     enriched_payload["timestamp"] = metadata["timestamp"]
     enriched_payload["source_mode"] = metadata["source_mode"]
     enriched_payload["parent_artifact_ids"] = list(metadata["parent_artifact_ids"])
+    enriched_payload["parent_run_ids"] = list(metadata.get("parent_run_ids", []))
+    if metadata.get("parent_run_id") is not None:
+        enriched_payload["parent_run_id"] = metadata["parent_run_id"]
+    if metadata.get("config_hash") is not None:
+        enriched_payload["config_hash"] = metadata["config_hash"]
+    if metadata.get("dataset_hash") is not None:
+        enriched_payload["dataset_hash"] = metadata["dataset_hash"]
+    if metadata.get("feature_hash") is not None:
+        enriched_payload["feature_hash"] = metadata["feature_hash"]
+    if metadata.get("model_id") is not None:
+        enriched_payload["model_id"] = metadata["model_id"]
     if metadata.get("model_artifact_id") is not None:
         enriched_payload["model_artifact_id"] = metadata["model_artifact_id"]
+    if metadata.get("model_fingerprint") is not None:
+        enriched_payload["model_fingerprint"] = metadata["model_fingerprint"]
     enriched_payload["artifact_metadata"] = metadata
 
     canonical_path = outputs_dir / filename
@@ -1311,15 +1416,19 @@ def build_pickle_artifact_metadata(
     run_id: str | None = None,
     source_mode: str | None = None,
     parent_artifact_ids: list[str] | None = None,
+    parent_run_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build metadata stored alongside pickled model artifacts."""
     saved_at = pd.Timestamp.now().isoformat()
+    normalized_parent_run_ids = [str(item) for item in (parent_run_ids or []) if str(item)]
+    parent_run_id = normalized_parent_run_ids[0] if normalized_parent_run_ids else None
     artifact_key = json.dumps(
         {
             "saved_at": saved_at,
             "model_id": model_id or type(obj).__name__,
             "run_id": run_id,
             "source_mode": source_mode,
+            "parent_run_ids": normalized_parent_run_ids,
             "parent_artifact_ids": list(parent_artifact_ids or []),
         },
         sort_keys=True,
@@ -1331,9 +1440,14 @@ def build_pickle_artifact_metadata(
         "saved_at": saved_at,
         "model_id": model_id or type(obj).__name__,
         "config_hash": compute_config_hash(config),
+        "dataset_hash": compute_dataset_hash(config),
+        "feature_hash": compute_feature_hash(config),
         "run_id": run_id,
+        "parent_run_id": parent_run_id,
+        "parent_run_ids": normalized_parent_run_ids,
         "source_mode": source_mode,
         "parent_artifact_ids": list(parent_artifact_ids or []),
+        "model_fingerprint": model_id or type(obj).__name__,
         "artifact_id": sha256(artifact_key.encode("utf-8")).hexdigest(),
         "code_fingerprint": {
             "git_commit": get_git_commit_hash(),
@@ -1386,6 +1500,7 @@ def save_pickle_artifact(
     run_id: str | None = None,
     source_mode: str | None = None,
     parent_artifact_ids: list[str] | None = None,
+    parent_run_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Serialize an object as a pickle file with backward-compatible metadata."""
     metadata = build_pickle_artifact_metadata(
@@ -1395,6 +1510,7 @@ def save_pickle_artifact(
         run_id=run_id,
         source_mode=source_mode,
         parent_artifact_ids=parent_artifact_ids,
+        parent_run_ids=parent_run_ids,
     )
     artifact_bundle = {
         "artifact_metadata": metadata,

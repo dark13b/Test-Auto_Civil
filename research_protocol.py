@@ -6,7 +6,6 @@ import ast
 import copy
 import json
 import math
-import pprint
 import re
 from pathlib import Path
 from typing import Any
@@ -15,6 +14,7 @@ import pandas as pd
 import yaml
 
 from novelty_scorer import NoveltyScorer
+from state_store import JSONStateStore, build_default_lab_state, default_runtime_state_path
 
 
 RESEARCH_SURFACE_STATE_START = "# RESEARCH_SURFACE_STATE_START"
@@ -1076,7 +1076,22 @@ def trial_budget_status(*, elapsed_seconds: float, max_trial_seconds: float) -> 
 
 
 def read_research_surface_state(research_lab_path: Path) -> dict[str, Any]:
-    """Read the mutable LAB_STATE block from research_lab.py."""
+    """Read runtime research state from the persisted store, migrating legacy LAB_STATE when needed."""
+    state = _get_research_state_store(research_lab_path).load_or_migrate(
+        legacy_path=research_lab_path,
+        legacy_loader=_read_legacy_research_surface_state,
+        default_state=build_default_lab_state(),
+    )
+    validate_lab_state_integrity(state)
+    return state
+
+
+def _get_research_state_store(research_lab_path: Path) -> JSONStateStore:
+    return JSONStateStore(default_runtime_state_path(research_lab_path.parent))
+
+
+def _read_legacy_research_surface_state(research_lab_path: Path) -> dict[str, Any]:
+    """Read the legacy checked-in LAB_STATE block from research_lab.py."""
     raw_text = research_lab_path.read_text(encoding="utf-8")
     pattern = re.compile(
         rf"{re.escape(RESEARCH_SURFACE_STATE_START)}\n(?P<body>.*?)\n{re.escape(RESEARCH_SURFACE_STATE_END)}",
@@ -1097,22 +1112,12 @@ def read_research_surface_state(research_lab_path: Path) -> dict[str, Any]:
 
 
 def write_research_surface_state(research_lab_path: Path, state: dict[str, Any]) -> None:
-    """Rewrite the mutable LAB_STATE block inside research_lab.py."""
-    raw_text = research_lab_path.read_text(encoding="utf-8")
-    state_literal = pprint.pformat(_to_serializable(state), sort_dicts=True, width=100)
-    replacement = (
-        f"{RESEARCH_SURFACE_STATE_START}\n"
-        f"LAB_STATE = {state_literal}\n"
-        f"{RESEARCH_SURFACE_STATE_END}"
+    """Persist runtime research state without rewriting source files."""
+    validate_lab_state_integrity(state)
+    _get_research_state_store(research_lab_path).save_state(
+        copy.deepcopy(state),
+        migrated_from=str(research_lab_path) if research_lab_path.exists() else None,
     )
-    pattern = re.compile(
-        rf"{re.escape(RESEARCH_SURFACE_STATE_START)}\n.*?\n{re.escape(RESEARCH_SURFACE_STATE_END)}",
-        flags=re.DOTALL,
-    )
-    updated_text, replacements = pattern.subn(replacement, raw_text, count=1)
-    if replacements != 1:
-        raise ValueError(f"Failed to rewrite LAB_STATE block in {research_lab_path}")
-    research_lab_path.write_text(updated_text, encoding="utf-8")
 
 
 def validate_lab_state_integrity(lab_state: dict[str, Any]) -> dict[str, Any]:
