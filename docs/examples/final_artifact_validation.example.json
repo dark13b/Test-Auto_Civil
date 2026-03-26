@@ -1,5 +1,5 @@
 {
   "consistent": true,
   "mismatches": [],
-  "source_of_truth": "final_metrics.json"
+  "source_of_truth": "best_search_result.json"
 }

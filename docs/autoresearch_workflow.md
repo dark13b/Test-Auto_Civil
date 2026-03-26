@@ -40,5 +40,6 @@
 `outputs/llm_interactions.jsonl` now records the raw response channel, raw thinking channel, final extracted text, `extracted_from_channel`, `repair_used`, duplicate rejection metadata, regeneration attempts, and deterministic fallback usage.
 
 ## Source of truth
-- `outputs/final_metrics.json` is canonical.
-- `best_search_result.json` and `best_search_model.pkl` are synchronized from that canonical result.
+- `outputs/best_search_result.json` is canonical for search-time selection and acceptance.
+- `outputs/final_holdout_evaluation.json` is canonical for terminal holdout reporting.
+- `best_search_model.pkl` stays aligned with `best_search_result.json`.

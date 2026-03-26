@@ -39,7 +39,7 @@ Additional autoresearch-style controls now included:
 - Proposal diversity tracking in `outputs/proposal_diversity.json`
 - Optional per-trial runtime budget via `research.max_trial_seconds`
 - Final artifact consistency validation in `outputs/final_artifact_validation.json`
-- Final acceptance decision in `outputs/final_acceptance.json` based on `outputs/final_metrics.json`
+- Final acceptance decision in `outputs/final_acceptance.json` based on `outputs/best_search_result.json`
 
 ## Project structure
 
@@ -157,17 +157,17 @@ python uncertainty.py
 ## Output files
 
 - `outputs/baseline_model.pkl`: saved baseline `RandomForestRegressor`.
-- `outputs/baseline_metrics.json`: baseline CV metrics, test metrics, and engineering validation report.
+- `outputs/baseline_metrics.json`: baseline CV metrics and engineering validation report.
 - `outputs/best_search_model.pkl`: current best model after the search loop.
-- `outputs/best_search_result.json`: synchronized derivative of the canonical final research result.
+- `outputs/best_search_result.json`: canonical search-selection artifact with cross-validation and selection-validation metrics.
 - `outputs/research_results.csv`: canonical per-experiment ledger for scout and confirm execution.
 - `outputs/optuna_results.csv`: backward-compatible mirror for existing reports and dashboards.
 - `outputs/research_log.txt`: timestamped scout/confirm research timeline.
-- `outputs/final_metrics.json`: consolidated baseline, best-search, holdout, and improvement metrics.
-- `outputs/final_acceptance.json`: acceptance gate computed from `final_metrics.json` and `research_brief.md` thresholds.
+- `outputs/final_holdout_evaluation.json`: canonical terminal holdout artifact written only by the final report step.
+- `outputs/final_acceptance.json`: acceptance gate computed from `best_search_result.json` and `research_brief.md` thresholds.
 - `outputs/experiment_memory.json`: cross-run memory of trial signatures, stages, and keep decisions.
 - `outputs/proposal_diversity.json`: diversity summary for the governed research loop.
-- `outputs/final_artifact_validation.json`: final artifact consistency report anchored to `final_metrics.json`.
+- `outputs/final_artifact_validation.json`: final artifact consistency report anchored to `best_search_result.json`.
 - `outputs/search_progress.png`: trial composite scores versus baseline.
 - `outputs/actual_vs_predicted.png`: holdout actual-vs-predicted scatter plot.
 - `outputs/residuals_plot.png`: residual structure plot for the best model.
@@ -228,7 +228,7 @@ confirm_top_k: 2
 - `required_model_families`: constrains the active proposal surface to those enabled families.
 - `min_improvement_pct`: required measured gain for final acceptance.
 - `research_lab.py`: the controlled research-editable file that defines scout and confirm behavior.
-- final acceptance is written to `outputs/final_acceptance.json`, computed from `outputs/final_metrics.json`.
+- final acceptance is written to `outputs/final_acceptance.json`, computed from `outputs/best_search_result.json`.
 
 See [`docs/autoresearch_workflow.md`](docs/autoresearch_workflow.md) for the end-to-end governed loop.
 See [`ARCHITECTURE_V2.md`](ARCHITECTURE_V2.md) for the canonical runtime contract and compatibility policy.
@@ -280,7 +280,7 @@ What it is not allowed to do:
 - override keep/revert decisions
 - redefine the final artifact source of truth
 
-`outputs/final_metrics.json` remains canonical even when LLM proposals are enabled.
+`outputs/best_search_result.json` remains the selection-time source of truth even when LLM proposals are enabled, and `outputs/final_holdout_evaluation.json` remains terminal-only.
 
 `outputs/llm_interactions.jsonl` now records the prompt variant, raw response/thinking channels, the final extracted text, `extracted_from_channel`, JSON repair usage, duplicate rejection metadata, regeneration attempts, fallback usage, and the final parsed candidate. This makes empty-response / thinking-text recoveries explicit instead of silent.
 

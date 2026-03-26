@@ -23,10 +23,11 @@
 
 ## Artifact source of truth
 
-The final persisted source of truth for a completed research run is `outputs/final_metrics.json`.
+The final persisted source of truth is split by lifecycle stage.
 
-- `outputs/final_metrics.json` is the canonical summary of the accepted best research result.
-- `outputs/best_search_result.json` and `outputs/search_state_best_result.json` are synchronized derivatives of that canonical result.
+- `outputs/best_search_result.json` is the canonical search-selection artifact and the source of truth for acceptance.
+- `outputs/final_holdout_evaluation.json` is the canonical terminal holdout artifact written only by `report.py`.
+- `outputs/search_state_best_result.json` is the live synchronized search-state mirror of the current best selection result.
 - `outputs/best_search_model.pkl` and `outputs/search_state_best_model.pkl` are synchronized copies of the same winning model artifact.
 - `outputs/research_results.csv` is the canonical per-experiment ledger for scout/confirm execution.
 - `outputs/optuna_results.csv` is a compatibility mirror of `outputs/research_results.csv` and must not become an independent decision source.
@@ -49,7 +50,7 @@ Legacy or alternate entry points are allowed only if they do not own unique busi
 
 - Wrappers may translate flags or config shape, but they must delegate execution to `research_loop`.
 - Deprecation behavior must be explicit: warnings in Python entry points, and obvious messaging in docs/launchers.
-- Compatibility artifacts may remain for existing dashboards and reports, but canonical decisions must come from the research-loop outputs named above.
+- Deprecated compatibility reads may remain for `final_metrics.json`, but new writes must target the canonical artifacts named above.
 - New runtime features belong in `research_loop.py` and its dedicated helper modules, not in wrapper entry points.
 
 ## Contributor default path
