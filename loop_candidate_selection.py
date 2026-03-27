@@ -7,6 +7,7 @@ from typing import Any
 
 import research_lab
 
+from proposal_contract import ProposalRequest
 from proposal_engine import ProposalContext, ProposalProvider, get_proposals
 from research_protocol import filter_diverse_candidates
 
@@ -69,8 +70,36 @@ def select_scout_candidates(
         config=context,
         trial_budget_remaining=int(scout_limit),
     )
-    if hasattr(proposal_engine, "get_proposals"):
+    if hasattr(proposal_engine, "generate_candidates"):
+        batch = proposal_engine.generate_candidates(
+            ProposalRequest(
+                brief=brief,
+                lab_state=lab_state,
+                available_models=available_models,
+                memory_payload=memory_payload,
+                current_best=current_best,
+                scout_limit=scout_limit,
+                trial_history=list(trial_history or []),
+                search_progress=dict(search_progress or {}),
+                failure_patterns=dict(failure_patterns or {}),
+                knowledge_context=knowledge_context or "",
+                archive_records=list(archive_records or []),
+                exploit_delta_ratio=exploit_delta_ratio,
+            )
+        )
+        llm_candidates = list(batch.candidates)
+        metadata = dict(batch.metadata)
+    elif hasattr(proposal_engine, "get_proposals"):
         llm_candidates = proposal_engine.get_proposals(proposal_context, n=scout_limit)
+        metadata = {
+            "proposal_mode": "llm",
+            "proposal_status": "llm_success",
+            "proposal_backend": "proposal_provider",
+            "proposal_count": len(llm_candidates),
+            "proposal_model": None,
+            "prompt_variant": None,
+            "proposal_error": None,
+        }
     elif hasattr(proposal_engine, "generate_research_proposals"):
         try:
             llm_result = proposal_engine.generate_research_proposals(
@@ -94,6 +123,15 @@ def select_scout_candidates(
                 raise
         else:
             llm_candidates = list(llm_result.get("proposals", [])) if isinstance(llm_result, dict) else list(llm_result or [])
+        metadata = {
+            "proposal_mode": "llm",
+            "proposal_status": str(llm_result.get("status", "llm_success")) if "llm_result" in locals() and isinstance(llm_result, dict) else "llm_success",
+            "proposal_backend": str(llm_result.get("backend")) if "llm_result" in locals() and isinstance(llm_result, dict) else "proposal_provider",
+            "proposal_count": len(llm_candidates),
+            "proposal_model": llm_result.get("model") if "llm_result" in locals() and isinstance(llm_result, dict) else None,
+            "prompt_variant": llm_result.get("prompt_variant") if "llm_result" in locals() and isinstance(llm_result, dict) else None,
+            "proposal_error": llm_result.get("error") if "llm_result" in locals() and isinstance(llm_result, dict) else None,
+        }
     else:
         llm_candidates = get_proposals(
             context,
@@ -101,6 +139,15 @@ def select_scout_candidates(
             logger=LOGGER,
             n=scout_limit,
         )
+        metadata = {
+            "proposal_mode": "llm",
+            "proposal_status": "llm_success",
+            "proposal_backend": "proposal_provider",
+            "proposal_count": len(llm_candidates),
+            "proposal_model": None,
+            "prompt_variant": None,
+            "proposal_error": None,
+        }
     llm_candidates = [
         candidate.__dict__ if hasattr(candidate, "__dict__") and not isinstance(candidate, dict) else candidate
         for candidate in llm_candidates
@@ -114,15 +161,8 @@ def select_scout_candidates(
         scout_limit=scout_limit,
     )
     if llm_candidates:
-        return llm_candidates, {
-            "proposal_mode": "llm",
-            "proposal_status": "llm_success",
-            "proposal_backend": "proposal_provider",
-            "proposal_count": len(llm_candidates),
-            "proposal_model": None,
-            "prompt_variant": None,
-            "proposal_error": None,
-        }
+        metadata["proposal_count"] = len(llm_candidates)
+        return llm_candidates, metadata
     if allow_deterministic_fallback:
         deterministic_candidates = research_lab.scout_experiments(
             brief=brief,

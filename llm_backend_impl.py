@@ -13,7 +13,7 @@ from typing import Any
 # Declared in requirements.txt for reproducible backend installs.
 import requests
 
-from model_routing import resolve_model_for_backend
+from proposal_backend_policy import resolve_backend_policy, resolve_model_for_backend
 
 
 DEFAULT_LLM_CONFIG: dict[str, Any] = {
@@ -651,29 +651,28 @@ class HybridBackend(LLMBackend):
 def resolve_backend(config: dict[str, Any]) -> LLMBackend:
     """Build the configured backend implementation."""
     llm_config = get_llm_config(config)
-    if not llm_config.get("enabled", False):
+    resolution = resolve_backend_policy({"llm": llm_config})
+    if not resolution.llm_enabled:
         return NullBackend()
 
-    mode = str(llm_config.get("backend_mode", "ollama")).lower()
+    mode = str(resolution.backend_mode or "ollama").lower()
     if mode == "ollama":
-        return OllamaBackend(config)
+        return OllamaBackend({"llm": llm_config})
     if mode == "openai":
-        return OpenAIBackend(config)
+        return OpenAIBackend({"llm": llm_config})
     if mode == "hybrid":
-        primary_name = str(llm_config.get("hybrid", {}).get("primary", "ollama")).lower()
-        fallback_name = str(llm_config.get("hybrid", {}).get("fallback", "openai")).lower()
         available = {
-            "ollama": OllamaBackend(config),
-            "openai": OpenAIBackend(config),
+            "ollama": OllamaBackend({"llm": llm_config}),
+            "openai": OpenAIBackend({"llm": llm_config}),
         }
-        return HybridBackend(primary=available.get(primary_name, available["ollama"]), fallback=available.get(fallback_name, available["openai"]))
+        primary_name = str(resolution.primary_backend or "ollama")
+        fallback_name = str(resolution.fallback_backend or "openai")
+        return HybridBackend(
+            primary=available.get(primary_name, available["ollama"]),
+            fallback=available.get(fallback_name, available["openai"]),
+        )
     raise ValueError(f"Unsupported llm.backend_mode: {mode}")
 
 
 def build_backend(config: dict[str, Any]):
-    provider = config.get("llm", {}).get("provider", "ollama")
-    if provider == "ollama":
-        return OllamaBackend(config)
-    if provider == "openai":
-        return OpenAIBackend(config)
-    raise ValueError(f"Unknown LLM provider: {provider}")
+    return resolve_backend(config)

@@ -26,6 +26,7 @@ from proposal_parsing import extract_proposals
 from proposal_prompting import build_prompt
 from policy_layer import PolicyLayer
 from llm_backend import extract_text_channels
+from proposal_service import ProposalService
 
 
 class ProposalEngine(_ProposalEngineImpl):
@@ -55,6 +56,7 @@ __all__ = [
     "ProposalBackendFailure",
     "ProposalContext",
     "ProposalEngine",
+    "ProposalService",
     "ProposalExtractionError",
     "ProposalGenerationError",
     "ProposalParseFailure",

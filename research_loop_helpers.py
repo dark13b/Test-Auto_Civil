@@ -12,9 +12,7 @@ import pandas as pd
 from artifact_contracts import get_selection_validation_aggregate, map_deprecated_artifact_payload
 from hypothesis_archive import HypothesisArchive
 from knowledge_base import get_knowledge_context
-from deterministic_proposal_provider import DeterministicProposalProvider
-from hybrid_proposal_provider import HybridProposalProvider
-from llm_proposal_provider import LLMProposalProvider
+from proposal_service import ProposalService
 from train_impl import EngineeringValidator, evaluate_candidate
 from research_protocol import RESEARCH_RESULTS_COLUMNS, load_json_file
 
@@ -356,14 +354,7 @@ def _propagate_confirm_metadata(
 
 
 def _build_proposal_provider(config: dict[str, Any]):
-    llm_config = dict(config.get("llm", {}))
-    llm_provider = LLMProposalProvider(config=config)
-    det_provider = DeterministicProposalProvider(None, config)
-    return HybridProposalProvider(
-        llm_provider=llm_provider,
-        deterministic_provider=det_provider,
-        min_llm_proposals=int(llm_config.get("min_proposals", 1)),
-    )
+    return ProposalService(config=config)
 
 
 def _build_proposal_engine(config: dict[str, Any], outputs_dir: Path):
