@@ -85,6 +85,102 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(normalized["validation_composite"], 0.8)
         self.assertEqual(normalized["holdout_composite"], 0.84)
 
+    def test_validation_details_exposes_distinct_metric_sources(self) -> None:
+        dashboard = importlib.import_module("dashboard")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "best_search_result.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "search_selection",
+                        "model_name": "LGBMRegressor",
+                        "cross_validation": {
+                            "stage": "cross_validation",
+                            "partition": "train",
+                            "aggregate": {
+                                "rmse": 5.0,
+                                "mae": 4.0,
+                                "r2": 0.61,
+                                "composite_score": 0.82,
+                            },
+                        },
+                        "selection_validation": {
+                            "stage": "selection_validation",
+                            "partition": "validation",
+                            "aggregate": {
+                                "rmse": 2.0,
+                                "mae": 1.0,
+                                "r2": 0.7,
+                                "composite_score": 0.80,
+                            },
+                        },
+                        "selection_validation_report": {
+                            "verdict": "PASS",
+                            "pass_rate": 1.0,
+                            "hard_constraint_count": 0,
+                            "engineering_caution_count": 0,
+                            "data_review_flag_count": 0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "final_holdout_evaluation",
+                        "selected_model": {"model_name": "LGBMRegressor"},
+                        "holdout_metrics": {
+                            "stage": "final_holdout",
+                            "partition": "holdout",
+                            "aggregate": {
+                                "rmse": 1.0,
+                                "mae": 0.5,
+                                "r2": 0.8,
+                                "composite_score": 0.84,
+                            },
+                        },
+                        "holdout_validation_report": {
+                            "verdict": "WARN",
+                            "pass_rate": 0.92,
+                            "hard_constraint_count": 1,
+                            "engineering_caution_count": 2,
+                            "data_review_flag_count": 3,
+                        },
+                        "uncertainty_audit": {
+                            "artifact_kind": "uncertainty_audit",
+                            "audit_partition": "holdout",
+                            "calibration_partition": "validation_audit",
+                            "coverage_target": 0.9,
+                            "coverage": 0.92,
+                            "coverage_audit": {"expected_partition": "holdout"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "OUTPUTS_DIR", outputs_dir), patch.object(
+                dashboard,
+                "DASHBOARD_PASSWORD",
+                "dummy",
+            ):
+                client = dashboard.app.test_client()
+                response = client.get(
+                    "/api/validation_details",
+                    headers={"Authorization": "Basic YXV0b2NpdmlsOmR1bW15"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["cross_validation"]["source_type"], "cross_validation")
+        self.assertEqual(payload["validation_metrics"]["source_type"], "selection_validation")
+        self.assertEqual(payload["holdout_metrics"]["source_type"], "holdout_metrics")
+        self.assertEqual(payload["cross_validation"]["aggregate"]["composite_score"], 0.82)
+        self.assertEqual(payload["validation_metrics"]["aggregate"]["composite_score"], 0.80)
+        self.assertEqual(payload["holdout_metrics"]["aggregate"]["composite_score"], 0.84)
+        self.assertEqual(payload["holdout_metrics"]["source_label"], "Final holdout metrics")
+        self.assertEqual(payload["uncertainty_audit"]["source_type"], "uncertainty_audit")
+
     def test_dashboard_requires_auth_even_without_env_password(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             dashboard = importlib.reload(importlib.import_module("dashboard"))
@@ -245,7 +341,29 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         page = response.get_data(as_text=True)
-        self.assertIn("const bestMetricSource =", page)
+        self.assertIn("Cross-validation metrics", page)
+        self.assertIn("Final holdout metrics", page)
+        self.assertNotIn("const bestMetricSource =", page)
+        self.assertNotIn("best.holdout_composite||best.val_composite", page)
+
+    def test_dashboard_template_renders_source_labeled_panels(self) -> None:
+        dashboard = importlib.import_module("dashboard")
+        with patch.object(dashboard, "DASHBOARD_PASSWORD", "dummy"):
+            client = dashboard.app.test_client()
+            response = client.get(
+                "/",
+                headers={"Authorization": "Basic YXV0b2NpdmlsOmR1bW15"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        page = response.get_data(as_text=True)
+        self.assertIn("Cross-validation metrics", page)
+        self.assertIn("Validation metrics", page)
+        self.assertIn("Final holdout metrics", page)
+        self.assertIn("Uncertainty audit", page)
+        self.assertIn("Design scenarios / trade-offs", page)
+        self.assertNotIn("holdout_composite||best.val_composite", page)
+        self.assertNotIn("best.holdout_r2||best.r2", page)
 
     def test_api_overview_ignores_stale_final_metrics(self) -> None:
         dashboard = importlib.import_module("dashboard")

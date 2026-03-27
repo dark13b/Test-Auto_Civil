@@ -122,6 +122,9 @@ def build_share_snapshot_payload():
         "best_composite": best.get("holdout_composite") or best.get("cv_composite") or best.get("composite"),
         "composite_improvement_pct": final.get("composite_improvement_pct"),
         "validation_verdict": best.get("validation_verdict") or best.get("validation"),
+        "validation_source_label": "Validation metrics",
+        "holdout_source_label": final.get("holdout_source_label") or "Final holdout metrics",
+        "uncertainty_source_label": final.get("uncertainty_source_label") or "Uncertainty audit",
     }
 
 def load_required_output_json(filename):
@@ -367,7 +370,112 @@ def normalize_final_payload(payload):
     normalized["composite_improvement_pct"] = coerce_number(
         normalized.get("composite_improvement_pct") or normalized.get("improvement_percentage")
     )
+    holdout_metrics = normalized.get("holdout_metrics") or {}
+    if isinstance(holdout_metrics, dict) and isinstance(holdout_metrics.get("aggregate"), dict):
+        holdout_metrics = holdout_metrics.get("aggregate") or {}
+    normalized["holdout_source_type"] = "holdout_metrics" if holdout_metrics else None
+    normalized["holdout_source_label"] = "Final holdout metrics" if holdout_metrics else None
+    normalized["holdout_rmse"] = coerce_number(holdout_metrics.get("rmse"))
+    normalized["holdout_mae"] = coerce_number(holdout_metrics.get("mae"))
+    normalized["holdout_r2"] = coerce_number(holdout_metrics.get("r2"))
+    normalized["holdout_composite"] = coerce_number(
+        normalized.get("holdout_composite") or holdout_metrics.get("composite_score")
+    )
+    uncertainty_audit = normalized.get("uncertainty_audit") or {}
+    if not isinstance(uncertainty_audit, dict):
+        uncertainty_audit = {}
+    normalized["uncertainty_source_type"] = "uncertainty_audit" if uncertainty_audit else None
+    normalized["uncertainty_source_label"] = "Uncertainty audit" if uncertainty_audit else None
+    normalized["uncertainty_coverage"] = coerce_number(uncertainty_audit.get("coverage"))
+    normalized["uncertainty_coverage_target"] = coerce_number(uncertainty_audit.get("coverage_target"))
     return normalized
+
+def summarize_metric_source(source_payload, *, source_type, source_label):
+    source = source_payload if isinstance(source_payload, dict) else {}
+    aggregate = source.get("aggregate") if isinstance(source.get("aggregate"), dict) else {}
+    return {
+        "source_type": source_type,
+        "source_label": source_label,
+        "stage": source.get("stage") or source_type,
+        "partition": source.get("partition"),
+        "available": bool(source),
+        "aggregate": {
+            "rmse": coerce_number(aggregate.get("rmse")),
+            "mae": coerce_number(aggregate.get("mae")),
+            "r2": coerce_number(aggregate.get("r2")),
+            "composite_score": coerce_number(aggregate.get("composite_score")),
+        },
+    }
+
+def summarize_validation_report_source(report_payload, *, source_type, source_label):
+    report = report_payload if isinstance(report_payload, dict) else {}
+    return {
+        "source_type": source_type,
+        "source_label": source_label,
+        "verdict": report.get("verdict") or report.get("overall_verdict") or report.get("pass_fail") or "N/A",
+        "pass_rate": coerce_number(report.get("pass_rate")),
+        "hard_constraint_count": int(coerce_number(report.get("hard_constraint_count") or report.get("hard_failed_count") or report.get("failed_count")) or 0),
+        "engineering_caution_count": int(coerce_number(report.get("engineering_caution_count") or report.get("durability_caution_count")) or 0),
+        "data_review_flag_count": int(coerce_number(report.get("data_review_flag_count") or report.get("dataset_anomaly_count") or report.get("suspicious_count")) or 0),
+        "contextual_summary": report.get("contextual_summary") or "",
+        "confidence_of_warning_assessment": report.get("confidence_of_warning_assessment") or "",
+        "source_available": bool(report),
+    }
+
+def build_validation_details_payload(best_source, final_raw):
+    best = best_source if isinstance(best_source, dict) else {}
+    final = final_raw if isinstance(final_raw, dict) else {}
+    cv_metrics = summarize_metric_source(
+        best.get("cross_validation") or best.get("cv_metrics") or best.get("cv"),
+        source_type="cross_validation",
+        source_label="Cross-validation metrics",
+    )
+    validation_metrics = summarize_metric_source(
+        best.get("selection_validation") or best.get("validation_metrics") or best.get("selection_metrics") or best.get("val_metrics"),
+        source_type="selection_validation",
+        source_label="Validation metrics",
+    )
+    holdout_metrics = summarize_metric_source(
+        final.get("holdout_metrics"),
+        source_type="holdout_metrics",
+        source_label="Final holdout metrics",
+    )
+    uncertainty_audit = summarize_metric_source(
+        final.get("uncertainty_audit"),
+        source_type="uncertainty_audit",
+        source_label="Uncertainty audit",
+    )
+    uncertainty_audit["coverage"] = coerce_number((final.get("uncertainty_audit") or {}).get("coverage"))
+    uncertainty_audit["coverage_target"] = coerce_number((final.get("uncertainty_audit") or {}).get("coverage_target"))
+    uncertainty_audit["coverage_audit"] = (final.get("uncertainty_audit") or {}).get("coverage_audit") or {}
+    uncertainty_audit["audit_partition"] = (final.get("uncertainty_audit") or {}).get("audit_partition")
+    uncertainty_audit["calibration_partition"] = (final.get("uncertainty_audit") or {}).get("calibration_partition")
+    uncertainty_audit["strength_bin_audit"] = (final.get("uncertainty_audit") or {}).get("strength_bin_audit") or {}
+    validation_report = summarize_validation_report_source(
+        best.get("selection_validation_report") or best.get("validation_report"),
+        source_type="selection_validation_report",
+        source_label="Validation report",
+    )
+    holdout_validation_report = summarize_validation_report_source(
+        final.get("holdout_validation_report") or final.get("final_artifact_validation"),
+        source_type="holdout_validation_report",
+        source_label="Holdout validation report",
+    )
+    return {
+        "model_name": best.get("model_name") or final.get("selected_model", {}).get("model_name") or "N/A",
+        "cross_validation": cv_metrics,
+        "validation_metrics": validation_metrics,
+        "holdout_metrics": holdout_metrics,
+        "validation_report": validation_report,
+        "holdout_validation_report": holdout_validation_report,
+        "uncertainty_audit": uncertainty_audit,
+        "source_map": {
+            "cross_validation": cv_metrics["source_label"],
+            "validation_metrics": validation_metrics["source_label"],
+            "holdout_metrics": holdout_metrics["source_label"],
+            "uncertainty_audit": uncertainty_audit["source_label"],
+        },
+    }
 
 def _first_numeric(*values):
     for value in values:
@@ -678,10 +786,10 @@ def api_validation_details():
             load_search_selection_payload(OUTPUTS_DIR, final_raw),
             load_required_output_json("best_search_result.json"),
         )
-        best = normalize_result_payload(best_source)
+        payload = build_validation_details_payload(best_source, final_raw)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
-    return jsonify(sanitize_dashboard_payload(best))
+    return jsonify(sanitize_dashboard_payload(payload))
 
 @app.route("/api/field_validation")
 def api_field_validation():
@@ -700,7 +808,36 @@ def api_design_results():
         if d:
             d["_filename"] = f.name
             singles.append(d)
-    return jsonify(sanitize_dashboard_payload({"batch": batch or [], "singles": singles}))
+    comparison_rows = []
+    for row in batch or []:
+        row = dict(row)
+        row["source_type"] = row.get("source_type") or "design_batch"
+        row["source_label"] = row.get("source_label") or "batch_design_results.csv"
+        row["interval_width"] = row.get("interval_width")
+        row["confidence_label"] = row.get("confidence_label")
+        comparison_rows.append(row)
+    for single in singles:
+        uncertainty = single.get("uncertainty_interval") or {}
+        cement_saving = single.get("estimated_cement_saving_vs_reference") or {}
+        comparison_rows.append(
+            {
+                "source_type": single.get("source_mode") or "design_single",
+                "source_label": single.get("_filename") or "design result",
+                "target_strength": single.get("target_strength"),
+                "predicted_strength": single.get("predicted_strength"),
+                "validation_verdict": single.get("validation_verdict"),
+                "interval_width": uncertainty.get("interval_width"),
+                "confidence_label": uncertainty.get("confidence_label"),
+                "target_window_overlap": uncertainty.get("target_window_overlap"),
+                "cement_saving_kg_per_m3": cement_saving.get("cement_saving_kg_per_m3"),
+                "cement_saving_percent": cement_saving.get("cement_saving_percent"),
+                "mix_design": single.get("mix_design") or {},
+                "ranking_breakdown": single.get("ranking_breakdown") or {},
+                "success": single.get("success"),
+                "_filename": single.get("_filename"),
+            }
+        )
+    return jsonify(sanitize_dashboard_payload({"batch": batch or [], "singles": singles, "comparison_rows": comparison_rows}))
 
 @app.route("/api/design_generate", methods=["POST"])
 def api_design_generate():
@@ -888,7 +1025,10 @@ def shared_snapshot(token):
     <section class="meta">
       <div>Baseline model: {_safe_text(snapshot.get("baseline_model"))}</div>
       <div>Baseline composite score: {_safe_text(_safe_metric(snapshot.get("baseline_composite"), 4))}</div>
+      <div>Validation source: {_safe_text(snapshot.get("validation_source_label"))}</div>
       <div>Validation verdict: {_safe_text(snapshot.get("validation_verdict"))}</div>
+      <div>Holdout source: {_safe_text(snapshot.get("holdout_source_label"))}</div>
+      <div>Uncertainty source: {_safe_text(snapshot.get("uncertainty_source_label"))}</div>
       <div>Created at: {_safe_text(created_text)}</div>
       <div>Expires at: {_safe_text(expires_text)}</div>
     </section>
@@ -1446,11 +1586,14 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 <!-- ══ VALIDATION ═════════════════════════════════════════════════════════ -->
 <section class="section" id="validation">
   <div class="section-title">Engineering Validation</div>
-  <div class="section-sub">Physical constraint checks — ACI 318 / BS 8500 inspired rules</div>
-  <div class="panel-grid">
-    <div class="panel" id="val-summary">Loading…</div>
-    <div class="panel" id="val-warnings">Loading…</div>
+  <div class="section-sub">Source-separated CV, validation, holdout, and uncertainty audit panels</div>
+  <div class="card-grid" id="validation-panels">
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
   </div>
+  <div id="validation-comparison" style="margin-top:20px"></div>
   <div class="chart-row">
     <div class="chart-box">
       <h3>RMSE by Strength Range</h3>
@@ -1468,7 +1611,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 <!-- ══ DESIGN TOOL ════════════════════════════════════════════════════════ -->
 <section class="section" id="design">
   <div class="section-title">Design Tool Results</div>
-  <div class="section-sub">Inverse prediction — find mix design for a target strength</div>
+  <div class="section-sub">Design scenarios / trade-offs with source-labeled batch and scenario cards</div>
   <div id="design-content">Loading…</div>
 </section>
 
@@ -1602,6 +1745,24 @@ function badgeClass(value){
   return ['pass','warn','fail','ok','low','moderate','high'].includes(cleaned) ? cleaned : 'warn';
 }
 
+function hasValue(value){
+  return value !== null && value !== undefined && value !== '';
+}
+
+function formatMetric(value, decimals = 4){
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(decimals) : '—';
+}
+
+function formatPercent(value, decimals = 2){
+  const n = Number(value);
+  return Number.isFinite(n) ? `${(n * 100).toFixed(decimals)}%` : '—';
+}
+
+function sourceLine(label, type){
+  return `<div class="card-label">Source: ${escapeHtml(label)}${type ? ` <span style="color:var(--muted)">(${escapeHtml(type)})</span>` : ''}</div>`;
+}
+
 async function loadStatus() {
   const r = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
   const all = Object.values(r).every(v=>v.exists);
@@ -1622,59 +1783,63 @@ async function loadOverview() {
   const b = d.baseline || {};
   const best = d.best || {};
   const fin = d.final || {};
-  const bestMetricSource = best.holdout_composite != null ? 'Holdout' : (best.validation_composite != null ? 'Validation' : ((best.cv_composite != null || best.composite != null) ? 'CV' : 'N/A'));
   document.getElementById('tb-dataset').textContent =
     `Dataset: ${d.dataset_rows || '—'} rows`;
 
   const verdictBadge = v => `<span class="badge ${(v||'').toLowerCase()}">${v||'—'}</span>`;
-  const pct = n => n ? (n*100).toFixed(2)+'%' : '—';
-  const num = (n,dec=4) => n!=null ? (+n).toFixed(dec) : '—';
+  const pct = n => formatPercent(n);
+  const num = (n,dec=4) => formatMetric(n,dec);
 
   document.getElementById('overview-cards').innerHTML = `
     <div class="card">
-      <div class="card-label">01 · Baseline</div>
+      ${sourceLine('Cross-validation metrics', 'cross_validation')}
       <div class="card-title">${escapeHtml(b.model_name||'RandomForestRegressor')}</div>
-      <div class="metric"><div class="metric-label">RMSE ?? CV</div><div class="metric-value">${num(b.cv_rmse||b.rmse,4)}</div></div>
-      <div class="metric"><div class="metric-label">CV R²</div><div class="metric-value sm">${num(b.cv_r2||b.r2,4)}</div></div>
-      <div class="metric"><div class="metric-label">Composite ?? CV</div><div class="metric-value sm">${num(b.cv_composite||b.composite,4)}</div></div>
+      <div class="metric"><div class="metric-label">CV RMSE</div><div class="metric-value">${num(b.cv_rmse ?? b.rmse,4)}</div></div>
+      <div class="metric"><div class="metric-label">CV R²</div><div class="metric-value sm">${num(b.cv_r2 ?? b.r2,4)}</div></div>
+      <div class="metric"><div class="metric-label">CV composite</div><div class="metric-value sm">${num(b.cv_composite ?? b.composite,4)}</div></div>
       <div style="margin-top:8px">${verdictBadge(b.validation_verdict||b.validation)}</div>
     </div>
     <div class="card">
-      <div class="card-label">02 · Best Model</div>
-      <div class="card-title">${best.model_name||'—'}</div>
-      <div class="metric"><div class="metric-label">RMSE ?? CV</div><div class="metric-value">${num(best.cv_rmse||best.rmse,4)}</div></div>
-      <div class="metric"><div class="metric-label">Holdout R²</div><div class="metric-value sm">${num(best.holdout_r2||best.r2,4)}</div></div>
-      <div class="metric"><div class="metric-label">Composite ?? ${bestMetricSource}</div><div class="metric-value sm">${num(best.holdout_composite||best.val_composite||best.composite,4)}</div></div>
+      ${sourceLine('Validation metrics', 'selection_validation')}
+      <div class="card-title">${escapeHtml(best.model_name||'—')}</div>
+      <div class="metric"><div class="metric-label">Validation RMSE</div><div class="metric-value">${num(best.validation_rmse,4)}</div></div>
+      <div class="metric"><div class="metric-label">Validation R²</div><div class="metric-value sm">${num(best.validation_r2,4)}</div></div>
+      <div class="metric"><div class="metric-label">Validation composite</div><div class="metric-value sm">${num(best.validation_composite,4)}</div></div>
       <div style="margin-top:8px">${verdictBadge(best.validation_verdict||best.validation)}</div>
     </div>
     <div class="card">
-      <div class="card-label">03 · Improvement</div>
-      <div class="card-title">vs Baseline</div>
-      <div class="metric"><div class="metric-label">Composite Δ</div><div class="metric-value" style="color:var(--green)">${fin.composite_improvement_pct ? '+'+num(fin.composite_improvement_pct,2)+'%' : '—'}</div></div>
-      <div class="metric"><div class="metric-label">Best found at Trial</div><div class="metric-value sm">#${best.best_trial||'—'}</div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">04 · Dataset</div>
-      <div class="card-title">concrete_data.csv</div>
-      <div class="metric"><div class="metric-label">Rows</div><div class="metric-value">${d.dataset_rows||'—'}</div></div>
-      <div class="metric"><div class="metric-label">Target</div><div class="metric-value sm">compressive_strength</div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">05 · RMSE by Range</div>
-      <div class="card-title">Low / Mid / High MPa</div>
+      ${sourceLine('Final holdout metrics', 'holdout_metrics')}
+      <div class="card-title">${escapeHtml(fin.holdout_source_label || 'Final holdout metrics')}</div>
+      <div class="metric"><div class="metric-label">Holdout RMSE</div><div class="metric-value">${num(fin.holdout_rmse,4)}</div></div>
+      <div class="metric"><div class="metric-label">Holdout R²</div><div class="metric-value sm">${num(fin.holdout_r2,4)}</div></div>
+      <div class="metric"><div class="metric-label">Holdout composite</div><div class="metric-value sm">${num(fin.holdout_composite,4)}</div></div>
+      <div style="margin-top:8px">${verdictBadge((fin.holdout_validation_report && fin.holdout_validation_report.verdict) || '—')}</div>
       ${fin.rmse_by_range ? `
+        <div class="metric" style="margin-top:14px"><div class="metric-label">Holdout RMSE by strength range</div></div>
         <div class="metric"><div class="metric-label">Low</div><div class="metric-value sm">${num(fin.rmse_by_range.low,4)}</div></div>
         <div class="metric"><div class="metric-label">Mid</div><div class="metric-value sm">${num(fin.rmse_by_range.mid,4)}</div></div>
         <div class="metric"><div class="metric-label">High</div><div class="metric-value sm">${num(fin.rmse_by_range.high,4)}</div></div>
-      ` : '<div style="color:var(--muted);font-size:12px">Not available</div>'}
+      ` : ''}
     </div>
     <div class="card">
-      <div class="card-label">06 · Validation Status</div>
-      <div class="card-title">Engineering Checks</div>
-      <div class="metric"><div class="metric-label">Hard Constraints</div><div class="metric-value" style="color:${(best.hard_failed_count||0)>0?'var(--red)':'var(--green)'}">${best.hard_failed_count??'—'}</div></div>
-      <div class="metric"><div class="metric-label">Engineering Cautions</div><div class="metric-value sm" style="color:${(best.engineering_caution_count||best.durability_caution_count||0)>0?'var(--yellow)':'var(--green)'}">${best.engineering_caution_count??best.durability_caution_count??'—'}</div></div>
-      <div class="metric"><div class="metric-label">Data Review Flags</div><div class="metric-value sm">${best.data_review_flag_count??best.dataset_anomaly_count??'—'}</div></div>
-      <div style="margin-top:8px">${verdictBadge(best.validation_verdict||best.validation)}</div>
+      ${sourceLine('Uncertainty audit', 'uncertainty_audit')}
+      <div class="card-title">${escapeHtml(fin.uncertainty_source_label || 'Uncertainty audit')}</div>
+      <div class="metric"><div class="metric-label">Coverage</div><div class="metric-value">${pct(fin.uncertainty_coverage)}</div></div>
+      <div class="metric"><div class="metric-label">Coverage target</div><div class="metric-value sm">${pct(fin.uncertainty_coverage_target)}</div></div>
+      <div class="metric"><div class="metric-label">Audit partition</div><div class="metric-value sm">${escapeHtml((fin.uncertainty_audit && fin.uncertainty_audit.audit_partition) || '—')}</div></div>
+      <div class="metric"><div class="metric-label">Calibration partition</div><div class="metric-value sm">${escapeHtml((fin.uncertainty_audit && fin.uncertainty_audit.calibration_partition) || '—')}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Improvement vs Baseline</div>
+      <div class="card-title">Outcome delta</div>
+      <div class="metric"><div class="metric-label">Composite Δ</div><div class="metric-value" style="color:var(--green)">${hasValue(fin.composite_improvement_pct) ? '+'+num(fin.composite_improvement_pct,2)+'%' : '—'}</div></div>
+      <div class="metric"><div class="metric-label">Best found at Trial</div><div class="metric-value sm">#${best.best_trial||'—'}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Dataset</div>
+      <div class="card-title">concrete_data.csv</div>
+      <div class="metric"><div class="metric-label">Rows</div><div class="metric-value">${d.dataset_rows||'—'}</div></div>
+      <div class="metric"><div class="metric-label">Target</div><div class="metric-value sm">compressive_strength</div></div>
     </div>
   `;
 }
@@ -2243,74 +2408,110 @@ function chartDefaults(){
 
 async function loadValidation() {
   const d = await fetch('/api/validation_details').then(r=>r.json()).catch(()=>({}));
-  const v = d.validation_verdict || d.validation || '—';
-  const fail = d.hard_failed_count ?? d.failed_samples ?? 0;
-  const warn = d.warning_count ?? 0;
-  const cautions = d.engineering_caution_count ?? d.durability_caution_count ?? 0;
-  const reviewFlags = d.data_review_flag_count ?? d.dataset_anomaly_count ?? d.suspicious_samples ?? 0;
-  const passRate = d.validation_pass_rate;
-  const hardFailReasons = d.hard_fail_reasons || [];
-  const warns = d.warn_reasons || [];
-  const cautionReasons = d.engineering_caution_reasons || d.durability_caution_reasons || [];
-  const reviewFlagReasons = d.data_review_flag_reasons || d.dataset_anomaly_reasons || [];
-  const contextualSummary = d.contextual_summary || '—';
-  const assessmentConfidence = d.confidence_of_warning_assessment || '—';
+  const cv = d.cross_validation || {};
+  const validation = d.validation_metrics || {};
+  const holdout = d.holdout_metrics || {};
+  const validationReport = d.validation_report || {};
+  const holdoutReport = d.holdout_validation_report || {};
+  const uncertainty = d.uncertainty_audit || {};
+  const verdictBadge = v => `<span class="badge ${(v||'').toLowerCase()}">${v||'—'}</span>`;
+
+  const metricRow = (label, value, suffix = '') => `
+    <div class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value sm">${formatMetric(value)}${suffix}</div></div>
+  `;
+
+  const countColor = value => (Number(value) > 0 ? 'var(--yellow)' : 'var(--green)');
   const red = theme('--red');
   const yellow = theme('--yellow');
   const accent = theme('--accent');
-  const renderReasonGroup = (title, items, emptyText, styles) => `
-    <div style="margin-bottom:16px">
-      <div class="metric-label" style="margin-bottom:8px">${title}</div>
-      ${items.length
-        ? `<ul class="warn-list">${items.map(w=>`<li style="background:${styles.bg};border-left-color:${styles.border};color:${styles.text}">${escapeHtml(w)}</li>`).join('')}</ul>`
-        : `<div style="color:var(--muted);font-family:var(--mono);font-size:11px">${emptyText}</div>`
-      }
+
+  document.getElementById('validation-panels').innerHTML = `
+    <div class="card">
+      ${sourceLine(cv.source_label || 'Cross-validation metrics', cv.source_type || 'cross_validation')}
+      <div class="card-title">${escapeHtml(d.model_name || 'Model selection')}</div>
+      ${metricRow('Cross-validation RMSE', cv.aggregate && cv.aggregate.rmse)}
+      ${metricRow('Cross-validation MAE', cv.aggregate && cv.aggregate.mae)}
+      ${metricRow('Cross-validation R²', cv.aggregate && cv.aggregate.r2)}
+      ${metricRow('Cross-validation composite', cv.aggregate && cv.aggregate.composite_score)}
+      <div style="margin-top:8px;color:var(--muted);font-family:var(--mono);font-size:10px">Train-fold aggregate only. No holdout data used here.</div>
+    </div>
+    <div class="card">
+      ${sourceLine(validation.source_label || 'Validation metrics', validation.source_type || 'selection_validation')}
+      <div class="card-title">${escapeHtml(validationReport.verdict || 'Validation report')}</div>
+      ${metricRow('Validation RMSE', validation.aggregate && validation.aggregate.rmse)}
+      ${metricRow('Validation MAE', validation.aggregate && validation.aggregate.mae)}
+      ${metricRow('Validation R²', validation.aggregate && validation.aggregate.r2)}
+      ${metricRow('Validation composite', validation.aggregate && validation.aggregate.composite_score)}
+      <div style="margin-top:8px">${verdictBadge(validationReport.verdict)}</div>
+      <div class="metric" style="margin-top:10px"><div class="metric-label">Pass rate</div><div class="metric-value sm">${formatPercent(validationReport.pass_rate)}</div></div>
+      <div class="metric"><div class="metric-label">Hard constraints</div><div class="metric-value sm" style="color:${countColor(validationReport.hard_constraint_count)}">${validationReport.hard_constraint_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Engineering cautions</div><div class="metric-value sm" style="color:${countColor(validationReport.engineering_caution_count)}">${validationReport.engineering_caution_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Data review flags</div><div class="metric-value sm" style="color:${countColor(validationReport.data_review_flag_count)}">${validationReport.data_review_flag_count ?? '—'}</div></div>
+    </div>
+    <div class="card">
+      ${sourceLine(holdout.source_label || 'Final holdout metrics', holdout.source_type || 'holdout_metrics')}
+      <div class="card-title">${escapeHtml((holdoutReport && holdoutReport.verdict) || 'Holdout report')}</div>
+      ${metricRow('Holdout RMSE', holdout.aggregate && holdout.aggregate.rmse)}
+      ${metricRow('Holdout MAE', holdout.aggregate && holdout.aggregate.mae)}
+      ${metricRow('Holdout R²', holdout.aggregate && holdout.aggregate.r2)}
+      ${metricRow('Holdout composite', holdout.aggregate && holdout.aggregate.composite_score)}
+      <div style="margin-top:8px">${verdictBadge(holdoutReport.verdict)}</div>
+      <div class="metric" style="margin-top:10px"><div class="metric-label">Pass rate</div><div class="metric-value sm">${formatPercent(holdoutReport.pass_rate)}</div></div>
+      <div class="metric"><div class="metric-label">Hard constraints</div><div class="metric-value sm" style="color:${countColor(holdoutReport.hard_constraint_count)}">${holdoutReport.hard_constraint_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Engineering cautions</div><div class="metric-value sm" style="color:${countColor(holdoutReport.engineering_caution_count)}">${holdoutReport.engineering_caution_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Data review flags</div><div class="metric-value sm" style="color:${countColor(holdoutReport.data_review_flag_count)}">${holdoutReport.data_review_flag_count ?? '—'}</div></div>
+    </div>
+    <div class="card">
+      ${sourceLine(uncertainty.source_label || 'Uncertainty audit', uncertainty.source_type || 'uncertainty_audit')}
+      <div class="card-title">Coverage audit</div>
+      <div class="metric"><div class="metric-label">Coverage</div><div class="metric-value">${formatPercent(uncertainty.coverage)}</div></div>
+      <div class="metric"><div class="metric-label">Coverage target</div><div class="metric-value sm">${formatPercent(uncertainty.coverage_target)}</div></div>
+      <div class="metric"><div class="metric-label">Audit partition</div><div class="metric-value sm">${escapeHtml(uncertainty.audit_partition || '—')}</div></div>
+      <div class="metric"><div class="metric-label">Calibration partition</div><div class="metric-value sm">${escapeHtml(uncertainty.calibration_partition || '—')}</div></div>
+      <div class="metric"><div class="metric-label">Expected partition</div><div class="metric-value sm">${escapeHtml((uncertainty.coverage_audit && uncertainty.coverage_audit.expected_partition) || '—')}</div></div>
     </div>
   `;
 
-  document.getElementById('val-summary').innerHTML = `
-    <h3>Validation Summary</h3>
-    <div class="verdict-big ${v.toLowerCase()}">${v}</div>
-    <div class="metric"><div class="metric-label">Hard Constraints</div><div class="metric-value sm" style="color:${fail>0?'var(--red)':'var(--green)'}">${fail}</div></div>
-    <div class="metric"><div class="metric-label">Warning Samples</div><div class="metric-value sm" style="color:${warn>0?'var(--yellow)':'var(--green)'}">${warn}</div></div>
-    <div class="metric"><div class="metric-label">Engineering Cautions</div><div class="metric-value sm" style="color:${cautions>0?'var(--yellow)':'var(--green)'}">${cautions}</div></div>
-    <div class="metric"><div class="metric-label">Data Review Flags</div><div class="metric-value sm" style="color:${reviewFlags>0?'var(--yellow)':'var(--green)'}">${reviewFlags}</div></div>
-    <div class="metric"><div class="metric-label">Pass Rate</div><div class="metric-value sm">${passRate!=null?(passRate*100).toFixed(2)+'%':'—'}</div></div>
-    <div class="metric"><div class="metric-label">Assessment Confidence</div><div class="metric-value sm">${assessmentConfidence}</div></div>
-    <div class="metric"><div class="metric-label">Model</div><div class="metric-value sm">${d.model_name||'—'}</div></div>
-  `;
+  const compareRows = [
+    ['Cross-validation metrics', cv.aggregate || {}, cv.source_type || 'cross_validation', cv.source_label || 'Cross-validation metrics', null],
+    ['Validation metrics', validation.aggregate || {}, validation.source_type || 'selection_validation', validation.source_label || 'Validation metrics', verdictBadge(validationReport.verdict)],
+    ['Final holdout metrics', holdout.aggregate || {}, holdout.source_type || 'holdout_metrics', holdout.source_label || 'Final holdout metrics', verdictBadge(holdoutReport.verdict)],
+  ];
 
-  document.getElementById('val-warnings').innerHTML = `
-    <h3>Validation Breakdown</h3>
-    ${renderReasonGroup('Hard-Fail Reasons', hardFailReasons, 'No hard failures triggered', {bg:withAlpha(red,.08), border:red, text:red})}
-    ${renderReasonGroup('Warning Reasons', warns, 'No warnings triggered', {bg:withAlpha(yellow,.08), border:yellow, text:yellow})}
-    ${renderReasonGroup('Engineering Cautions', cautionReasons, 'No engineering cautions triggered', {bg:withAlpha(yellow,.08), border:yellow, text:yellow})}
-    ${renderReasonGroup('Data Review Flags', reviewFlagReasons, 'No data review flags triggered', {bg:withAlpha(accent,.08), border:accent, text:accent})}
-    <div style="margin-bottom:16px">
-      <div class="metric-label" style="margin-bottom:8px">Contextual Summary</div>
-      <div style="color:var(--muted);font-family:var(--mono);font-size:11px;line-height:1.6">${escapeHtml(contextualSummary)}</div>
-    </div>
-    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
-      <div class="metric-label" style="margin-bottom:8px">RULE REFERENCE</div>
-      ${[
-        ['Exposure class + w/c or w/b','Durability caution uses exposure metadata when available','WARN'],
-        ['High w/c + high strength','SCM, age, binder, and w/b context decide whether review is needed','WARN'],
-        ['High-volume SCM regime','Triggers age-aware data review instead of automatic anomaly labeling','WARN'],
-        ['Binder < 250 kg/m³','Low binder content','WARN'],
-        ['Binder > 550 kg/m³','Shrinkage risk','WARN'],
-        ['Fly ash > 40%','Exceeds ACI substitution limit','WARN'],
-        ['Slag > 70%','Exceeds BS 8500 GGBS limit','WARN'],
-        ['Predicted NaN / inf','Numerically invalid model output','FAIL'],
-        ['Predicted < 0 MPa','Physical impossibility','FAIL'],
-        ['Predicted outside configured bounds','Outside configured engineering range','FAIL'],
-      ].map(([rule,desc,sev])=>`
-        <div class="rule-item">
-          <span style="color:var(--txt)">${rule}</span>
-          <span style="color:var(--muted);flex:1;margin:0 12px;font-size:10px">${desc}</span>
-          <span class="badge ${sev.toLowerCase()}">${sev}</span>
-        </div>`).join('')}
+  const comparisonHtml = `
+    <div class="table-wrap">
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Source type</th>
+            <th>RMSE</th>
+            <th>MAE</th>
+            <th>R²</th>
+            <th>Composite</th>
+            <th>Verdict</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${compareRows.map(([label, aggregate, type, sourceLabel, verdict]) => `
+            <tr>
+              <td>${escapeHtml(sourceLabel)}</td>
+              <td><span class="comparison-pill neutral">${escapeHtml(type)}</span></td>
+              <td>${formatMetric(aggregate.rmse)}</td>
+              <td>${formatMetric(aggregate.mae)}</td>
+              <td>${formatMetric(aggregate.r2)}</td>
+              <td>${formatMetric(aggregate.composite_score)}</td>
+              <td>${verdict || '—'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
     </div>
   `;
+  const comparisonMount = document.getElementById('validation-comparison');
+  if(comparisonMount){
+    comparisonMount.innerHTML = comparisonHtml;
+  }
 }
 
 // ─── design tool ─────────────────────────────────────────────────────────────
@@ -2407,7 +2608,26 @@ async function loadDesign() {
     return;
   }
   let html = renderDesignGenerator();
-  if(d.batch.length){
+  const comparisonRows = Array.isArray(d.comparison_rows) ? d.comparison_rows : [];
+  if(comparisonRows.length){
+    html += `<div class="table-wrap" style="margin-bottom:24px">
+      <table class="comparison-table">
+        <thead><tr>
+          <th>Source</th><th>Source type</th><th>Target MPa</th><th>Predicted MPa</th>
+          <th>Verdict</th><th>Interval width</th><th>Cement saving</th><th>Confidence</th>
+        </tr></thead>
+        <tbody>${comparisonRows.map(r=>`<tr>
+          <td>${escapeHtml(r.source_label || r._filename || '—')}</td>
+          <td><span class="comparison-pill neutral">${escapeHtml(r.source_type || '—')}</span></td>
+          <td>${r.target_strength != null ? formatMetric(r.target_strength, 2) : '—'}</td>
+          <td>${r.predicted_strength != null ? formatMetric(r.predicted_strength, 2) : '—'}</td>
+          <td><span class="badge ${(r.validation_verdict||'').toLowerCase()}">${escapeHtml(r.validation_verdict||'—')}</span></td>
+          <td>${r.interval_width != null ? formatMetric(r.interval_width, 2) : '—'}</td>
+          <td>${r.cement_saving_percent != null ? `${formatMetric(r.cement_saving_percent, 2)}%` : (r.cement_saving_kg_per_m3 != null ? `${formatMetric(r.cement_saving_kg_per_m3, 2)} kg` : '—')}</td>
+          <td>${escapeHtml(r.confidence_label || '—')}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>`;
+  }else if(d.batch.length){
     html += `<div class="table-wrap" style="margin-bottom:24px">
       <table>
         <thead><tr>
@@ -2428,13 +2648,22 @@ async function loadDesign() {
   if(d.singles.length){
     html += `<div class="card-grid">${d.singles.map(s=>`
       <div class="card" style="cursor:pointer" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
-        <div class="card-label">Design Result</div>
-        <div class="card-title">${s._filename||'—'}</div>
-        <div class="metric"><div class="metric-label">Target</div><div class="metric-value sm">${s.target_strength||'—'} MPa</div></div>
-        <div class="metric"><div class="metric-label">Predicted</div><div class="metric-value sm">${s.predicted_strength?parseFloat(s.predicted_strength).toFixed(2):'—'} MPa</div></div>
-        <span class="badge ${(s.validation_verdict||'').toLowerCase()}">${s.validation_verdict||'—'}</span>
+        <div class="card-label">Source: ${escapeHtml(s.source_mode || 'design_single')}</div>
+        <div class="card-title">${escapeHtml(s._filename || '—')}</div>
+        <div class="metric"><div class="metric-label">Target MPa</div><div class="metric-value sm">${s.target_strength!=null?formatMetric(s.target_strength,2):'—'}</div></div>
+        <div class="metric"><div class="metric-label">Predicted MPa</div><div class="metric-value sm">${s.predicted_strength!=null?formatMetric(s.predicted_strength,2):'—'}</div></div>
+        <div class="metric"><div class="metric-label">Verdict</div><div class="metric-value sm"><span class="badge ${(s.validation_verdict||'').toLowerCase()}">${escapeHtml(s.validation_verdict||'—')}</span></div></div>
+        <div class="metric"><div class="metric-label">Interval width</div><div class="metric-value sm">${s.uncertainty_interval && s.uncertainty_interval.interval_width != null ? formatMetric(s.uncertainty_interval.interval_width,2) : '—'}</div></div>
+        <div class="metric"><div class="metric-label">Confidence</div><div class="metric-value sm">${escapeHtml((s.uncertainty_interval && s.uncertainty_interval.confidence_label) || '—')}</div></div>
+        <div class="metric"><div class="metric-label">Cement saving</div><div class="metric-value sm">${s.estimated_cement_saving_vs_reference && s.estimated_cement_saving_vs_reference.cement_saving_percent != null ? `${formatMetric(s.estimated_cement_saving_vs_reference.cement_saving_percent,2)}%` : '—'}</div></div>
       </div>
       <div style="display:none;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:-8px;margin-bottom:8px;font-family:var(--mono);font-size:11px">
+        <div class="metric-label" style="margin-bottom:10px">Trade-off details</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px">
+          <div class="comparison-pill neutral">Source: ${escapeHtml(s.source_mode || 'design_single')}</div>
+          <div class="comparison-pill neutral">Overlap: ${s.uncertainty_interval && s.uncertainty_interval.target_window_overlap != null ? formatMetric(s.uncertainty_interval.target_window_overlap,2) : '—'}</div>
+          <div class="comparison-pill neutral">Saving: ${s.estimated_cement_saving_vs_reference && s.estimated_cement_saving_vs_reference.cement_saving_kg_per_m3 != null ? `${formatMetric(s.estimated_cement_saving_vs_reference.cement_saving_kg_per_m3,2)} kg` : '—'}</div>
+        </div>
         <pre style="white-space:pre-wrap;color:var(--muted)">${escapeHtml(JSON.stringify(s,null,2))}</pre>
       </div>
     `).join('')}</div>`;
