@@ -2,6 +2,7 @@ import os
 import json
 import csv
 import re
+import math
 import secrets
 import html
 from pathlib import Path
@@ -144,6 +145,12 @@ def coerce_number(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+def coerce_finite_number(value):
+    number = coerce_number(value)
+    if number is None:
+        return None
+    return number if math.isfinite(number) else None
 
 def sanitize_dashboard_payload(value):
     if isinstance(value, dict):
@@ -393,19 +400,35 @@ def normalize_final_payload(payload):
 def summarize_metric_source(source_payload, *, source_type, source_label):
     source = source_payload if isinstance(source_payload, dict) else {}
     aggregate = source.get("aggregate") if isinstance(source.get("aggregate"), dict) else {}
+    aggregate_summary = {
+        "rmse": coerce_finite_number(aggregate.get("rmse")),
+        "mae": coerce_finite_number(aggregate.get("mae")),
+        "r2": coerce_finite_number(aggregate.get("r2")),
+        "composite_score": coerce_finite_number(aggregate.get("composite_score")),
+    }
     return {
         "source_type": source_type,
         "source_label": source_label,
         "stage": source.get("stage") or source_type,
         "partition": source.get("partition"),
-        "available": bool(source),
-        "aggregate": {
-            "rmse": coerce_number(aggregate.get("rmse")),
-            "mae": coerce_number(aggregate.get("mae")),
-            "r2": coerce_number(aggregate.get("r2")),
-            "composite_score": coerce_number(aggregate.get("composite_score")),
-        },
+        "available": any(value is not None for value in aggregate_summary.values()),
+        "aggregate": aggregate_summary,
     }
+
+def has_uncertainty_audit_evidence(source_payload):
+    source = source_payload if isinstance(source_payload, dict) else {}
+    if not source:
+        return False
+    return any(
+        [
+            coerce_finite_number(source.get("coverage")) is not None,
+            coerce_finite_number(source.get("coverage_target")) is not None,
+            bool(source.get("coverage_audit")),
+            bool(source.get("strength_bin_audit")),
+            bool(source.get("audit_partition")),
+            bool(source.get("calibration_partition")),
+        ]
+    )
 
 def summarize_validation_report_source(report_payload, *, source_type, source_label):
     report = report_payload if isinstance(report_payload, dict) else {}
@@ -731,6 +754,127 @@ def parse_research_log(path):
         pass
     return trials
 
+def build_overview_decision_metric(best_source, final_raw):
+    best = best_source if isinstance(best_source, dict) else {}
+    final = final_raw if isinstance(final_raw, dict) else {}
+    candidate_sources = [
+        summarize_metric_source(
+            final.get("holdout_metrics"),
+            source_type="holdout_metrics",
+            source_label="Final holdout metrics",
+        ),
+        summarize_metric_source(
+            best.get("selection_validation")
+            or best.get("validation_metrics")
+            or best.get("selection_metrics")
+            or best.get("val_metrics"),
+            source_type="selection_validation",
+            source_label="Validation metrics",
+        ),
+        summarize_metric_source(
+            best.get("cross_validation") or best.get("cv_metrics") or best.get("cv"),
+            source_type="cross_validation",
+            source_label="Cross-validation metrics",
+        ),
+    ]
+    selected = next((source for source in candidate_sources if source.get("available")), None)
+    if not selected:
+        return {
+            "source_type": None,
+            "source_label": "No decision evidence available",
+            "rmse": None,
+            "mae": None,
+            "r2": None,
+            "composite_score": None,
+        }
+    aggregate = selected.get("aggregate") or {}
+    return {
+        "source_type": selected.get("source_type"),
+        "source_label": selected.get("source_label"),
+        "rmse": coerce_number(aggregate.get("rmse")),
+        "mae": coerce_number(aggregate.get("mae")),
+        "r2": coerce_number(aggregate.get("r2")),
+        "composite_score": coerce_number(aggregate.get("composite_score")),
+    }
+
+def build_overview_warning_state(best_source, final_raw):
+    best = best_source if isinstance(best_source, dict) else {}
+    final = final_raw if isinstance(final_raw, dict) else {}
+
+    holdout_available = summarize_metric_source(
+        final.get("holdout_metrics"),
+        source_type="holdout_metrics",
+        source_label="Final holdout metrics",
+    ).get("available", False)
+    uncertainty_available = has_uncertainty_audit_evidence(final.get("uncertainty_audit"))
+    validation_available = summarize_metric_source(
+        best.get("selection_validation")
+        or best.get("validation_metrics")
+        or best.get("selection_metrics")
+        or best.get("val_metrics"),
+        source_type="selection_validation",
+        source_label="Validation metrics",
+    ).get(
+        "available",
+        False,
+    )
+
+    warnings = []
+    if not holdout_available:
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Missing artifact",
+                "message": "Final holdout metrics not available.",
+            }
+        )
+    if not uncertainty_available:
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Missing artifact",
+                "message": "Uncertainty audit not available.",
+            }
+        )
+    if not validation_available:
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Missing artifact",
+                "message": "Validation metrics not available.",
+            }
+        )
+
+    if not holdout_available:
+        next_action = {
+            "title": "Run final holdout evaluation",
+            "message": "Generate final_holdout_evaluation.json before promoting a model.",
+        }
+    elif not uncertainty_available:
+        next_action = {
+            "title": "Run uncertainty audit",
+            "message": "Add uncertainty_audit evidence to final_holdout_evaluation.json.",
+        }
+    elif not validation_available:
+        next_action = {
+            "title": "Recover selection validation artifact",
+            "message": "Ensure best_search_result.json includes selection_validation metrics.",
+        }
+    else:
+        next_action = {
+            "title": "Evidence complete",
+            "message": "Holdout, uncertainty, and validation artifacts are available.",
+        }
+
+    evidence_status = {
+        "label": "Action required" if warnings else "Ready",
+        "warning_count": len(warnings),
+        "holdout_available": holdout_available,
+        "uncertainty_available": uncertainty_available,
+        "validation_available": validation_available,
+    }
+    return warnings, next_action, evidence_status
+
 # ─── API endpoints ──────────────────────────────────────────────────────────
 
 @app.before_request
@@ -761,7 +905,22 @@ def api_overview():
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
     dataset_rows = get_dataset_rows()
-    return jsonify(sanitize_dashboard_payload({"baseline": baseline, "best": best, "final": final, "dataset_rows": dataset_rows}))
+    decision_metric = build_overview_decision_metric(best_source, final_raw)
+    warnings, next_action, evidence_status = build_overview_warning_state(best_source, final_raw)
+    return jsonify(
+        sanitize_dashboard_payload(
+            {
+                "baseline": baseline,
+                "best": best,
+                "final": final,
+                "dataset_rows": dataset_rows,
+                "warnings": warnings,
+                "decision_metric": decision_metric,
+                "next_action": next_action,
+                "evidence_status": evidence_status,
+            }
+        )
+    )
 
 @app.route("/api/run_history")
 def api_run_history():
@@ -1135,6 +1294,13 @@ nav a .icon{font-size:15px;width:20px;text-align:center}
 }
 .tb-left{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .tb-left span{color:var(--accent);margin-right:16px}
+.mode-switch{display:inline-flex;align-items:center;gap:6px}
+.mode-pill{
+  background:var(--card);border:1px solid var(--border);border-radius:999px;
+  color:var(--muted);padding:4px 10px;text-decoration:none;font-size:10px;
+  text-transform:uppercase;letter-spacing:.06em;
+}
+.mode-pill.active{border-color:var(--accent);color:var(--accent)}
 .tb-right{display:flex;align-items:center;gap:8px}
 .refresh-btn{
   background:var(--card);border:1px solid var(--border);
@@ -1402,7 +1568,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 }
 </style>
 </head>
-<body>
+<body data-default-mode="{{ dashboard_mode }}">
 
 <!-- Sidebar -->
 <aside id="sidebar">
@@ -1415,14 +1581,19 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
     </div>
   </div>
   <nav>
-    <a href="#field-results"     ><span class="icon">#</span> Field Results</a>
-    <a href="#overview"   class="active"><span class="icon">◈</span> Overview</a>
-    <a href="#log"               ><span class="icon">◎</span> Research Log</a>
-    <a href="#models"            ><span class="icon">◫</span> Model Comparison</a>
-    <a href="#validation"        ><span class="icon">◉</span> Engineering Validation</a>
-    <a href="#design"            ><span class="icon">◧</span> Design Tool</a>
-    <a href="#gallery"           ><span class="icon">◰</span> Plots Gallery</a>
-    <a href="#runs"              ><span class="icon">⟡</span> Run History</a>
+    {% if dashboard_mode == "normal" %}
+    <a href="#project-health" class="active"><span class="icon">H</span> Project Health</a>
+    {% endif %}
+    {% if dashboard_mode == "experimental" %}
+    <a href="#overview" class="active"><span class="icon">O</span> Overview</a>
+    <a href="#log"><span class="icon">R</span> Research Log</a>
+    <a href="#models"><span class="icon">M</span> Model Comparison</a>
+    <a href="#validation"><span class="icon">V</span> Engineering Validation</a>
+    <a href="#design"><span class="icon">D</span> Design Tool</a>
+    <a href="#field-results"><span class="icon">F</span> Field Results</a>
+    <a href="#gallery"><span class="icon">P</span> Plots Gallery</a>
+    <a href="#runs"><span class="icon">R</span> Run History</a>
+    {% endif %}
   </nav>
 </aside>
 
@@ -1431,6 +1602,10 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
   <div class="tb-left">
     <span id="tb-dataset">—</span>
     <span id="tb-time">—</span>
+    <div class="mode-switch" role="group" aria-label="Dashboard mode">
+      <a class="mode-pill {% if dashboard_mode == 'normal' %}active{% endif %}" href="/?mode=normal">Normal Mode</a>
+      <a class="mode-pill {% if dashboard_mode == 'experimental' %}active{% endif %}" href="/?mode=experimental">Experimental Mode</a>
+    </div>
   </div>
   <div class="tb-right">
     <span class="share-status" id="share-status"></span>
@@ -1441,8 +1616,35 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 
 <!-- Main -->
 <main id="main">
+{% if dashboard_mode == "experimental" %}
+<section class="section" id="experimental-workspace">
+  <div class="section-title">Experimental research workspace</div>
+  <div class="section-sub">Full search telemetry, longitudinal run history, and trial-level diagnostics.</div>
+</section>
+{% endif %}
 
 <!-- ══ OVERVIEW ══════════════════════════════════════════════════════════ -->
+{% if dashboard_mode == "normal" %}
+<section class="section" id="project-health">
+  <div class="section-title">Project Health</div>
+  <div class="section-sub">Evidence status, decision metric source, and the next action needed for confidence.</div>
+  <div class="card-grid" id="normal-summary-cards">
+    <div class="card">
+      <div class="card-label">Evidence status</div>
+      <div class="skeleton" style="height:90px"></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Next action</div>
+      <div class="skeleton" style="height:90px"></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Open Experimental View</div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Experimental View</a>
+    </div>
+  </div>
+</section>
+{% endif %}
+{% if dashboard_mode == "experimental" %}
 <section class="section" id="overview">
   <div class="section-title">Overview</div>
   <div class="section-sub">Pipeline summary · last run results · dataset info</div>
@@ -1455,6 +1657,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 
 <!-- ══ RESEARCH LOG ══════════════════════════════════════════════════════ -->
 <!-- ══ RUN HISTORY ═══════════════════════════════════════════════════════════ -->
+{% if dashboard_mode == "experimental" %}
 <section class="section" id="runs">
   <div class="run-history-head">
     <div>
@@ -1584,6 +1787,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 </section>
 
 <!-- ══ VALIDATION ═════════════════════════════════════════════════════════ -->
+{% endif %}
 <section class="section" id="validation">
   <div class="section-title">Engineering Validation</div>
   <div class="section-sub">Source-separated CV, validation, holdout, and uncertainty audit panels</div>
@@ -1611,7 +1815,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 <!-- ══ DESIGN TOOL ════════════════════════════════════════════════════════ -->
 <section class="section" id="design">
   <div class="section-title">Design Tool Results</div>
-  <div class="section-sub">Design scenarios / trade-offs with source-labeled batch and scenario cards</div>
+  <div class="section-sub">Design scenarios / trade-offs with Source-separated batch comparison and source-labeled scenario cards</div>
   <div id="design-content">Loading…</div>
 </section>
 
@@ -1631,6 +1835,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
     <div class="card skeleton" style="height:220px"></div>
   </div>
 </section>
+{% endif %}
 
 </main>
 
@@ -1653,6 +1858,15 @@ let tablePage = 0;
 const PAGE_SIZE = 20;
 let tableSortCol = 0;
 let tableSortAsc = true;
+const dashboardMode = (document.body.dataset.defaultMode || 'normal').toLowerCase();
+
+function isNormalMode() {
+  return dashboardMode === 'normal';
+}
+
+function isExperimentalMode() {
+  return dashboardMode === 'experimental';
+}
 
 // ─── boot ────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -1661,6 +1875,21 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 async function loadAll() {
+  if (isExperimentalMode()) {
+    await loadExperimentalMode();
+    return;
+  }
+  await loadNormalMode();
+}
+
+async function loadNormalMode() {
+  await Promise.all([
+    loadStatus(),
+    loadNormalSummary(),
+  ]);
+}
+
+async function loadExperimentalMode() {
   await Promise.all([
     loadStatus(),
     loadOverview(),
@@ -1777,6 +2006,56 @@ async function loadStatus() {
 }
 
 // ─── overview ────────────────────────────────────────────────────────────────
+async function loadNormalSummary() {
+  const mount = document.getElementById('normal-summary-cards');
+  if(!mount){
+    return;
+  }
+  const d = await fetch('/api/overview').then(r=>r.json()).catch(()=>({}));
+  overviewData = d;
+  document.getElementById('tb-dataset').textContent = `Dataset: ${d.dataset_rows || '—'} rows`;
+  const decision = d.decision_metric || {};
+  const fallbackWarnings = (!Array.isArray(d.warnings) || !d.warnings.length) && !decision.source_type
+    ? [{ title: 'Missing artifact', message: 'Overview artifacts not available.' }]
+    : [];
+  const warnings = Array.isArray(d.warnings) && d.warnings.length ? d.warnings : fallbackWarnings;
+  const nextAction = Object.keys(d.next_action || {}).length ? d.next_action : {
+    title: 'Recover overview artifacts',
+    message: 'Generate the dashboard summary artifacts before trusting the current result.',
+  };
+  const evidence = Object.keys(d.evidence_status || {}).length ? d.evidence_status : {
+    label: 'Action required',
+    warning_count: warnings.length,
+  };
+
+  const warningHtml = warnings.length
+    ? `<ul style="margin:10px 0 0 18px;padding:0;font-family:var(--mono);font-size:11px;color:var(--yellow)">${warnings.map(w => `<li>${escapeHtml(w.message || 'Missing evidence artifact.')}</li>`).join('')}</ul>`
+    : `<div class="metric" style="margin-top:8px"><div class="metric-value sm" style="color:var(--green)">All required evidence artifacts available.</div></div>`;
+  mount.innerHTML = `
+    <div class="card">
+      <div class="card-label">Project Health</div>
+      <div class="card-title">${escapeHtml(evidence.label || 'Action required')}</div>
+      <div class="metric"><div class="metric-label">Decision source</div><div class="metric-value sm">${escapeHtml(decision.source_label || 'No decision evidence available')}</div></div>
+      <div class="metric"><div class="metric-label">Composite score</div><div class="metric-value sm">${formatMetric(decision.composite_score, 4)}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Evidence status</div>
+      <div class="metric"><div class="metric-label">Warnings</div><div class="metric-value">${evidence.warning_count != null ? evidence.warning_count : warnings.length}</div></div>
+      ${warningHtml}
+    </div>
+    <div class="card">
+      <div class="card-label">Next action</div>
+      <div class="card-title">${escapeHtml(nextAction.title || 'Review evidence artifacts')}</div>
+      <div class="metric"><div class="metric-label">Instruction</div><div class="metric-value sm">${escapeHtml(nextAction.message || 'Inspect artifact coverage before model promotion.')}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Open Experimental View</div>
+      <div class="metric"><div class="metric-label">Detailed analysis</div><div class="metric-value sm">Run history, validation panels, design trade-offs, field records, and gallery.</div></div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Experimental View</a>
+    </div>
+  `;
+}
+
 async function loadOverview() {
   const d = await fetch('/api/overview').then(r=>r.json()).catch(()=>({}));
   overviewData = d;
@@ -1903,7 +2182,7 @@ function renderRunHistory(summary){
     if(el) el.textContent = 'No historical runs found in outputs/runs/.';
     if(cardsEl) cardsEl.innerHTML = `
       <div class="design-placeholder" style="grid-column:1/-1">
-        <div style="font-size:14px;font-weight:700;margin-bottom:6px">No Run History Yet</div>
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px">No historical runs yet</div>
         <div style="color:var(--muted);font-size:12px">This dashboard will populate once run manifests are archived under outputs/runs/.</div>
       </div>`;
     if(tbody) tbody.innerHTML = '';
@@ -2610,10 +2889,11 @@ async function loadDesign() {
   let html = renderDesignGenerator();
   const comparisonRows = Array.isArray(d.comparison_rows) ? d.comparison_rows : [];
   if(comparisonRows.length){
-    html += `<div class="table-wrap" style="margin-bottom:24px">
+    html += `<div class="card-label" style="margin:0 0 10px 0">Source-separated batch comparison</div>
+      <div class="table-wrap" style="margin-bottom:24px">
       <table class="comparison-table">
         <thead><tr>
-          <th>Source</th><th>Source type</th><th>Target MPa</th><th>Predicted MPa</th>
+          <th>Artifact source</th><th>Source type</th><th>Target MPa</th><th>Predicted MPa</th>
           <th>Verdict</th><th>Interval width</th><th>Cement saving</th><th>Confidence</th>
         </tr></thead>
         <tbody>${comparisonRows.map(r=>`<tr>
@@ -2780,7 +3060,9 @@ function initScrollSpy(){
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    requested_mode = (request.args.get("mode") or "").strip().lower()
+    dashboard_mode = requested_mode if requested_mode in {"normal", "experimental"} else "normal"
+    return render_template_string(HTML, dashboard_mode=dashboard_mode)
 
 if __name__ == "__main__":
     import webbrowser, threading
