@@ -8,7 +8,11 @@ import html
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, url_for
-from artifact_contracts import map_deprecated_artifact_payload
+from artifact_contracts import (
+    coalesce_artifact_lineage,
+    evaluate_uncertainty_lineage,
+    map_deprecated_artifact_payload,
+)
 
 app = Flask(__name__)
 
@@ -391,10 +395,22 @@ def normalize_final_payload(payload):
     uncertainty_audit = normalized.get("uncertainty_audit") or {}
     if not isinstance(uncertainty_audit, dict):
         uncertainty_audit = {}
-    normalized["uncertainty_source_type"] = "uncertainty_audit" if uncertainty_audit else None
-    normalized["uncertainty_source_label"] = "Uncertainty audit" if uncertainty_audit else None
-    normalized["uncertainty_coverage"] = coerce_number(uncertainty_audit.get("coverage"))
-    normalized["uncertainty_coverage_target"] = coerce_number(uncertainty_audit.get("coverage_target"))
+    expected_uncertainty_lineage = coalesce_artifact_lineage(
+        payload.get("selected_model"),
+        payload,
+        fallback_model_id=str((payload.get("selected_model") or {}).get("model_name", "")).strip() or None,
+    )
+    uncertainty_summary = summarize_uncertainty_audit(
+        uncertainty_audit,
+        expected_lineage=expected_uncertainty_lineage,
+    )
+    normalized["uncertainty_audit"] = uncertainty_summary
+    normalized["uncertainty_source_type"] = uncertainty_summary.get("source_type")
+    normalized["uncertainty_source_label"] = uncertainty_summary.get("source_label")
+    normalized["uncertainty_coverage"] = uncertainty_summary.get("coverage")
+    normalized["uncertainty_coverage_target"] = uncertainty_summary.get("coverage_target")
+    normalized["uncertainty_lineage"] = uncertainty_summary.get("lineage")
+    normalized["uncertainty_lineage_status"] = uncertainty_summary.get("lineage_status")
     return normalized
 
 def summarize_metric_source(source_payload, *, source_type, source_label):
@@ -430,6 +446,35 @@ def has_uncertainty_audit_evidence(source_payload):
         ]
     )
 
+
+def summarize_uncertainty_audit(source_payload, *, expected_lineage=None):
+    source = source_payload if isinstance(source_payload, dict) else {}
+    lineage_report = evaluate_uncertainty_lineage(
+        source,
+        expected_lineage=expected_lineage,
+        fallback_model_id=str(source.get("model_id") or source.get("model_name") or "").strip() or None,
+    )
+    lineage = dict(lineage_report["lineage"])
+    lineage["status"] = lineage_report["status"]
+    if lineage_report["missing_fields"]:
+        lineage["missing_fields"] = list(lineage_report["missing_fields"])
+    if lineage_report["mismatches"]:
+        lineage["mismatches"] = list(lineage_report["mismatches"])
+    return {
+        "source_type": "uncertainty_audit" if source else None,
+        "source_label": source.get("source_label") or lineage_report["label"] if source else None,
+        "available": has_uncertainty_audit_evidence(source),
+        "coverage": coerce_number(source.get("coverage")),
+        "coverage_target": coerce_number(source.get("coverage_target")),
+        "coverage_audit": source.get("coverage_audit") or {},
+        "audit_partition": source.get("audit_partition"),
+        "calibration_partition": source.get("calibration_partition"),
+        "strength_bin_audit": source.get("strength_bin_audit") or {},
+        "lineage": lineage,
+        "lineage_status": lineage_report["status"],
+        "lineage_mismatches": list(lineage_report["mismatches"]),
+    }
+
 def summarize_validation_report_source(report_payload, *, source_type, source_label):
     report = report_payload if isinstance(report_payload, dict) else {}
     return {
@@ -463,17 +508,15 @@ def build_validation_details_payload(best_source, final_raw):
         source_type="holdout_metrics",
         source_label="Final holdout metrics",
     )
-    uncertainty_audit = summarize_metric_source(
+    uncertainty_audit = summarize_uncertainty_audit(
         final.get("uncertainty_audit"),
-        source_type="uncertainty_audit",
-        source_label="Uncertainty audit",
+        expected_lineage=coalesce_artifact_lineage(
+            best,
+            final.get("selected_model"),
+            final,
+            fallback_model_id=str(best.get("model_name") or final.get("selected_model", {}).get("model_name") or "").strip() or None,
+        ),
     )
-    uncertainty_audit["coverage"] = coerce_number((final.get("uncertainty_audit") or {}).get("coverage"))
-    uncertainty_audit["coverage_target"] = coerce_number((final.get("uncertainty_audit") or {}).get("coverage_target"))
-    uncertainty_audit["coverage_audit"] = (final.get("uncertainty_audit") or {}).get("coverage_audit") or {}
-    uncertainty_audit["audit_partition"] = (final.get("uncertainty_audit") or {}).get("audit_partition")
-    uncertainty_audit["calibration_partition"] = (final.get("uncertainty_audit") or {}).get("calibration_partition")
-    uncertainty_audit["strength_bin_audit"] = (final.get("uncertainty_audit") or {}).get("strength_bin_audit") or {}
     validation_report = summarize_validation_report_source(
         best.get("selection_validation_report") or best.get("validation_report"),
         source_type="selection_validation_report",
@@ -806,7 +849,17 @@ def build_overview_warning_state(best_source, final_raw):
         source_type="holdout_metrics",
         source_label="Final holdout metrics",
     ).get("available", False)
-    uncertainty_available = has_uncertainty_audit_evidence(final.get("uncertainty_audit"))
+    uncertainty_summary = summarize_uncertainty_audit(
+        final.get("uncertainty_audit"),
+        expected_lineage=coalesce_artifact_lineage(
+            best,
+            final.get("selected_model"),
+            final,
+            fallback_model_id=str(best.get("model_name") or final.get("selected_model", {}).get("model_name") or "").strip() or None,
+        ),
+    )
+    uncertainty_available = uncertainty_summary.get("available", False)
+    uncertainty_lineage_status = uncertainty_summary.get("lineage_status")
     validation_available = summarize_metric_source(
         best.get("selection_validation")
         or best.get("validation_metrics")
@@ -836,6 +889,22 @@ def build_overview_warning_state(best_source, final_raw):
                 "message": "Uncertainty audit not available.",
             }
         )
+    elif uncertainty_lineage_status == "mismatch":
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Lineage mismatch",
+                "message": "Uncertainty audit lineage does not match the active model lineage.",
+            }
+        )
+    elif uncertainty_lineage_status == "missing":
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Lineage missing",
+                "message": "Uncertainty audit lineage is incomplete and cannot be proven.",
+            }
+        )
     if not validation_available:
         warnings.append(
             {
@@ -855,6 +924,11 @@ def build_overview_warning_state(best_source, final_raw):
             "title": "Run uncertainty audit",
             "message": "Add uncertainty_audit evidence to final_holdout_evaluation.json.",
         }
+    elif uncertainty_lineage_status in {"mismatch", "missing"}:
+        next_action = {
+            "title": "Rebuild uncertainty artifact",
+            "message": "Regenerate uncertainty_audit so its lineage matches the active model and configuration.",
+        }
     elif not validation_available:
         next_action = {
             "title": "Recover selection validation artifact",
@@ -871,6 +945,7 @@ def build_overview_warning_state(best_source, final_raw):
         "warning_count": len(warnings),
         "holdout_available": holdout_available,
         "uncertainty_available": uncertainty_available,
+        "uncertainty_lineage_status": uncertainty_lineage_status,
         "validation_available": validation_available,
     }
     return warnings, next_action, evidence_status

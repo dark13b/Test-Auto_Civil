@@ -6,7 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
-ObjectiveName = Literal["target_fit", "cement_penalty", "co2_proxy", "validator_risk"]
+ObjectiveName = Literal[
+    "target_fit",
+    "strength_fit",
+    "cost_proxy",
+    "cement_penalty",
+    "co2_proxy",
+    "validator_risk",
+]
 ValidatorVerdict = Literal["PASS", "WARN", "FAIL"]
 
 
@@ -42,7 +49,7 @@ class DesignConstraints:
     water_cement_ratio: RangeConstraint = field(default_factory=RangeConstraint)
     fly_ash_replacement_ratio: RangeConstraint = field(default_factory=RangeConstraint)
     slag_replacement_ratio: RangeConstraint = field(default_factory=RangeConstraint)
-    tolerance_mpa: float = 2.0
+    tolerance_mpa: float | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +158,23 @@ class ObjectiveScorecard:
     total_score: float
     components: tuple[ObjectiveComponentScore, ...]
     rank_explanation: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CandidateProposal:
+    """One optimizer-generated candidate before scenario packaging."""
+
+    proposal_id: str
+    mix_design: dict[str, float]
+    source: str
+
+
+@dataclass(frozen=True)
+class OptimizationResult:
+    """Typed optimizer output used by the facade."""
+
+    proposals: tuple[CandidateProposal, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

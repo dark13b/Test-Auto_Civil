@@ -727,6 +727,10 @@ class ResearchProtocolTests(unittest.TestCase):
                         "artifact_kind": "search_selection",
                         "run_id": "run-current",
                         "artifact_id": "best-current",
+                        "config_hash": "config-hash-current",
+                        "model_id": "LGBMRegressor",
+                        "model_fingerprint": "model-artifact-current",
+                        "model_artifact_id": "model-artifact-current",
                         "model_name": "LGBMRegressor",
                         "hyperparameters": {"n_estimators": 300},
                         "composite_score": 0.83,
@@ -765,6 +769,79 @@ class ResearchProtocolTests(unittest.TestCase):
         self.assertFalse(report["consistent"])
         self.assertTrue(any(item["field"] == "run_id" for item in report["mismatches"]))
 
+    def test_validate_final_artifact_consistency_detects_uncertainty_lineage_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "best_search_model.pkl").write_bytes(b"placeholder")
+            (outputs_dir / "best_search_result.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "search_selection",
+                        "run_id": "run-current",
+                        "artifact_id": "best-current",
+                        "config_hash": "config-hash-current",
+                        "model_artifact_id": "model-artifact-current",
+                        "model_id": "LGBMRegressor",
+                        "model_fingerprint": "model-artifact-current",
+                        "model_name": "LGBMRegressor",
+                        "hyperparameters": {"n_estimators": 300},
+                        "composite_score": 0.83,
+                        "validation_verdict": "WARN",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "final_holdout_evaluation",
+                        "run_id": "run-current",
+                        "config_hash": "config-hash-current",
+                        "model_artifact_id": "model-artifact-current",
+                        "selected_model": {
+                            "artifact_kind": "search_selection",
+                            "run_id": "run-current",
+                            "artifact_id": "best-current",
+                            "config_hash": "config-hash-current",
+                            "model_artifact_id": "model-artifact-current",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact-current",
+                            "model_name": "LGBMRegressor",
+                            "hyperparameters": {"n_estimators": 300},
+                            "composite_score": 0.83,
+                            "validation_verdict": "WARN",
+                        },
+                        "holdout_metrics": {
+                            "stage": "final_holdout",
+                            "partition": "holdout",
+                            "aggregate": {"rmse": 4.1, "mae": 3.2, "r2": 0.8, "composite_score": 0.84},
+                        },
+                        "holdout_validation_report": {"verdict": "PASS"},
+                        "uncertainty_audit": {
+                            "artifact_kind": "uncertainty_audit",
+                            "run_id": "run-current",
+                            "config_hash": "config-hash-stale",
+                            "model_artifact_id": "model-artifact-stale",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact-stale",
+                            "audit_partition": "holdout",
+                            "coverage_target": 0.9,
+                            "coverage": 0.92,
+                            "coverage_audit": {"expected_partition": "holdout"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = validate_final_artifact_consistency(outputs_dir)
+
+        self.assertFalse(report["consistent"])
+        self.assertTrue(
+            any(item["field"].startswith("uncertainty_audit.") for item in report["mismatches"]),
+            report["mismatches"],
+        )
+
     def test_validate_final_artifact_consistency_accepts_report_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
@@ -777,12 +854,18 @@ class ResearchProtocolTests(unittest.TestCase):
                         "artifact_metadata": {
                             "artifact_id": "best-artifact",
                             "run_id": "run-123",
+                            "config_hash": "config-hash-123",
                             "model_artifact_id": "model-artifact",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact",
                         },
                         "model_name": "LGBMRegressor",
                         "hyperparameters": {"n_estimators": 300},
                         "composite_score": 0.83,
                         "validation_verdict": "WARN",
+                        "config_hash": "config-hash-123",
+                        "model_id": "LGBMRegressor",
+                        "model_fingerprint": "model-artifact",
                         "model_artifact_id": "model-artifact",
                     }
                 ),
@@ -796,8 +879,12 @@ class ResearchProtocolTests(unittest.TestCase):
                         "artifact_metadata": {
                             "artifact_id": "final-artifact",
                             "run_id": "run-123",
+                            "config_hash": "config-hash-123",
                             "model_artifact_id": "model-artifact",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact",
                         },
+                        "config_hash": "config-hash-123",
                         "selected_model": {
                             "artifact_kind": "search_selection",
                             "artifact_id": "best-artifact",
@@ -805,6 +892,9 @@ class ResearchProtocolTests(unittest.TestCase):
                             "hyperparameters": {"n_estimators": 300},
                             "composite_score": 0.83,
                             "validation_verdict": "WARN",
+                            "config_hash": "config-hash-123",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact",
                             "model_artifact_id": "model-artifact",
                         },
                         "holdout_metrics": {
@@ -813,6 +903,18 @@ class ResearchProtocolTests(unittest.TestCase):
                             "aggregate": {"rmse": 4.1, "mae": 3.2, "r2": 0.8, "composite_score": 0.84},
                         },
                         "holdout_validation_report": {"verdict": "WARN"},
+                        "uncertainty_audit": {
+                            "artifact_kind": "uncertainty_audit",
+                            "run_id": "run-123",
+                            "config_hash": "config-hash-123",
+                            "model_artifact_id": "model-artifact",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact",
+                            "audit_partition": "holdout",
+                            "coverage_target": 0.9,
+                            "coverage": 0.92,
+                            "coverage_audit": {"expected_partition": "holdout"},
+                        },
                     }
                 ),
                 encoding="utf-8",

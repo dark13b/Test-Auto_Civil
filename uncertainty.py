@@ -9,9 +9,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from artifact_contracts import normalize_uncertainty_artifact
 from feature_engineering import build_engineering_features
 from train_impl import (
     artifact_id,
+    compute_config_hash,
     compute_file_hash,
     create_run_id,
     get_base_input_columns,
@@ -568,6 +570,7 @@ class UncertaintyEstimator:
         high_strength_bins = grouped.nlargest(max(1, min(2, len(grouped))), columns="actual_strength_mean")
         audit_status = "FAIL" if coverage < 0.88 else "PASS"
         report = {
+            "artifact_kind": "uncertainty_audit",
             "method": self.method,
             "coverage_target": self.coverage_level,
             "coverage": coverage,
@@ -601,6 +604,18 @@ class UncertaintyEstimator:
                 "bin_details": grouped.to_dict(orient="records"),
             },
         }
+        report = normalize_uncertainty_artifact(
+            report,
+            expected_lineage={
+                "run_id": self.active_run_id,
+                "model_artifact_id": self.model_artifact_id,
+                "model_id": str(type(self.model).__name__),
+                "model_fingerprint": self.model_artifact_id,
+                "config_hash": compute_config_hash(self.config),
+            },
+            allow_provenance_fill=True,
+            fallback_model_id=str(type(self.model).__name__),
+        )
         report_path = self.outputs_dir / self.report_filename
         _, _, enriched_report = write_run_scoped_json_artifact(
             outputs_dir=self.outputs_dir,

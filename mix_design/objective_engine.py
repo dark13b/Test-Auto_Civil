@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
 from mix_design.contracts import (
+    CandidateScenario,
     ConstraintEvaluation,
     DesignConstraints,
     ObjectiveComponentScore,
@@ -20,6 +21,7 @@ from mix_design.contracts import (
 class MixObjectiveEngine:
     """Score candidate scenarios against explicit objectives."""
 
+    cost_proxy: str = "cement_content"
     cement_co2_factor: float = 1.0
     slag_co2_factor: float = 0.15
     fly_ash_co2_factor: float = 0.10
@@ -33,15 +35,47 @@ class MixObjectiveEngine:
         tolerance = max(float(design_constraints.tolerance_mpa), 1e-6)
         deviation = abs(float(prediction.predicted_strength_mpa) - float(target_strength_mpa))
         raw_value = deviation / tolerance
+        if deviation > tolerance:
+            outside_window = (deviation - tolerance) / tolerance
+            raw_value += outside_window * outside_window * 100.0
         explanation = (
             f"Predicted strength is {deviation:.2f} MPa away from the {target_strength_mpa:.2f} MPa target "
             f"using a {tolerance:.2f} MPa tolerance window."
         )
+        if deviation > tolerance:
+            explanation += " A large explicit penalty applies once the candidate falls outside the tolerance window."
         return raw_value, explanation
 
-    def _score_cement_penalty(self, mix_design: dict[str, float]) -> tuple[float, str]:
-        cement = float(mix_design.get("cement", 0.0))
-        return cement, f"Cement penalty uses {cement:.2f} kg/m^3 cement as the direct cost proxy."
+    def _resolve_cost_proxy_value(
+        self,
+        mix_design: dict[str, float],
+        prediction: PredictionResult,
+    ) -> tuple[float, str]:
+        proxy_name = str(self.cost_proxy).strip().lower()
+        if proxy_name in {"cement", "cement_content"}:
+            value = float(mix_design.get("cement", 0.0))
+            return value, "cement"
+        if proxy_name in mix_design:
+            return float(mix_design[proxy_name]), proxy_name
+        if proxy_name in prediction.engineered_features:
+            return float(prediction.engineered_features[proxy_name]), proxy_name
+        raise ValueError(f"Unsupported objective cost proxy: {self.cost_proxy}")
+
+    def _score_cost_proxy(
+        self,
+        mix_design: dict[str, float],
+        prediction: PredictionResult,
+    ) -> tuple[float, str]:
+        raw_value, proxy_name = self._resolve_cost_proxy_value(mix_design, prediction)
+        return raw_value, f"Cost proxy uses '{proxy_name}' with a candidate value of {raw_value:.2f}."
+
+    def _score_cement_penalty(
+        self,
+        mix_design: dict[str, float],
+        prediction: PredictionResult,
+    ) -> tuple[float, str]:
+        raw_value, explanation = self._score_cost_proxy(mix_design, prediction)
+        return raw_value, f"Cement penalty alias: {explanation}"
 
     def _score_co2_proxy(self, mix_design: dict[str, float]) -> tuple[float, str]:
         cement = float(mix_design.get("cement", 0.0))
@@ -93,7 +127,9 @@ class MixObjectiveEngine:
 
         scorers: dict[str, Callable[[], tuple[float, str]]] = {
             "target_fit": lambda: self._score_target_fit(prediction, target_strength_mpa, design_constraints),
-            "cement_penalty": lambda: self._score_cement_penalty(mix_design),
+            "strength_fit": lambda: self._score_target_fit(prediction, target_strength_mpa, design_constraints),
+            "cost_proxy": lambda: self._score_cost_proxy(mix_design, prediction),
+            "cement_penalty": lambda: self._score_cement_penalty(mix_design, prediction),
             "co2_proxy": lambda: self._score_co2_proxy(mix_design),
             "validator_risk": lambda: self._score_validator_risk(constraints, validator),
         }
@@ -116,12 +152,73 @@ class MixObjectiveEngine:
                     explanation=explanation,
                 )
             )
-            explanations.append(f"{objective.name} contributed {weighted_score:.2f} to the total score.")
+            explanations.append(
+                f"{objective.name} contributed {weighted_score:.2f} (raw={raw_value:.2f}, weight={objective.weight:.2f})."
+            )
 
         total_score = float(sum(component.weighted_score for component in components))
+        if explanations:
+            explanations.append(f"Total weighted score is {total_score:.2f}. Lower scores rank better.")
         rank_explanation = tuple(explanations or ["No enabled objectives produced a score."])
         return ObjectiveScorecard(
             total_score=total_score,
             components=tuple(components),
             rank_explanation=rank_explanation,
         )
+
+    @staticmethod
+    def _component_raw(scorecard: ObjectiveScorecard, *names: str) -> float:
+        for component in scorecard.components:
+            if component.name in names:
+                return float(component.raw_value)
+        return 0.0
+
+    def rank_scenarios(self, scenarios: Sequence[CandidateScenario]) -> tuple[CandidateScenario, ...]:
+        """Apply deterministic ranking after the facade has packaged scenarios."""
+
+        verdict_rank = {
+            "PASS": 0,
+            "WARN": 1,
+            "FAIL": 2,
+        }
+        return tuple(
+            sorted(
+                scenarios,
+                key=lambda scenario: (
+                    0 if scenario.success else 1,
+                    verdict_rank.get(str(scenario.validator.overall_verdict), 3),
+                    float(scenario.objective_scorecard.total_score),
+                    self._component_raw(scenario.objective_scorecard, "target_fit", "strength_fit"),
+                    self._component_raw(scenario.objective_scorecard, "cost_proxy", "cement_penalty"),
+                    float(scenario.mix_design.get("cement", 0.0)),
+                    str(scenario.scenario_id),
+                ),
+            )
+        )
+
+    def build_comparison_summary(
+        self,
+        ranked_scenarios: Sequence[CandidateScenario],
+    ) -> tuple[str, ...]:
+        """Explain why the top scenario ranked ahead of the next best alternatives."""
+
+        if not ranked_scenarios:
+            return ("No candidate scenarios were available for comparison.",)
+
+        best = ranked_scenarios[0]
+        summary = [
+            (
+                f"{best.scenario_id} ranked first because it "
+                f"{'satisfied' if best.success else 'did not satisfy'} the explicit feasibility gates "
+                f"and achieved a weighted objective score of {best.objective_scorecard.total_score:.2f}."
+            )
+        ]
+        summary.extend(best.objective_scorecard.rank_explanation)
+
+        if len(ranked_scenarios) > 1:
+            runner_up = ranked_scenarios[1]
+            summary.append(
+                f"Runner-up {runner_up.scenario_id} scored {runner_up.objective_scorecard.total_score:.2f}, "
+                f"a gap of {runner_up.objective_scorecard.total_score - best.objective_scorecard.total_score:.2f}."
+            )
+        return tuple(summary)

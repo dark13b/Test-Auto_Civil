@@ -14,7 +14,7 @@ import numpy as np
 import optuna
 import pandas as pd
 
-from artifact_contracts import map_deprecated_artifact_payload
+from artifact_contracts import coalesce_artifact_lineage, map_deprecated_artifact_payload, normalize_uncertainty_artifact
 from search import csv_is_stale, repair_optuna_results_csv, sync_check
 from train import (
     EngineeringValidator,
@@ -212,6 +212,19 @@ def load_reference_payload(outputs_dir: Path, config: dict[str, Any]) -> dict[st
         else {}
     )
     reference_uncertainty = load_json_artifact(reference_uncertainty_path) if reference_uncertainty_path.exists() else {}
+    if isinstance(reference_uncertainty, dict) and reference_uncertainty:
+        reference_uncertainty = normalize_uncertainty_artifact(
+            reference_uncertainty,
+            expected_lineage=coalesce_artifact_lineage(
+                reference_result,
+                finalized_best,
+                fallback_model_id=str(reference_result.get("model_name", finalized_best.get("model_name", ""))).strip()
+                or None,
+            ),
+            allow_provenance_fill=False,
+            fallback_model_id=str(reference_result.get("model_name", finalized_best.get("model_name", ""))).strip()
+            or None,
+        )
 
     reference_payload = {
         "baseline": {
@@ -246,6 +259,8 @@ def load_reference_payload(outputs_dir: Path, config: dict[str, Any]) -> dict[st
             "coverage": reference_uncertainty.get("coverage"),
             "mean_interval_width": reference_uncertainty.get("mean_interval_width"),
             "global_status": reference_uncertainty.get("coverage_audit", {}).get("global_status"),
+            "lineage_status": reference_uncertainty.get("lineage_status"),
+            "source_label": reference_uncertainty.get("source_label"),
         },
     }
     return reference_payload

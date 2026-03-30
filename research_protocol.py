@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
+from artifact_contracts import artifact_metadata as resolve_artifact_metadata, evaluate_uncertainty_lineage
 from novelty_scorer import NoveltyScorer
 from state_store import JSONStateStore, build_default_lab_state, default_runtime_state_path
 
@@ -258,12 +259,7 @@ def _to_serializable(value: Any) -> Any:
 
 
 def _artifact_metadata(payload: dict[str, Any]) -> dict[str, Any]:
-    raw_metadata = payload.get("artifact_metadata", {})
-    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
-    for key in ("run_id", "artifact_id", "model_artifact_id", "source_mode", "timestamp"):
-        if key not in metadata and key in payload:
-            metadata[key] = payload[key]
-    return metadata
+    return resolve_artifact_metadata(payload)
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -1263,6 +1259,39 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
                         "field": key,
                         "expected": expected_value,
                         "actual": actual_value,
+                    }
+                )
+        uncertainty_audit = final_holdout.get("uncertainty_audit")
+        if isinstance(uncertainty_audit, dict):
+            uncertainty_lineage = evaluate_uncertainty_lineage(
+                uncertainty_audit,
+                expected_lineage={
+                    "run_id": best_result_metadata.get("run_id"),
+                    "model_artifact_id": best_result_metadata.get("model_artifact_id"),
+                    "model_id": best_result_metadata.get("model_id") or best_result.get("model_name"),
+                    "model_fingerprint": best_result_metadata.get("model_fingerprint")
+                    or best_result_metadata.get("model_artifact_id")
+                    or best_result.get("model_name"),
+                    "config_hash": best_result_metadata.get("config_hash"),
+                },
+                fallback_model_id=str(best_result.get("model_name", "")).strip() or None,
+            )
+            for item in uncertainty_lineage["mismatches"]:
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": f"uncertainty_audit.{item['field']}",
+                        "expected": item["expected"],
+                        "actual": item["actual"],
+                    }
+                )
+            for field in uncertainty_lineage["missing_fields"]:
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": f"uncertainty_audit.{field}",
+                        "expected": best_result_metadata.get(field),
+                        "actual": None,
                     }
                 )
 

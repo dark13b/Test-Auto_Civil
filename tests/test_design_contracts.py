@@ -1,5 +1,7 @@
 import unittest
 
+import pytest
+
 from mix_design.contracts import (
     CandidateScenario,
     ConstraintCheck,
@@ -16,6 +18,9 @@ from mix_design.contracts import (
     ValidatorOutcome,
     default_objectives,
 )
+
+
+pytestmark = pytest.mark.contract
 
 
 class DesignContractTests(unittest.TestCase):

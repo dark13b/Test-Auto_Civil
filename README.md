@@ -74,6 +74,39 @@ Use Python 3.10+ and install the dependencies:
 pip install -r requirements.txt
 ```
 
+For contributor checks and CI parity, install the dev tools as well:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+```
+
+## CI checks
+
+Run the same slices locally that CI runs on every push and pull request:
+
+```bash
+python scripts/run_ci_checks.py
+```
+
+If you only need one slice, run it directly:
+
+```bash
+python scripts/run_ci_checks.py --only lint
+python scripts/run_ci_checks.py --only types
+python scripts/run_ci_checks.py --only unit
+python scripts/run_ci_checks.py --only contract
+python scripts/run_ci_checks.py --only golden
+```
+
+The golden fixture lives under `tests/fixtures/golden_run/` and executes one deterministic `research_loop.py` cycle with:
+
+- a tiny concrete dataset fixture
+- LLM proposals disabled
+- a fixed random seed
+- reports disabled for speed
+
+Lint and type checks are intentionally scoped to the regression harness files for now, because the broader repository does not yet have a clean repo-wide baseline.
+
 ## Contributor path
 
 ```bash

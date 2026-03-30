@@ -8,7 +8,7 @@ from typing import Any, Mapping
 from mix_design.contracts import ConstraintCheck, ConstraintEvaluation, DesignConstraints, RangeConstraint
 
 
-_BASE_COLUMNS = (
+BASE_CONSTRAINT_FIELDS = (
     "cement",
     "slag",
     "fly_ash",
@@ -18,14 +18,17 @@ _BASE_COLUMNS = (
     "fine_aggregate",
     "age",
 )
-_RATIO_COLUMNS = (
+RATIO_CONSTRAINT_FIELDS = (
     "water_cement_ratio",
     "fly_ash_replacement_ratio",
     "slag_replacement_ratio",
 )
+ALL_CONSTRAINT_FIELDS = BASE_CONSTRAINT_FIELDS + RATIO_CONSTRAINT_FIELDS
 
 
-def _constraint_from_raw(raw_value: Any) -> RangeConstraint:
+def constraint_from_raw(raw_value: Any) -> RangeConstraint:
+    """Normalize one raw config or override value into a typed range constraint."""
+
     if raw_value is None:
         return RangeConstraint()
     if isinstance(raw_value, Mapping):
@@ -37,34 +40,71 @@ def _constraint_from_raw(raw_value: Any) -> RangeConstraint:
     return RangeConstraint(fixed=float(raw_value))
 
 
+def design_constraints_from_legacy(
+    overrides: Mapping[str, Any] | None = None,
+    *,
+    tolerance_mpa: float | None = None,
+) -> DesignConstraints:
+    """Convert legacy mapping-style overrides into the typed constraint contract."""
+
+    raw = overrides or {}
+    resolved_tolerance = tolerance_mpa
+    if resolved_tolerance is None and "tolerance_mpa" in raw:
+        resolved_tolerance = float(raw["tolerance_mpa"])
+
+    return DesignConstraints(
+        cement=constraint_from_raw(raw.get("cement")),
+        slag=constraint_from_raw(raw.get("slag")),
+        fly_ash=constraint_from_raw(raw.get("fly_ash")),
+        water=constraint_from_raw(raw.get("water")),
+        superplasticizer=constraint_from_raw(raw.get("superplasticizer")),
+        coarse_aggregate=constraint_from_raw(raw.get("coarse_aggregate")),
+        fine_aggregate=constraint_from_raw(raw.get("fine_aggregate")),
+        age=constraint_from_raw(raw.get("age")),
+        water_cement_ratio=constraint_from_raw(raw.get("water_cement_ratio")),
+        fly_ash_replacement_ratio=constraint_from_raw(raw.get("fly_ash_replacement_ratio")),
+        slag_replacement_ratio=constraint_from_raw(raw.get("slag_replacement_ratio")),
+        tolerance_mpa=None if resolved_tolerance is None else float(resolved_tolerance),
+    )
+
+
+def merge_design_constraints(defaults: DesignConstraints, overrides: DesignConstraints | None) -> DesignConstraints:
+    """Merge request overrides into config-derived defaults without hiding the result."""
+
+    if overrides is None:
+        return defaults
+
+    merged_fields: dict[str, RangeConstraint] = {}
+    for field_name in ALL_CONSTRAINT_FIELDS:
+        base_constraint = getattr(defaults, field_name)
+        override_constraint = getattr(overrides, field_name)
+        merged_fields[field_name] = RangeConstraint(
+            min=override_constraint.min if override_constraint.min is not None else base_constraint.min,
+            max=override_constraint.max if override_constraint.max is not None else base_constraint.max,
+            fixed=override_constraint.fixed if override_constraint.fixed is not None else base_constraint.fixed,
+        )
+
+    return DesignConstraints(
+        **merged_fields,
+        tolerance_mpa=(
+            float(overrides.tolerance_mpa)
+            if overrides.tolerance_mpa is not None
+            else defaults.tolerance_mpa
+        ),
+    )
+
+
 def load_design_constraints(config: Mapping[str, Any], overrides: Mapping[str, Any] | None = None) -> DesignConstraints:
     """Load config-defined design constraints into a typed contract."""
 
     design_config = config["engineering"]["design_tool"]
-    raw_constraints = dict(design_config.get("constraints", {}))
-    if overrides:
-        for key, value in overrides.items():
-            if key == "tolerance_mpa":
-                continue
-            raw_constraints[key] = value
-
-    tolerance = float(overrides["tolerance_mpa"]) if overrides and "tolerance_mpa" in overrides else float(
-        design_config.get("target_tolerance_mpa", 2.0)
+    default_constraints = design_constraints_from_legacy(
+        design_config.get("constraints", {}),
+        tolerance_mpa=float(design_config.get("target_tolerance_mpa", 2.0)),
     )
-    return DesignConstraints(
-        cement=_constraint_from_raw(raw_constraints.get("cement")),
-        slag=_constraint_from_raw(raw_constraints.get("slag")),
-        fly_ash=_constraint_from_raw(raw_constraints.get("fly_ash")),
-        water=_constraint_from_raw(raw_constraints.get("water")),
-        superplasticizer=_constraint_from_raw(raw_constraints.get("superplasticizer")),
-        coarse_aggregate=_constraint_from_raw(raw_constraints.get("coarse_aggregate")),
-        fine_aggregate=_constraint_from_raw(raw_constraints.get("fine_aggregate")),
-        age=_constraint_from_raw(raw_constraints.get("age")),
-        water_cement_ratio=_constraint_from_raw(raw_constraints.get("water_cement_ratio")),
-        fly_ash_replacement_ratio=_constraint_from_raw(raw_constraints.get("fly_ash_replacement_ratio")),
-        slag_replacement_ratio=_constraint_from_raw(raw_constraints.get("slag_replacement_ratio")),
-        tolerance_mpa=tolerance,
-    )
+    if not overrides:
+        return default_constraints
+    return merge_design_constraints(default_constraints, design_constraints_from_legacy(overrides))
 
 
 def apply_target_strength_bounds(constraints: DesignConstraints, target_strength_mpa: float) -> DesignConstraints:
@@ -116,6 +156,46 @@ def apply_target_strength_bounds(constraints: DesignConstraints, target_strength
         cement=cement,
         water=water,
         water_cement_ratio=water_cement_ratio,
+    )
+
+
+def ensure_default_age_constraint(constraints: DesignConstraints, default_age_days: float) -> DesignConstraints:
+    """Make the design age explicit when the request did not override it."""
+
+    if constraints.age.fixed is not None:
+        return constraints
+    return replace(
+        constraints,
+        age=RangeConstraint(
+            min=constraints.age.min,
+            max=constraints.age.max,
+            fixed=float(default_age_days),
+        ),
+    )
+
+
+def prepare_design_constraints(
+    config: Mapping[str, Any],
+    *,
+    target_strength_mpa: float,
+    overrides: DesignConstraints | Mapping[str, Any] | None = None,
+) -> DesignConstraints:
+    """Merge config defaults, request overrides, regime bounds, and default age."""
+
+    default_constraints = load_design_constraints(config)
+    typed_overrides: DesignConstraints | None
+    if overrides is None:
+        typed_overrides = None
+    elif isinstance(overrides, DesignConstraints):
+        typed_overrides = overrides
+    else:
+        typed_overrides = design_constraints_from_legacy(overrides)
+
+    merged = merge_design_constraints(default_constraints, typed_overrides)
+    bounded = apply_target_strength_bounds(merged, target_strength_mpa=float(target_strength_mpa))
+    return ensure_default_age_constraint(
+        bounded,
+        float(config["engineering"]["design_tool"]["default_age_days"]),
     )
 
 
@@ -179,7 +259,7 @@ def evaluate_constraints(
     checks: list[ConstraintCheck] = []
     hard_failures: list[str] = []
 
-    for name in _BASE_COLUMNS:
+    for name in BASE_CONSTRAINT_FIELDS:
         _evaluate_named_constraint(
             checks=checks,
             hard_failures=hard_failures,
@@ -188,7 +268,7 @@ def evaluate_constraints(
             constraint=getattr(constraints, name),
         )
 
-    for name in _RATIO_COLUMNS:
+    for name in RATIO_CONSTRAINT_FIELDS:
         _evaluate_named_constraint(
             checks=checks,
             hard_failures=hard_failures,

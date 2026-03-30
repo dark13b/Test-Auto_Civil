@@ -2,6 +2,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from train import write_run_scoped_json_artifact
 
 from artifact_contracts import (
@@ -9,6 +11,9 @@ from artifact_contracts import (
     map_deprecated_artifact_payload,
     validate_artifact_payload,
 )
+
+
+pytestmark = pytest.mark.contract
 
 
 def _metric_aggregate() -> dict:
@@ -40,6 +45,12 @@ def _search_selection_payload() -> dict:
     return {
         "schema_version": 1,
         "artifact_kind": "search_selection",
+        "run_id": "run-20260327T100000",
+        "artifact_id": "search-artifact-1",
+        "config_hash": "config-hash-1",
+        "model_artifact_id": "model-artifact-1",
+        "model_id": "Ridge",
+        "model_fingerprint": "model-artifact-1",
         "model_name": "Ridge",
         "display_name": "Ridge",
         "hyperparameters": {"alpha": 1.0},
@@ -88,6 +99,12 @@ def _final_holdout_payload() -> dict:
         "holdout_validation_report": _validation_report(),
         "uncertainty_audit": {
             "artifact_kind": "uncertainty_audit",
+            "run_id": "run-20260327T100000",
+            "artifact_id": "uncertainty-artifact-1",
+            "config_hash": "config-hash-1",
+            "model_artifact_id": "model-artifact-1",
+            "model_id": "Ridge",
+            "model_fingerprint": "model-artifact-1",
             "audit_partition": "holdout",
             "calibration_partition": "validation_audit",
             "coverage_target": 0.9,
@@ -132,6 +149,12 @@ class ArtifactContractTests(unittest.TestCase):
                 "hyperparameters": {"alpha": 1.0},
                 "trial_number": 12,
                 "source": "search",
+                "run_id": "run-20260327T100000",
+                "artifact_id": "legacy-search-artifact-1",
+                "config_hash": "config-hash-1",
+                "model_artifact_id": "model-artifact-1",
+                "model_id": "Ridge",
+                "model_fingerprint": "model-artifact-1",
                 "cv_metrics": _metric_aggregate(),
                 "selection_metrics": _metric_aggregate(),
                 "validation_report": _validation_report(),
@@ -161,8 +184,24 @@ class ArtifactContractTests(unittest.TestCase):
         self.assertEqual(mapped["selected_model"]["composite_score"], 0.0)
         self.assertEqual(mapped["selected_model"]["validation_verdict"], "PASS")
         self.assertEqual(mapped["selected_model"]["validation_metrics"]["rmse"], 3.1)
+        self.assertEqual(mapped["uncertainty_audit"]["run_id"], "run-20260327T100000")
+        self.assertEqual(mapped["uncertainty_audit"]["model_fingerprint"], "model-artifact-1")
         self.assertTrue(mapped["deprecations"])
         self.assertIn("final_metrics.json", mapped["deprecations"][0]["source"])
+
+    def test_validate_final_holdout_rejects_uncertainty_without_provable_lineage(self) -> None:
+        payload = _final_holdout_payload()
+        payload["uncertainty_audit"].pop("config_hash")
+
+        with self.assertRaises(ArtifactValidationError):
+            validate_artifact_payload("final_holdout_evaluation.json", payload)
+
+    def test_validate_final_holdout_rejects_uncertainty_lineage_mismatch(self) -> None:
+        payload = _final_holdout_payload()
+        payload["uncertainty_audit"]["model_fingerprint"] = "model-artifact-stale"
+
+        with self.assertRaises(ArtifactValidationError):
+            validate_artifact_payload("final_holdout_evaluation.json", payload)
 
     def test_write_run_scoped_json_artifact_rejects_invalid_canonical_holdout_artifact(self) -> None:
         config = {

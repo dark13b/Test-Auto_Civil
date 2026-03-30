@@ -99,6 +99,29 @@ class ObjectiveEngineTests(unittest.TestCase):
 
         self.assertGreater(fail_score.total_score, warn_score.total_score)
 
+    def test_cost_proxy_objective_uses_configured_proxy_and_strength_fit_alias(self) -> None:
+        engine = MixObjectiveEngine(cost_proxy="water")
+
+        scorecard = engine.score_candidate(
+            mix_design={"cement": 180.0, "slag": 80.0, "fly_ash": 40.0, "water": 150.0},
+            prediction=make_prediction(32.2),
+            constraints=ConstraintEvaluation(passed=True, checks=(), hard_failures=()),
+            validator=make_validator("PASS"),
+            target_strength_mpa=32.0,
+            design_constraints=DesignConstraints(tolerance_mpa=2.0),
+            objectives=(
+                ObjectiveSpec(name="strength_fit", weight=1.0),
+                ObjectiveSpec(name="cost_proxy", weight=0.5),
+            ),
+        )
+
+        self.assertEqual(
+            [component.name for component in scorecard.components],
+            ["strength_fit", "cost_proxy"],
+        )
+        self.assertEqual(scorecard.components[1].raw_value, 150.0)
+        self.assertIn("water", scorecard.components[1].explanation.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

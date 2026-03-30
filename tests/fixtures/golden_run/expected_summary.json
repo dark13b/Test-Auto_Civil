@@ -1,0 +1,92 @@
+{
+  "baseline_metrics": {
+    "composite_score": -0.063291,
+    "cross_validation": {
+      "composite_score": -0.063291,
+      "mae": 17.200687,
+      "r2": -1.443386,
+      "rmse": 20.764652
+    },
+    "model_name": "Ridge",
+    "selection_validation": {
+      "composite_score": 0.801324,
+      "mae": 5.785575,
+      "r2": 0.730226,
+      "rmse": 7.541253
+    },
+    "validation_verdict": "WARN"
+  },
+  "best_search_result": {
+    "composite_score": 0.344307,
+    "cross_validation": {
+      "composite_score": 0.344307,
+      "mae": 13.070539,
+      "r2": -0.34738,
+      "rmse": 15.821256
+    },
+    "model_name": "RandomForestRegressor",
+    "selection_validation": {
+      "composite_score": 0.769634,
+      "mae": 6.636992,
+      "r2": 0.669993,
+      "rmse": 8.340747
+    },
+    "validation_verdict": "WARN"
+  },
+  "final_acceptance": {
+    "acceptance_metric": "composite_score",
+    "accepted": true,
+    "best_model_name": "RandomForestRegressor",
+    "decision_reason": "accepted: measured improvement meets threshold",
+    "source_of_truth": "best_search_result.json"
+  },
+  "final_artifact_validation": {
+    "consistent": true,
+    "mismatch_count": 0,
+    "source_of_truth": "best_search_result.json"
+  },
+  "research_results": [
+    {
+      "experiment_id": "scout-001-randomforestregressor-balanced",
+      "model_name": "RandomForestRegressor",
+      "proposal_family": "RandomForestRegressor-balanced",
+      "selection_status": "scout_promising",
+      "stage": "scout"
+    },
+    {
+      "experiment_id": "scout-002-randomforestregressor-conservative",
+      "model_name": "RandomForestRegressor",
+      "proposal_family": "RandomForestRegressor-conservative",
+      "selection_status": "scout_promising",
+      "stage": "scout"
+    },
+    {
+      "experiment_id": "scout-003-randomforestregressor-expansive",
+      "model_name": "RandomForestRegressor",
+      "proposal_family": "RandomForestRegressor-expansive",
+      "selection_status": "scout_promising",
+      "stage": "scout"
+    },
+    {
+      "experiment_id": "confirm-scout-001-randomforestregressor-balanced",
+      "model_name": "RandomForestRegressor",
+      "proposal_family": "RandomForestRegressor-balanced",
+      "selection_status": "kept",
+      "stage": "confirm"
+    }
+  ],
+  "run_manifest": {
+    "backend": "disabled",
+    "final_run_status": "success",
+    "model": null,
+    "number_of_candidates_evaluated": 4,
+    "preflight_status": "failed",
+    "smoke_test_status": "aborted_due_to_preflight_failure"
+  },
+  "uncertainty_calibration": {
+    "audit_partition": "validation_audit",
+    "coverage": 1.0,
+    "global_status": "PASS",
+    "mean_interval_width": 47.200842
+  }
+}

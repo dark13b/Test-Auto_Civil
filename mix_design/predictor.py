@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
@@ -32,17 +32,46 @@ class MixPerformancePredictor:
             normalized["structural_application"] = str(context.structural_application).strip().lower().replace(" ", "_")
         return normalized
 
-    def _frame_from_mix(
+    def build_candidate_frame(
         self,
         mix_design: Mapping[str, float],
         context: DesignContext | None = None,
     ) -> pd.DataFrame:
+        """Convert one candidate mix into the predictor input frame."""
+
         normalized_mix = {column: float(mix_design[column]) for column in self.base_columns}
         for column in ("slag", "fly_ash"):
             if abs(normalized_mix[column]) < 1.0:
                 normalized_mix[column] = 0.0
         normalized_mix.update(self._normalize_context(context))
         return pd.DataFrame([normalized_mix])
+
+    def _frame_from_mix(
+        self,
+        mix_design: Mapping[str, float],
+        context: DesignContext | None = None,
+    ) -> pd.DataFrame:
+        """Backward-compatible alias for callers migrated from the legacy tool."""
+
+        return self.build_candidate_frame(mix_design, context=context)
+
+    def predict_strengths(
+        self,
+        mix_designs: Sequence[Mapping[str, float]],
+        *,
+        context: DesignContext | None = None,
+    ) -> list[float]:
+        """Predict strengths for several candidate mixes without packaging intervals."""
+
+        if not mix_designs:
+            return []
+        frame = pd.concat(
+            [self.build_candidate_frame(mix_design, context=context) for mix_design in mix_designs],
+            ignore_index=True,
+        )
+        engineered = build_engineering_features(frame, config=self.config)
+        predictions = self.model.predict(engineered[self.feature_columns])
+        return [float(value) for value in predictions]
 
     def _build_uncertainty_interval(
         self,
@@ -87,7 +116,7 @@ class MixPerformancePredictor:
     ) -> PredictionResult:
         """Predict performance for one mix candidate."""
 
-        candidate_frame = self._frame_from_mix(mix_design, context=context)
+        candidate_frame = self.build_candidate_frame(mix_design, context=context)
         engineered = build_engineering_features(candidate_frame, config=self.config)
         predicted_strength = float(self.model.predict(engineered[self.feature_columns])[0])
         interval = self._build_uncertainty_interval(

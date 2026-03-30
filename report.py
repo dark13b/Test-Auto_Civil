@@ -15,10 +15,15 @@ import numpy as np
 import pandas as pd
 from sklearn.inspection import permutation_importance
 
-from artifact_contracts import map_deprecated_artifact_payload
+from artifact_contracts import (
+    extract_artifact_lineage,
+    normalize_uncertainty_artifact,
+    map_deprecated_artifact_payload,
+)
 from train_impl import (
     artifact_id,
     artifact_run_id,
+    compute_config_hash,
     compute_regression_metrics,
     EngineeringValidator,
     get_outputs_dir,
@@ -488,7 +493,20 @@ def main() -> int:
             outputs_dir=outputs_dir,
             audit_partition="holdout",
         )
-        uncertainty_audit = uncertainty_estimator.calibration_report()
+        uncertainty_expected_lineage = extract_artifact_lineage(
+            best_search_result,
+            fallback_model_id=str(best_search_result.get("model_name", "")).strip() or None,
+        )
+        if active_run_id:
+            uncertainty_expected_lineage["run_id"] = str(active_run_id)
+        if not uncertainty_expected_lineage.get("config_hash"):
+            uncertainty_expected_lineage["config_hash"] = compute_config_hash(config)
+        uncertainty_audit = normalize_uncertainty_artifact(
+            uncertainty_estimator.calibration_report(),
+            expected_lineage=uncertainty_expected_lineage,
+            allow_provenance_fill=True,
+            fallback_model_id=str(best_search_result.get("model_name", "")).strip() or None,
+        )
         interval_frame = uncertainty_estimator.predict_with_interval(best_features)
         audit_coverages = {
             int(row["bin_id"]): float(row["observed_coverage"])
@@ -535,6 +553,8 @@ def main() -> int:
                 "baseline_rmse_by_range": baseline_rmse_by_range,
                 "uncertainty_summary": uncertainty_summary,
                 "uncertainty_audit": uncertainty_audit,
+                "uncertainty_source_label": uncertainty_audit.get("source_label"),
+                "uncertainty_lineage_status": uncertainty_audit.get("lineage_status"),
                 "regime_specific_modeling": regime_specific_modeling,
             }
         )

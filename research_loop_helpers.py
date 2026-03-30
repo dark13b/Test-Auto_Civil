@@ -34,14 +34,14 @@ def _read_baseline_metrics(outputs_dir: Path, config: dict[str, Any]) -> dict[st
     if baseline_path.exists():
         return load_json_file(baseline_path)
 
-    import train
+    import train_impl
 
-    original_load_config = train.load_config
-    train.load_config = lambda: config
+    original_load_config = train_impl.load_config
+    train_impl.load_config = lambda: config
     try:
-        exit_code = train.main()
+        exit_code = train_impl.main()
     finally:
-        train.load_config = original_load_config
+        train_impl.load_config = original_load_config
     if exit_code != 0:
         raise RuntimeError("Baseline training failed while preparing the research loop.")
     return load_json_file(baseline_path)
@@ -84,7 +84,7 @@ def _build_record(
     research_results_columns: list[str] | None = None,
 ) -> dict[str, Any]:
     columns = list(research_results_columns or RESEARCH_RESULTS_COLUMNS)
-    record = {column: None for column in columns}
+    record: dict[str, Any] = {column: None for column in columns}
     record.update(
         {
             "trial_number": trial_number,

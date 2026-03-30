@@ -1,6 +1,7 @@
 """Canonical concrete mix design subsystem package."""
 
 from mix_design.contracts import (
+    CandidateProposal,
     CandidateScenario,
     ConstraintCheck,
     ConstraintEvaluation,
@@ -10,6 +11,7 @@ from mix_design.contracts import (
     ObjectiveComponentScore,
     ObjectiveScorecard,
     ObjectiveSpec,
+    OptimizationResult,
     PredictionResult,
     RangeConstraint,
     ScenarioComparisonResult,
@@ -19,6 +21,7 @@ from mix_design.contracts import (
 )
 
 __all__ = [
+    "CandidateProposal",
     "CandidateScenario",
     "ConstraintCheck",
     "ConstraintEvaluation",
@@ -28,6 +31,7 @@ __all__ = [
     "ObjectiveComponentScore",
     "ObjectiveScorecard",
     "ObjectiveSpec",
+    "OptimizationResult",
     "PredictionResult",
     "RangeConstraint",
     "ScenarioComparisonResult",

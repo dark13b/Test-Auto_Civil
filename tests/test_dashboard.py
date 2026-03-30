@@ -93,6 +93,11 @@ class DashboardTests(unittest.TestCase):
                 json.dumps(
                     {
                         "artifact_kind": "search_selection",
+                        "run_id": "run-123",
+                        "config_hash": "config-hash-123",
+                        "model_artifact_id": "model-artifact-123",
+                        "model_id": "LGBMRegressor",
+                        "model_fingerprint": "model-artifact-123",
                         "model_name": "LGBMRegressor",
                         "cross_validation": {
                             "stage": "cross_validation",
@@ -129,6 +134,8 @@ class DashboardTests(unittest.TestCase):
                 json.dumps(
                     {
                         "artifact_kind": "final_holdout_evaluation",
+                        "run_id": "run-123",
+                        "config_hash": "config-hash-123",
                         "selected_model": {"model_name": "LGBMRegressor"},
                         "holdout_metrics": {
                             "stage": "final_holdout",
@@ -149,6 +156,11 @@ class DashboardTests(unittest.TestCase):
                         },
                         "uncertainty_audit": {
                             "artifact_kind": "uncertainty_audit",
+                            "run_id": "run-123",
+                            "config_hash": "config-hash-123",
+                            "model_artifact_id": "model-artifact-123",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact-123",
                             "audit_partition": "holdout",
                             "calibration_partition": "validation_audit",
                             "coverage_target": 0.9,
@@ -180,6 +192,11 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["holdout_metrics"]["aggregate"]["composite_score"], 0.84)
         self.assertEqual(payload["holdout_metrics"]["source_label"], "Final holdout metrics")
         self.assertEqual(payload["uncertainty_audit"]["source_type"], "uncertainty_audit")
+        self.assertEqual(payload["uncertainty_audit"]["lineage_status"], "verified")
+        self.assertEqual(payload["uncertainty_audit"]["lineage"]["run_id"], "run-123")
+        self.assertEqual(payload["uncertainty_audit"]["lineage"]["model_fingerprint"], "model-artifact-123")
+        self.assertIn("run-123", payload["uncertainty_audit"]["source_label"])
+        self.assertIn("model-artifact-123", payload["uncertainty_audit"]["source_label"])
 
     def test_dashboard_requires_auth_even_without_env_password(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
@@ -555,6 +572,112 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["decision_metric"]["source_type"], "selection_validation")
         self.assertEqual(payload["decision_metric"]["source_label"], "Validation metrics")
         self.assertIsNone(payload["final"].get("holdout_composite"))
+
+    def test_api_overview_flags_uncertainty_lineage_mismatch(self) -> None:
+        dashboard = importlib.import_module("dashboard")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs_dir = Path(tmpdir)
+            (outputs_dir / "baseline_metrics.json").write_text(
+                json.dumps({"model_name": "RandomForestRegressor", "composite_score": 0.9}),
+                encoding="utf-8",
+            )
+            (outputs_dir / "best_search_result.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "search_selection",
+                        "run_id": "run-current",
+                        "config_hash": "config-hash-current",
+                        "model_artifact_id": "model-artifact-current",
+                        "model_id": "LGBMRegressor",
+                        "model_fingerprint": "model-artifact-current",
+                        "model_name": "LGBMRegressor",
+                        "selection_validation": {
+                            "stage": "selection_validation",
+                            "partition": "validation",
+                            "aggregate": {
+                                "rmse": 2.0,
+                                "mae": 1.0,
+                                "r2": 0.7,
+                                "composite_score": 0.8,
+                            },
+                        },
+                        "selection_validation_report": {
+                            "verdict": "PASS",
+                            "pass_rate": 1.0,
+                            "hard_constraint_count": 0,
+                            "engineering_caution_count": 0,
+                            "data_review_flag_count": 0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (outputs_dir / "final_holdout_evaluation.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_kind": "final_holdout_evaluation",
+                        "run_id": "run-current",
+                        "config_hash": "config-hash-current",
+                        "selected_model": {
+                            "model_name": "LGBMRegressor",
+                            "run_id": "run-current",
+                            "config_hash": "config-hash-current",
+                            "model_artifact_id": "model-artifact-current",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact-current",
+                        },
+                        "holdout_metrics": {
+                            "stage": "final_holdout",
+                            "partition": "holdout",
+                            "aggregate": {
+                                "rmse": 1.0,
+                                "mae": 0.5,
+                                "r2": 0.8,
+                                "composite_score": 0.84,
+                            },
+                        },
+                        "holdout_validation_report": {
+                            "verdict": "PASS",
+                            "pass_rate": 1.0,
+                            "hard_constraint_count": 0,
+                            "engineering_caution_count": 0,
+                            "data_review_flag_count": 0,
+                        },
+                        "uncertainty_audit": {
+                            "artifact_kind": "uncertainty_audit",
+                            "run_id": "run-stale",
+                            "config_hash": "config-hash-stale",
+                            "model_artifact_id": "model-artifact-stale",
+                            "model_id": "LGBMRegressor",
+                            "model_fingerprint": "model-artifact-stale",
+                            "audit_partition": "holdout",
+                            "calibration_partition": "validation_audit",
+                            "coverage_target": 0.9,
+                            "coverage": 0.92,
+                            "coverage_audit": {"expected_partition": "holdout"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(dashboard, "OUTPUTS_DIR", outputs_dir), patch.object(
+                dashboard,
+                "DASHBOARD_PASSWORD",
+                "dummy",
+            ):
+                client = dashboard.app.test_client()
+                response = client.get(
+                    "/api/overview",
+                    headers={"Authorization": "Basic YXV0b2NpdmlsOmR1bW15"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        warnings = payload.get("warnings") or []
+        warning_messages = {warning.get("message") for warning in warnings}
+        self.assertIn("Uncertainty audit lineage does not match the active model lineage.", warning_messages)
+        self.assertEqual(payload["final"]["uncertainty_lineage_status"], "mismatch")
 
     def test_api_overview_treats_empty_holdout_artifact_as_missing_evidence(self) -> None:
         dashboard = importlib.import_module("dashboard")

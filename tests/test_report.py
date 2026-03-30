@@ -61,6 +61,10 @@ def _search_selection_payload(**overrides) -> dict:
         "artifact_kind": "search_selection",
         "run_id": "run-current",
         "artifact_id": "best-search-artifact",
+        "config_hash": "config-hash-current",
+        "model_artifact_id": "model-artifact-current",
+        "model_id": "Ridge",
+        "model_fingerprint": "model-artifact-current",
         "model_name": "Ridge",
         "hyperparameters": {"alpha": 1.0},
         "trial_number": 31,
@@ -212,6 +216,11 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(final_metrics["selected_model"]["model_name"], "Ridge")
         self.assertEqual(_FakeUncertaintyEstimator.last_kwargs["audit_partition"], "holdout")
         self.assertEqual(final_metrics["uncertainty_summary"]["coverage_audit"]["expected_partition"], "holdout")
+        self.assertEqual(final_metrics["uncertainty_audit"]["run_id"], "run-current")
+        self.assertEqual(final_metrics["uncertainty_audit"]["config_hash"], "config-hash-current")
+        self.assertEqual(final_metrics["uncertainty_audit"]["model_fingerprint"], "model-artifact-current")
+        self.assertIn("run-current", final_metrics["uncertainty_source_label"])
+        self.assertIn("model-artifact-current", final_metrics["uncertainty_source_label"])
         self.assertIn("regime_specific_modeling", final_metrics)
         self.assertIn("structured_metrics_summary", final_metrics["regime_specific_modeling"])
         self.assertIn("pass_fail", final_metrics["regime_specific_modeling"])
