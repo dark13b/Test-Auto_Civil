@@ -175,7 +175,13 @@ def normalize_result_payload(payload):
 
     normalized = dict(payload)
     cv_metrics = normalized.get("cv_metrics") or {}
-    test_metrics = normalized.get("test_metrics") or {}
+    selection_metrics = (
+        normalized.get("selection_metrics")
+        or normalized.get("val_metrics")
+        or normalized.get("test_metrics")
+        or {}
+    )
+    holdout_metrics = normalized.get("holdout_metrics") or {}
     validation_report = normalized.get("validation_report") or {}
 
     normalized["validation"] = normalized.get("validation_verdict") or normalized.get("validation")
@@ -185,17 +191,29 @@ def normalize_result_payload(payload):
     normalized["cv_composite"] = coerce_number(
         normalized.get("cv_composite") or cv_metrics.get("composite_score") or normalized.get("composite_score")
     )
+    normalized["validation_rmse"] = coerce_number(
+        normalized.get("validation_rmse") or selection_metrics.get("rmse")
+    )
+    normalized["validation_mae"] = coerce_number(
+        normalized.get("validation_mae") or selection_metrics.get("mae")
+    )
+    normalized["validation_r2"] = coerce_number(
+        normalized.get("validation_r2") or selection_metrics.get("r2")
+    )
+    normalized["validation_composite"] = coerce_number(
+        normalized.get("validation_composite") or selection_metrics.get("composite_score")
+    )
     normalized["holdout_rmse"] = coerce_number(
-        normalized.get("holdout_rmse") or test_metrics.get("rmse")
+        normalized.get("holdout_rmse") or holdout_metrics.get("rmse")
     )
     normalized["holdout_mae"] = coerce_number(
-        normalized.get("holdout_mae") or test_metrics.get("mae")
+        normalized.get("holdout_mae") or holdout_metrics.get("mae")
     )
     normalized["holdout_r2"] = coerce_number(
-        normalized.get("holdout_r2") or test_metrics.get("r2")
+        normalized.get("holdout_r2") or holdout_metrics.get("r2")
     )
     normalized["holdout_composite"] = coerce_number(
-        normalized.get("holdout_composite") or test_metrics.get("composite_score")
+        normalized.get("holdout_composite") or holdout_metrics.get("composite_score")
     )
     normalized["best_trial"] = normalized.get("best_trial", normalized.get("trial_number"))
 
@@ -1274,7 +1292,7 @@ async function loadOverview() {
   const b = d.baseline || {};
   const best = d.best || {};
   const fin = d.final || {};
-  const bestMetricSource = best.holdout_composite != null ? 'Holdout' : ((best.cv_composite != null || best.composite != null) ? 'CV' : 'N/A');
+  const bestMetricSource = best.holdout_composite != null ? 'Holdout' : (best.validation_composite != null ? 'Validation' : ((best.cv_composite != null || best.composite != null) ? 'CV' : 'N/A'));
   document.getElementById('tb-dataset').textContent =
     `Dataset: ${d.dataset_rows || '—'} rows`;
 
@@ -1571,7 +1589,7 @@ function renderCharts(){
 
   // Improvement gauge
   const bComp = +(baseline.cv_composite||baseline.composite||0);
-  const bestComp = +(best.holdout_composite||best.composite||0);
+  const bestComp = +(best.validation_composite||best.cv_composite||best.composite||0);
   if(chartImprovement) chartImprovement.destroy();
   chartImprovement = new Chart(document.getElementById('chart-improvement'),{
     type:'doughnut',

@@ -11,6 +11,7 @@ from research_protocol import (
     build_family_state_summary,
     filter_diverse_candidates,
     gate_proposal,
+    gate_research_proposal,
     load_human_research_brief,
     load_or_initialize_experiment_memory,
     read_research_surface_state,
@@ -42,6 +43,45 @@ class ResearchProtocolTests(unittest.TestCase):
         self.duplicate_settings = {
             "numeric_tolerance": 0.05,
             "float_round_digits": 4,
+        }
+
+    def _research_proposal(
+        self,
+        *,
+        model_name: str = "ModelFamilyA",
+        params: dict[str, object] | None = None,
+        hypothesis: str = "Reduce depth slightly to improve generalization.",
+        rationale: str = "The current family is close to a plateau.",
+        change_type: str = "hyperparameter",
+        target_component: str = "ModelFamilyA",
+        proposed_change: str = "Decrease depth to 3 while keeping learning_rate near 0.1.",
+        expected_direction: str = "improve",
+        expected_metric_effect: dict[str, str] | None = None,
+        confidence: float = 0.64,
+        novelty_claim: str = "This proposal makes a bounded change to the search surface.",
+        risk_notes: str = "May underfit if the change is too aggressive.",
+        candidate_model_name: str | None = None,
+        candidate_params: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        raw_params = params if candidate_params is None else candidate_params
+        if raw_params is None:
+            raw_params = {"depth": 3, "learning_rate": 0.1}
+        return {
+            "hypothesis": hypothesis,
+            "rationale": rationale,
+            "change_type": change_type,
+            "target_component": target_component,
+            "proposed_change": proposed_change,
+            "expected_direction": expected_direction,
+            "expected_metric_effect": expected_metric_effect
+            or {"metric": "rmse", "direction": "down", "magnitude_estimate": "0.03-0.08 MPa"},
+            "confidence": confidence,
+            "novelty_claim": novelty_claim,
+            "risk_notes": risk_notes,
+            "candidate_config": {
+                "model_name": candidate_model_name or model_name,
+                "params": dict(raw_params),
+            },
         }
 
     def test_load_human_research_brief_front_matter(self) -> None:
@@ -78,8 +118,14 @@ class ResearchProtocolTests(unittest.TestCase):
                 "hyperparameters": json.dumps({"n_estimators": 300, "learning_rate": 0.05}),
                 "selection_status": "new_best",
                 "composite_score": 0.91,
+                "rmse": 4.8,
+                "test_rmse": 4.7,
                 "validation_verdict": "WARN",
                 "proposal_family": "boosting-balanced",
+                "expected_delta_rmse": 0.2,
+                "actual_delta_rmse": 0.1,
+                "calibration_error": 0.1,
+                "novelty_score": 0.44,
             }
             record_experiment_memory(
                 memory_path=memory_path,
@@ -88,8 +134,10 @@ class ResearchProtocolTests(unittest.TestCase):
             )
 
             parsed_again = load_or_initialize_experiment_memory(memory_path)
+            self.assertEqual(parsed_again["schema_version"], 3)
             self.assertEqual(len(parsed_again["runs"]), 1)
             self.assertEqual(len(parsed_again["runs"][0]["trials"]), 1)
+            self.assertEqual(parsed_again["runs"][0]["trials"][0]["novelty_score"], 0.44)
 
             signature = build_config_signature("LGBMRegressor", {"n_estimators": 300, "learning_rate": 0.05})
             self.assertTrue(
@@ -140,6 +188,225 @@ class ResearchProtocolTests(unittest.TestCase):
 
         self.assertFalse(result["accepted"])
         self.assertEqual(result["reason"]["code"], "exact_duplicate")
+        self.assertIn("novelty_score", result)
+
+    def test_gate_research_proposal_rejects_exact_duplicate(self) -> None:
+        proposal = self._research_proposal(
+            proposed_change="Keep depth at 3 and learning_rate at 0.1.",
+            candidate_params={"depth": 3, "learning_rate": 0.1},
+        )
+        trial_history = [
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 3, "learning_rate": 0.1}),
+                "proposal_family": "family-a",
+                "composite_score": 0.91,
+                "validation_verdict": "WARN",
+            }
+        ]
+        memory_payload = {"runs": [], "accepted_experiments": []}
+
+        result = gate_research_proposal(
+            proposal=proposal,
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=trial_history,
+            family_state=build_family_state_summary(
+                available_models=self.available_models,
+                current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+                trial_history=trial_history,
+                memory_payload=memory_payload,
+                diversity_settings={"max_family_share": 0.35},
+            ),
+            duplicate_settings=self.duplicate_settings,
+            archive_records=[],
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["semantic_rejection_reason"]["code"], "duplicate_proposal")
+
+    def test_gate_research_proposal_rejects_near_duplicate_with_float_tolerance(self) -> None:
+        proposal = self._research_proposal(
+            proposed_change="Decrease learning_rate to 0.104 while keeping depth at 3.",
+            candidate_params={"depth": 3, "learning_rate": 0.104},
+        )
+        trial_history = [
+            {
+                "model_name": "ModelFamilyA",
+                "hyperparameters": json.dumps({"depth": 3, "learning_rate": 0.1000}),
+                "proposal_family": "family-a",
+                "composite_score": 0.89,
+                "validation_verdict": "WARN",
+            }
+        ]
+        memory_payload = {"runs": [], "accepted_experiments": []}
+        family_state = build_family_state_summary(
+            available_models=self.available_models,
+            current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+            trial_history=trial_history,
+            memory_payload=memory_payload,
+            diversity_settings={"max_family_share": 0.35},
+        )
+
+        result = gate_research_proposal(
+            proposal=proposal,
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=trial_history,
+            family_state=family_state,
+            duplicate_settings=self.duplicate_settings,
+            archive_records=[],
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["semantic_rejection_reason"]["code"], "near_duplicate_proposal")
+
+    def test_gate_research_proposal_rejects_schema_valid_but_meaningless_candidate_config(self) -> None:
+        proposal = self._research_proposal(candidate_params={})
+        memory_payload = {"runs": [], "accepted_experiments": []}
+
+        result = gate_research_proposal(
+            proposal=proposal,
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=[],
+            family_state=build_family_state_summary(
+                available_models=self.available_models,
+                current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+                trial_history=[],
+                memory_payload=memory_payload,
+                diversity_settings={"max_family_share": 0.35},
+            ),
+            duplicate_settings=self.duplicate_settings,
+            archive_records=[],
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["semantic_rejection_reason"]["code"], "semantically_invalid_candidate_config")
+
+    def test_gate_research_proposal_rejects_inconsistent_hypothesis_vs_config(self) -> None:
+        proposal = self._research_proposal(
+            proposed_change="Decrease depth to 5 and keep learning_rate at 0.05.",
+            candidate_params={"depth": 3, "learning_rate": 0.1},
+        )
+        memory_payload = {"runs": [], "accepted_experiments": []}
+
+        result = gate_research_proposal(
+            proposal=proposal,
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=[],
+            family_state=build_family_state_summary(
+                available_models=self.available_models,
+                current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+                trial_history=[],
+                memory_payload=memory_payload,
+                diversity_settings={"max_family_share": 0.35},
+            ),
+            duplicate_settings=self.duplicate_settings,
+            archive_records=[],
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["semantic_rejection_reason"]["code"], "inconsistent_expected_effect")
+
+    def test_gate_research_proposal_rejects_novelty_claim_contradicted_by_archive(self) -> None:
+        proposal = self._research_proposal(
+            novelty_claim="No accepted run used this setting.",
+        )
+        archive_records = [
+            {
+                "outcome": "accepted",
+                "proposal": {
+                    "model_name": "ModelFamilyA",
+                    "params": {"depth": 3, "learning_rate": 0.1},
+                }
+            }
+        ]
+        memory_payload = {"runs": [], "accepted_experiments": []}
+
+        result = gate_research_proposal(
+            proposal=proposal,
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=[],
+            family_state=build_family_state_summary(
+                available_models=self.available_models,
+                current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+                trial_history=[],
+                memory_payload=memory_payload,
+                diversity_settings={"max_family_share": 0.35},
+            ),
+            duplicate_settings=self.duplicate_settings,
+            archive_records=archive_records,
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["semantic_rejection_reason"]["code"], "unsupported_novelty_claim")
+
+    def test_gate_research_proposal_ignores_pending_archive_records_for_novelty_checks(self) -> None:
+        proposal = self._research_proposal(
+            novelty_claim="This is a new configuration.",
+        )
+        archive_records = [
+            {
+                "outcome": "pending",
+                "proposal": {
+                    "model_name": "ModelFamilyA",
+                    "params": {"depth": 3, "learning_rate": 0.1},
+                },
+            }
+        ]
+        memory_payload = {"runs": [], "accepted_experiments": []}
+
+        result = gate_research_proposal(
+            proposal=proposal,
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=[],
+            family_state=build_family_state_summary(
+                available_models=self.available_models,
+                current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+                trial_history=[],
+                memory_payload=memory_payload,
+                diversity_settings={"max_family_share": 0.35},
+            ),
+            duplicate_settings=self.duplicate_settings,
+            archive_records=archive_records,
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["semantic_validation_result"], "passed")
+
+    def test_gate_research_proposal_rejects_invalid_candidate_config_mapping(self) -> None:
+        proposal = self._research_proposal(candidate_model_name="MissingFamily")
+        memory_payload = {"runs": [], "accepted_experiments": []}
+
+        result = gate_research_proposal(
+            proposal=proposal,
+            available_models=self.available_models,
+            current_run_signatures=set(),
+            memory_payload=memory_payload,
+            trial_history=[],
+            family_state=build_family_state_summary(
+                available_models=self.available_models,
+                current_best={"model_name": "ModelFamilyA", "composite_score": 0.90},
+                trial_history=[],
+                memory_payload=memory_payload,
+                diversity_settings={"max_family_share": 0.35},
+            ),
+            duplicate_settings=self.duplicate_settings,
+            archive_records=[],
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["semantic_rejection_reason"]["code"], "non_executable_semantic_config")
 
     def test_gate_proposal_rejects_near_duplicate_with_float_tolerance(self) -> None:
         trial_history = [
@@ -171,6 +438,7 @@ class ResearchProtocolTests(unittest.TestCase):
 
         self.assertFalse(result["accepted"])
         self.assertEqual(result["reason"]["code"], "near_duplicate")
+        self.assertLess(result["novelty_score"], 0.30)
 
     def test_gate_proposal_rejects_saturated_family_when_recent_run_is_too_similar(self) -> None:
         trial_history = [

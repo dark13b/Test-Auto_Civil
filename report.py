@@ -393,6 +393,11 @@ def main() -> int:
         config = load_config()
         set_global_seed(int(config["experiment"]["random_seed"]))
         outputs_dir = get_outputs_dir(config)
+        final_acceptance_path = outputs_dir / "final_acceptance.json"
+        if not final_acceptance_path.exists():
+            raise FileNotFoundError(
+                "final_acceptance.json is required before running the final holdout report."
+            )
 
         baseline_metrics = load_json_artifact(outputs_dir / "baseline_metrics.json")
         baseline_model = load_pickle_artifact(outputs_dir / "baseline_model.pkl")
@@ -457,10 +462,8 @@ def main() -> int:
             config=config,
             target_mean=float(y_train.mean()),
         )
-        validation_report = validator.validate_model(best_model, best_features, y_test)
-        validation_result = dict(best_search_result)
-        validation_result["validation_verdict"] = validation_report["verdict"]
-        validation_result["validation_report"] = validation_report
+        holdout_validation_report = validator.validate_model(best_model, best_features, y_test)
+        selection_validation_report = dict(best_search_result.get("validation_report", {}))
         baseline_rmse_by_range = compute_rmse_by_range(y_test, baseline_pred)
 
         create_search_progress_plot(optuna_results, float(baseline_metrics["composite_score"]), outputs_dir)
@@ -502,18 +505,22 @@ def main() -> int:
             float(baseline_metrics["composite_score"]),
             float(best_search_result["composite_score"]),
         )
-        validation_summary = summarize_validation_report(validation_report)
+        selection_validation_summary = summarize_validation_report(selection_validation_report)
+        holdout_validation_summary = summarize_validation_report(holdout_validation_report)
         final_metrics = dict(existing_final_metrics) if isinstance(existing_final_metrics, dict) else {}
         final_metrics.update(
             {
                 "baseline_metrics": baseline_metrics,
-                "best_search_metrics": validation_result,
+                "best_search_metrics": dict(best_search_result),
                 "improvement_percentage": improvement_percentage,
                 "composite_improvement_pct": improvement_percentage,
-                "validation_verdict": validation_result["validation_verdict"],
-                "best_model_name": validation_result["model_name"],
-                "best_model_hyperparameters": validation_result["hyperparameters"],
-                "validation_summary": validation_summary,
+                "validation_verdict": best_search_result["validation_verdict"],
+                "best_model_name": best_search_result["model_name"],
+                "best_model_hyperparameters": best_search_result["hyperparameters"],
+                "validation_summary": selection_validation_summary,
+                "holdout_validation_verdict": holdout_validation_report["verdict"],
+                "holdout_validation_report": holdout_validation_report,
+                "holdout_validation_summary": holdout_validation_summary,
                 "holdout_metrics": holdout_metrics,
                 "rmse_by_range": rmse_by_range,
                 "baseline_rmse_by_range": baseline_rmse_by_range,
@@ -539,13 +546,14 @@ def main() -> int:
         )
 
         log_status(
-            f"Final report ready. Best model={validation_result['model_name']} | "
-            f"Composite={validation_result['composite_score']:.4f} | "
+            f"Final report ready. Best model={best_search_result['model_name']} | "
+            f"Composite={best_search_result['composite_score']:.4f} | "
             f"Improvement={improvement_percentage:.2f}% | "
-            f"Validation={validation_result['validation_verdict']} | "
-            f"HardConstraints={validation_summary['hard_constraint_count']} | "
-            f"EngineeringCautions={validation_summary['engineering_caution_count']} | "
-            f"DataReviewFlags={validation_summary['data_review_flag_count']}"
+            f"SelectionValidation={best_search_result['validation_verdict']} | "
+            f"HoldoutValidation={holdout_validation_report['verdict']} | "
+            f"HardConstraints={holdout_validation_summary['hard_constraint_count']} | "
+            f"EngineeringCautions={holdout_validation_summary['engineering_caution_count']} | "
+            f"DataReviewFlags={holdout_validation_summary['data_review_flag_count']}"
         )
         return 0
     except Exception as exc:

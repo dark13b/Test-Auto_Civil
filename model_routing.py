@@ -23,7 +23,7 @@ def resolve_model_for_backend(
     default_local = str(
         llm_config.get("default_local_proposal_model")
         or llm_config.get("ollama", {}).get("model")
-        or "qwen3:8b"
+        or "qwen3-coder:480b-cloud"
     )
     default_openai = str(
         llm_config.get("default_openai_model")

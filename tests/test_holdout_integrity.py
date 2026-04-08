@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from benchmark import rank_results
 from train import split_dataset
 
 
@@ -26,6 +27,44 @@ def _extract_function_block(source: str, function_name: str) -> str:
 
 
 class HoldoutIntegrityTests(unittest.TestCase):
+    def test_benchmark_ranking_uses_selection_metrics_not_holdout_metrics(self) -> None:
+        ranked = rank_results(
+            [
+                {
+                    "model_name": "ScientificallyValidWinner",
+                    "display_name": "Scientifically Valid Winner",
+                    "cv_composite": 0.92,
+                    "validation_composite": 0.88,
+                    "validation_rmse": 3.0,
+                    "validation_mae": 2.0,
+                    "validation_r2": 0.82,
+                    "validation_verdict": "PASS",
+                    "cv_rmse_std": 0.05,
+                    "training_time_seconds": 1.0,
+                    "holdout_rmse": 9.0,
+                    "holdout_mae": 8.0,
+                    "holdout_r2": 0.10,
+                },
+                {
+                    "model_name": "HoldoutOnlyWinner",
+                    "display_name": "Holdout Only Winner",
+                    "cv_composite": 0.40,
+                    "validation_composite": 0.35,
+                    "validation_rmse": 8.0,
+                    "validation_mae": 7.0,
+                    "validation_r2": 0.20,
+                    "validation_verdict": "PASS",
+                    "cv_rmse_std": 0.20,
+                    "training_time_seconds": 1.0,
+                    "holdout_rmse": 0.1,
+                    "holdout_mae": 0.1,
+                    "holdout_r2": 0.99,
+                },
+            ]
+        )
+
+        self.assertEqual(ranked[0]["model_name"], "ScientificallyValidWinner")
+
     def test_split_dataset_creates_train_validation_and_test_partitions(self) -> None:
         frame = pd.DataFrame(
             {
@@ -78,24 +117,17 @@ class HoldoutIntegrityTests(unittest.TestCase):
             self.assertNotRegex(block, r"\bx_test\b", msg=function_name)
             self.assertNotRegex(block, r"\by_test\b", msg=function_name)
 
-    def test_benchmark_module_uses_x_test_not_x_val_for_evaluation(self) -> None:
+    def test_benchmark_module_uses_validation_for_selection_and_holdout_only_for_final_winner(self) -> None:
         source = _read("benchmark.py")
-        eval_block = _extract_function_block(source, "evaluate_benchmark_model")
-        # The function signature must accept x_val and y_val as parameter names
-        # but the call site in main() must pass x_test/y_test, not x_val/y_val.
         main_block = _extract_function_block(source, "main")
-        self.assertIn("x_test", main_block,
-            "benchmark.main() must pass x_test to evaluate_benchmark_model")
-        self.assertIn("y_test", main_block,
-            "benchmark.main() must pass y_test to evaluate_benchmark_model")
-        # Confirm x_val is NOT passed as the evaluation set in main()
-        # (it may still be present for other uses — the check is that
-        # evaluate_benchmark_model is not called with x_val as the eval arg)
-        self.assertNotIn(
-            "x_val, y_val, config",
+        self.assertIn("evaluate_benchmark_model(", main_block)
+        self.assertIn("x_val,", main_block, "benchmark.main() must rank candidate models on x_val, not x_test")
+        self.assertIn(
+            "evaluate_final_holdout_winner(",
             main_block,
-            "benchmark.main() must not call evaluate_benchmark_model with x_val"
+            "benchmark.main() must reserve x_test for one-time final winner reporting",
         )
+        self.assertIn("x_test,", main_block, "benchmark.main() must pass x_test only to the final holdout helper")
 
 
 if __name__ == "__main__":
