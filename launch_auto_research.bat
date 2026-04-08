@@ -12,6 +12,7 @@ if not exist "%PYTHON_EXE%" (
 
 echo Starting AutoCivil-Lab from %CD%
 echo Using Python: %PYTHON_EXE%
+echo Official runtime: research_loop.py
 echo.
 
 "%PYTHON_EXE%" research_loop.py %*

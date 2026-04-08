@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from feature_engineering import build_engineering_features
-from train import (
+from train_impl import (
     artifact_id,
     compute_file_hash,
     create_run_id,
@@ -96,7 +96,7 @@ class UncertaintyEstimator:
             raise ValueError("UncertaintyEstimator does not support refitting the model.")
         if model is None and not self.model_path.exists():
             raise FileNotFoundError(
-                f"Best search model not found at {self.model_path}. Run search.py before uncertainty.py."
+                f"Best search model not found at {self.model_path}. Run research_loop.py before uncertainty.py."
             )
 
         set_global_seed(self.seed)

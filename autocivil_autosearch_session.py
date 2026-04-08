@@ -1,4 +1,4 @@
-"""Run an AutoCivil-Lab search session with periodic status snapshots."""
+"""Session wrapper around the canonical research_loop with periodic status snapshots."""
 
 from __future__ import annotations
 

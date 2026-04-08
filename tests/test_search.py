@@ -1,15 +1,76 @@
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
+import search
 from search import build_post_search_ensemble, finalize_search_artifacts, resolve_final_best_result
 
 
 class SearchTests(unittest.TestCase):
+    def test_run_autocivil_loop_delegates_to_research_loop_with_deprecation_warning(self) -> None:
+        config = {
+            "experiment": {"optuna_trials": 30},
+            "research": {"max_cycles": 4, "max_runtime_minutes": 0},
+            "search": {
+                "min_runtime_minutes": 25,
+                "max_trial_seconds": 90,
+                "research_brief_path": "program.md",
+            },
+        }
+
+        with warnings.catch_warnings(record=True) as caught, patch(
+            "search.research_loop.run_engineering_research_loop",
+            return_value={"model_name": "LGBMRegressor", "composite_score": 0.91, "validation_verdict": "PASS"},
+        ) as run_mock, patch("search.log_status"):
+            warnings.simplefilter("always")
+            result = search.run_autocivil_loop(n_trials=12, config=config)
+
+        self.assertEqual(result["model_name"], "LGBMRegressor")
+        run_mock.assert_called_once()
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["cycles_override"], 12)
+        self.assertFalse(kwargs["with_report"])
+        delegated_config = kwargs["config_override"]
+        self.assertEqual(delegated_config["research"]["max_cycles"], 12)
+        self.assertEqual(delegated_config["research"]["max_runtime_minutes"], 25)
+        self.assertEqual(delegated_config["research"]["max_trial_seconds"], 90)
+        self.assertEqual(delegated_config["research"]["brief_path"], "program.md")
+        self.assertTrue(any("deprecated" in str(item.message).lower() for item in caught))
+
+    def test_search_main_routes_runtime_execution_through_research_loop(self) -> None:
+        config = {
+            "experiment": {"optuna_trials": 7},
+            "research": {"max_cycles": 3, "max_runtime_minutes": 0},
+            "search": {"min_runtime_minutes": 11},
+        }
+
+        with warnings.catch_warnings(record=True) as caught, patch(
+            "search.load_config",
+            return_value=config,
+        ), patch(
+            "search.research_loop.run_engineering_research_loop",
+            return_value={"model_name": "RandomForestRegressor", "composite_score": 0.88, "validation_verdict": "PASS"},
+        ) as run_mock, patch(
+            "search.log_status"
+        ), patch(
+            "sys.argv",
+            ["search.py"],
+        ):
+            warnings.simplefilter("always")
+            exit_code = search.main()
+
+        self.assertEqual(exit_code, 0)
+        run_mock.assert_called_once()
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["cycles_override"], 7)
+        self.assertFalse(kwargs["with_report"])
+        self.assertTrue(any("deprecated" in str(item.message).lower() for item in caught))
+
     def test_build_post_search_ensemble_promotes_on_cv_r2_not_holdout_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)

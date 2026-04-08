@@ -1,0 +1,74 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# AutoCivil Track B — config.yaml additions
+# ══════════════════════════════════════════════════════════════════════════════
+# Merge this block into your existing config.yaml under the top-level key:
+#   research:
+#
+# If you already have a `research:` section, add the keys below to it.
+# If you don't have one yet, add the entire block at the end of config.yaml.
+# ══════════════════════════════════════════════════════════════════════════════
+
+research:
+
+  # ── Feature Lab ────────────────────────────────────────────────────────────
+  # Set feature_lab_enabled: true to allow the LLM to propose new Python
+  # features and test them. Disabled by default (opt-in per spec).
+  feature_lab_enabled: false
+  feature_lab_interval_cycles: 3       # run FeatureLab every N main cycles
+  feature_lab_min_delta_rmse: 0.02     # minimum RMSE improvement (MPa) to promote
+  feature_lab_sandbox_timeout: 30      # hard kill after N seconds (non-negotiable)
+
+  # ── Novelty Gate ──────────────────────────────────────────────────────────
+  # Proposals with novelty_score < threshold are rejected BEFORE executing.
+  # Must be applied BEFORE the trial runs (per spec constraint 3).
+  novelty_gate_threshold: 0.20
+
+  # ── Domain Knowledge ──────────────────────────────────────────────────────
+  # Injects concrete-science rules (ACI, Ke et al., Yeh 1998, etc.) into
+  # the LLM proposal prompt. 46 rules currently in knowledge_base.py.
+  knowledge_base_enabled: true
+
+  # ── Failure Learning ──────────────────────────────────────────────────────
+  # Parses experiment_memory.json at the start of every cycle and injects
+  # known failure patterns into the LLM prompt to prevent repeating mistakes.
+  failure_analysis_enabled: true
+
+  # ── Hypothesis Archive ────────────────────────────────────────────────────
+  # Where to store the hypothesis_archive.json file (relative to outputs_dir).
+  hypothesis_archive_filename: hypothesis_archive.json
+
+  # ── Chain-of-Thought Prompting ────────────────────────────────────────────
+  # Restructures the LLM prompt to follow 4 reasoning steps:
+  #   STEP 1 DIAGNOSE → STEP 2 HYPOTHESIZE → STEP 3 PREDICT → STEP 4 PROPOSE
+  # The LLM must output expected_delta in the proposal JSON.
+  llm_chain_of_thought: true
+
+  # ── Expected Delta Requirement ────────────────────────────────────────────
+  # Requires every proposal to include an expected_delta field.
+  # This is used to measure LLM calibration over time.
+  # calibration_error = mean(|expected_delta - actual_delta|)
+  # Track B criterion: calibration_error ≤ 0.05
+  llm_require_expected_delta: true
+
+  # ── Scientific Report Review ──────────────────────────────────────────────
+  # A second LLM call reviews the generated scientific report.
+  # Scores accuracy, novelty, reproducibility (1–10).
+  # Reports with any score < 6 are flagged (advisory — never blocks the run).
+  report_review_enabled: true
+  report_review_min_score: 6           # flag if any dimension falls below this
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Validator calibration is applied in-memory (not written to config.yaml).
+# After a successful calibration run you can paste the calibrated values
+# into a `validator:` block like this example (values are illustrative):
+#
+# validator:
+#   total_binder_low_warn: 280.0        # calibrated from dataset
+#   suspicious_water_cement_ratio: 0.75
+#   fly_ash_replacement_warn: 0.35
+#   superplasticizer_max_warn: 32.0
+#   strength_min_plausible: 5.0
+#   strength_max_plausible: 100.0
+#   age_max_warn: 365
+# ══════════════════════════════════════════════════════════════════════════════

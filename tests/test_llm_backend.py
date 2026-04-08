@@ -1,8 +1,10 @@
 import os
 import unittest
+from subprocess import CompletedProcess
 from unittest.mock import MagicMock, patch
 
 from llm_backend import (
+    BackendUnavailableError,
     HybridBackend,
     NullBackend,
     OpenAIBackend,
@@ -35,12 +37,14 @@ class LLMBackendTests(unittest.TestCase):
     def test_get_llm_config_includes_safe_prompt_and_gate_defaults(self) -> None:
         llm_config = get_llm_config({})
 
-        self.assertEqual(llm_config["default_local_proposal_model"], "qwen3:8b")
+        self.assertEqual(llm_config["default_local_proposal_model"], "qwen3-coder:480b-cloud")
         self.assertEqual(llm_config["compact_prompt_models"], ["qwen3:4b"])
         self.assertTrue(llm_config["enable_regeneration_on_reject"])
         self.assertEqual(llm_config["max_regeneration_attempts"], 1)
         self.assertEqual(llm_config["duplicate_similarity_thresholds"]["numeric_tolerance"], 0.05)
         self.assertEqual(llm_config["duplicate_similarity_thresholds"]["float_round_digits"], 4)
+        self.assertEqual(llm_config["ollama"]["model"], "qwen3-coder:480b-cloud")
+        self.assertEqual(llm_config["ollama"]["timeout_seconds"], 600)
 
     def test_resolve_prompt_variant_uses_configured_compact_models(self) -> None:
         llm_config = get_llm_config({"llm": {"compact_prompt_models": ["tiny-local"]}})
@@ -209,6 +213,118 @@ class LLMBackendTests(unittest.TestCase):
         self.assertEqual(payload["transport"], "cli")
         self.assertEqual(payload["model"], "qwen3:4b")
         mock_cli.assert_called_once()
+
+    def test_ollama_cli_uses_utf8_safe_subprocess_io_for_unicode_prompt_and_response(self) -> None:
+        config = {
+            "llm": {
+                "enabled": True,
+                "backend_mode": "ollama",
+                "default_local_proposal_model": "qwen3:8b",
+                "ollama": {
+                    "model": "qwen3:8b",
+                    "base_url": "http://localhost:11434",
+                    "use_cli_fallback": True,
+                },
+            }
+        }
+        backend = OllamaBackend(config)
+        unicode_prompt = "Return JSON for warning sign \u26a0 and arabic \u0627"
+
+        def fake_run(*args: object, **kwargs: object) -> CompletedProcess[str]:
+            self.assertEqual(kwargs["encoding"], "utf-8")
+            self.assertEqual(kwargs["errors"], "replace")
+            self.assertIn("\u26a0", str(kwargs["input"]))
+            return CompletedProcess(
+                args=list(args[0]) if args else ["ollama", "run", "qwen3:8b"],
+                returncode=0,
+                stdout='{"summary":"unicode \u26a0 \u0627"}',
+                stderr="",
+            )
+
+        with patch("llm_backend.subprocess.run", side_effect=fake_run):
+            payload = backend._generate_cli(
+                unicode_prompt,
+                system_prompt="system",
+                model="qwen3:8b",
+                max_output_tokens=128,
+                temperature=0.2,
+            )
+
+        self.assertEqual(payload["transport"], "cli")
+        self.assertIn("\u26a0", payload["text"])
+        self.assertIn("\u0627", payload["response_text"])
+
+    def test_ollama_cloud_model_enforces_cloud_timeout_floor(self) -> None:
+        config = {
+            "llm": {
+                "enabled": True,
+                "backend_mode": "ollama",
+                "default_local_proposal_model": "qwen3-coder:480b-cloud",
+                "ollama": {
+                    "model": "qwen3-coder:480b-cloud",
+                    "base_url": "http://localhost:11434",
+                    "timeout_seconds": 120,
+                },
+            }
+        }
+        backend = OllamaBackend(config)
+        self.assertEqual(backend.timeout_seconds, 600)
+
+    def test_ollama_cloud_cli_uses_extended_timeout_budget(self) -> None:
+        config = {
+            "llm": {
+                "enabled": True,
+                "backend_mode": "ollama",
+                "default_local_proposal_model": "qwen3-coder:480b-cloud",
+                "ollama": {
+                    "model": "qwen3-coder:480b-cloud",
+                    "base_url": "http://localhost:11434",
+                    "timeout_seconds": 600,
+                    "use_cli_fallback": True,
+                },
+            }
+        }
+        backend = OllamaBackend(config)
+
+        with patch("llm_backend.subprocess.run", return_value=CompletedProcess(args=["ollama"], returncode=0, stdout="ok", stderr="")) as mock_run:
+            backend._generate_cli(
+                "hello",
+                system_prompt=None,
+                model="qwen3-coder:480b-cloud",
+                max_output_tokens=512,
+                temperature=0.2,
+            )
+
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], 840)
+
+    def test_ollama_http_auth_failure_includes_signin_guidance(self) -> None:
+        config = {
+            "llm": {
+                "enabled": True,
+                "backend_mode": "ollama",
+                "ollama": {
+                    "model": "qwen3-coder:480b-cloud",
+                    "base_url": "http://localhost:11434",
+                },
+            }
+        }
+        backend = OllamaBackend(config)
+        response = MagicMock()
+        response.status_code = 401
+        import requests
+
+        response.raise_for_status.side_effect = requests.HTTPError("401 unauthorized", response=response)
+
+        with patch("llm_backend.requests.post", return_value=response):
+            with self.assertRaisesRegex(BackendUnavailableError, "ollama signin"):
+                backend._generate_http(
+                    "hello",
+                    system_prompt=None,
+                    response_format=None,
+                    model="qwen3-coder:480b-cloud",
+                    max_output_tokens=128,
+                    temperature=0.2,
+                )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Optuna-driven research loop for AutoCivil-Lab."""
+"""Legacy compatibility wrappers and artifact helpers for AutoCivil-Lab research."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import time
+import warnings
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ from research_protocol import (
     trial_budget_status,
     validate_final_artifact_consistency,
 )
-from train import (
+from train_impl import (
     EngineeringValidator,
     artifact_id,
     artifact_run_id,
@@ -87,6 +88,23 @@ FINAL_BEST_MODEL_FILENAME = "best_search_model.pkl"
 FINAL_METRICS_FILENAME = "final_metrics.json"
 FINAL_ACCEPTANCE_FILENAME = "final_acceptance.json"
 EXPERIMENT_MEMORY_FILENAME = "experiment_memory.json"
+LEGACY_RUNTIME_MESSAGE = (
+    "search.py is deprecated as a research runtime. "
+    "Use `python research_loop.py` for canonical research execution."
+)
+
+
+class _CanonicalResearchLoopProxy:
+    """Lazy proxy so compatibility wrappers can call research_loop without import cycles."""
+
+    @staticmethod
+    def run_engineering_research_loop(**kwargs: Any) -> dict[str, Any]:
+        import research_loop as _research_loop
+
+        return _research_loop.run_engineering_research_loop(**kwargs)
+
+
+research_loop = _CanonicalResearchLoopProxy()
 
 
 def load_json_artifact(path: Path) -> dict[str, Any]:
@@ -413,7 +431,10 @@ def build_trial_record(
         return base_record
 
     validation_report = result["validation_report"]
-    validation_metrics = result.get("val_metrics", result.get("test_metrics", {}))
+    validation_metrics = result.get(
+        "selection_metrics",
+        result.get("val_metrics", result.get("test_metrics", {})),
+    )
     base_record.update(
         {
             "rmse": result["rmse"],
@@ -614,7 +635,12 @@ def build_final_metrics_payload(
         "best_model_name": final_best_result["model_name"],
         "best_model_hyperparameters": copy.deepcopy(final_best_result["hyperparameters"]),
         "validation_summary": build_validation_summary(validation_report),
-        "validation_metrics": copy.deepcopy(final_best_result.get("val_metrics", final_best_result.get("test_metrics", {}))),
+        "validation_metrics": copy.deepcopy(
+            final_best_result.get(
+                "selection_metrics",
+                final_best_result.get("val_metrics", final_best_result.get("test_metrics", {})),
+            )
+        ),
     }
 
 
@@ -944,7 +970,10 @@ def _build_repaired_trial_record(
     best_trial_number = None if best_result is None else _safe_int(best_result.get("trial_number", best_result.get("best_trial")))
     if best_result is not None and best_trial_number == trial_number:
         validation_report = best_result.get("validation_report", {})
-        test_metrics = best_result.get("val_metrics", best_result.get("test_metrics", {}))
+        test_metrics = best_result.get(
+            "selection_metrics",
+            best_result.get("val_metrics", best_result.get("test_metrics", {})),
+        )
         base_row.update(
             {
                 "model_name": best_result.get("model_name", base_row["model_name"]),
@@ -1300,554 +1329,63 @@ def build_post_search_ensemble(
     return current_best_result
 
 
+def _warn_legacy_runtime(entrypoint: str) -> None:
+    warnings.warn(LEGACY_RUNTIME_MESSAGE, DeprecationWarning, stacklevel=3)
+    log_status(
+        "WARNING legacy_runtime_redirect | "
+        f"entrypoint={entrypoint} | canonical=research_loop.py"
+    )
+
+
+def _build_canonical_runtime_config(
+    config: dict[str, Any],
+    *,
+    n_trials: int | None = None,
+    min_runtime_minutes: float | None = None,
+) -> dict[str, Any]:
+    """Translate legacy search runtime settings onto the canonical research_loop config surface."""
+    normalized = copy.deepcopy(config)
+    experiment_config = normalized.setdefault("experiment", {})
+    search_config = normalized.setdefault("search", {})
+    research_config = normalized.setdefault("research", {})
+
+    resolved_cycles = n_trials if n_trials is not None else experiment_config.get("optuna_trials")
+    if resolved_cycles is not None:
+        research_config["max_cycles"] = max(1, int(resolved_cycles))
+
+    resolved_runtime_minutes = (
+        min_runtime_minutes if min_runtime_minutes is not None else search_config.get("min_runtime_minutes")
+    )
+    if resolved_runtime_minutes is not None:
+        research_config["max_runtime_minutes"] = max(0.0, float(resolved_runtime_minutes))
+
+    if "max_trial_seconds" not in research_config and "max_trial_seconds" in search_config:
+        research_config["max_trial_seconds"] = max(0.0, float(search_config["max_trial_seconds"]))
+
+    if not research_config.get("brief_path") and search_config.get("research_brief_path"):
+        research_config["brief_path"] = str(search_config["research_brief_path"])
+
+    return normalized
+
+
 def run_autocivil_loop(n_trials: int, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Execute the visible propose-run-compare-keep research loop."""
+    """Compatibility wrapper that redirects legacy callers into research_loop."""
     if config is None:
         config = load_config()
-    set_global_seed(int(config["experiment"]["random_seed"]))
-    outputs_dir = get_outputs_dir(config)
-    repair_synced_artifacts_on_startup(
-        outputs_dir,
-        csv_targets=[("optuna_results.csv", OPTUNA_RESULTS_COLUMNS)],
-        best_result_filename=SEARCH_STATE_BEST_RESULT_FILENAME,
+    _warn_legacy_runtime("search.run_autocivil_loop")
+    normalized_config = _build_canonical_runtime_config(config, n_trials=n_trials)
+    cycles_override = int(normalized_config["research"]["max_cycles"])
+    return research_loop.run_engineering_research_loop(
+        cycles_override=cycles_override,
+        with_report=False,
+        config_override=normalized_config,
     )
-    project_root = Path(__file__).resolve().parent
-    brief_relative_path = str(config.get("search", {}).get("research_brief_path", "program.md"))
-    brief_path = project_root / brief_relative_path
-    if not brief_path.exists():
-        fallback_brief = project_root / "research_brief.md"
-        if fallback_brief.exists():
-            brief_path = fallback_brief
-    brief = load_human_research_brief(brief_path)
-    log_status(
-        "INFO research_brief_loaded | "
-        f"path={brief_path} | acceptance_metric={brief['acceptance_metric']} | "
-        f"min_improvement_pct={brief['min_improvement_pct']:.4f}"
-    )
-    min_runtime_minutes = float(config["search"].get("min_runtime_minutes", 0.0))
-    if min_runtime_minutes < 0.0:
-        raise ValueError("search.min_runtime_minutes must be non-negative.")
-    min_runtime_seconds = min_runtime_minutes * 60.0
-    max_trial_seconds = float(config["search"].get("max_trial_seconds", 0.0))
-    if max_trial_seconds < 0.0:
-        raise ValueError("search.max_trial_seconds must be non-negative.")
-    search_start_time = time.perf_counter()
-    baseline_metrics_path = outputs_dir / "baseline_metrics.json"
-    baseline_metrics = load_json_artifact(baseline_metrics_path)
-
-    data = load_dataset(config)
-    x_train, x_val, _, y_train, y_val, _ = split_dataset(data, config)
-    validator = EngineeringValidator.from_config(config)
-    available_models = get_available_model_configs(config)
-    required_families = [family for family in brief.get("required_model_families", []) if family in available_models]
-    if required_families:
-        available_models = {family: available_models[family] for family in required_families}
-        log_status(
-            "INFO research_surface_constrained | "
-            f"required_model_families={','.join(required_families)}"
-        )
-    elif brief.get("required_model_families"):
-        log_status("WARNING research_brief_required_families_not_available | falling back to enabled config models")
-
-    memory_path = outputs_dir / EXPERIMENT_MEMORY_FILENAME
-    historical_memory = load_or_initialize_experiment_memory(memory_path)
-    run_id = create_run_id()
-    current_run_signatures: set[tuple[str, str]] = set()
-
-    best_result = initialize_search_state(outputs_dir, baseline_metrics, config=config, run_id=run_id)
-    current_best_composite = float(best_result["composite_score"])
-    current_best_name = str(best_result["model_name"])
-
-    research_log_path = outputs_dir / "research_log.txt"
-    initialize_research_log(research_log_path, baseline_metrics)
-    optuna_results_path = outputs_dir / "optuna_results.csv"
-    initialize_optuna_results_csv(optuna_results_path)
-    sync_writer = build_search_sync_writer(outputs_dir)
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize", study_name="autocivil_search")
-    trial_records: list[dict[str, Any]] = []
-    # LLM PROPOSAL
-    llm_config = get_llm_config(config)
-    llm_proposer = None
-    if llm_config.get("enabled", False):
-        from llm_proposer import LLMProposer
-
-        llm_proposer = LLMProposer(config)
-        if llm_proposer.is_available():
-            log_status(
-                "INFO llm_proposer_ready | "
-                f"default={llm_proposer.fast_model} | smart={llm_proposer.smart_model} | "
-                f"compact_fallback={llm_proposer.compact_model} | "
-                f"log_path={llm_proposer.interaction_log_path}"
-            )
-        else:
-            llm_proposer = None
-            log_status("INFO llm_proposer_unavailable | falling back to Optuna only")
-
-    llm_interaction_interval_minutes = float(llm_config.get("interaction_interval_minutes", 0.0))
-    llm_interaction_interval_seconds = max(0.0, llm_interaction_interval_minutes * 60.0)
-    llm_smart_model_after_progress = float(llm_config.get("smart_model_after_progress", 0.67))
-    next_llm_interaction_seconds = llm_interaction_interval_seconds if llm_interaction_interval_seconds > 0.0 else None
-    llm_interaction_count = 0
-
-    trial_number = 0
-    while True:
-        trial_number += 1
-        elapsed_seconds = time.perf_counter() - search_start_time
-        # LLM PROPOSAL
-        if llm_proposer is not None and next_llm_interaction_seconds is not None:
-            while elapsed_seconds >= next_llm_interaction_seconds:
-                llm_interaction_count += 1
-                progress_context = build_llm_progress_context(
-                    elapsed_seconds=elapsed_seconds,
-                    runtime_target_seconds=min_runtime_seconds,
-                    interaction_index=llm_interaction_count,
-                    trial_records=trial_records,
-                    available_models=available_models,
-                )
-                use_smart_model = (
-                    min_runtime_seconds > 0.0
-                    and float(progress_context["progress_percent"]) / 100.0 >= llm_smart_model_after_progress
-                )
-                log_status(
-                    "INFO llm_interaction_due | "
-                    f"index={llm_interaction_count} | stage={progress_context['stage']} | "
-                    f"elapsed_min={progress_context['elapsed_minutes']:.1f} | "
-                    f"remaining_min={progress_context['remaining_minutes']:.1f} | "
-                    f"model_used={'smart' if use_smart_model else 'fast'}"
-                )
-                family_state = build_search_family_state(
-                    available_models=available_models,
-                    best_result=best_result,
-                    trial_records=trial_records,
-                    historical_memory=historical_memory,
-                    llm_config=llm_config,
-                )
-                suggestion = llm_proposer.propose(
-                    trial_history=trial_records[-50:],
-                    available_models=available_models,
-                    current_best=best_result,
-                    use_smart_model=use_smart_model,
-                    search_progress=progress_context,
-                    research_brief=brief,
-                    experiment_memory=historical_memory,
-                    diversity_state={"historic_family_counts": progress_context.get("family_counts", {})},
-                )
-                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records) and not use_smart_model:
-                    log_status(
-                        "INFO llm_proposal_duplicate | "
-                        f"model={suggestion['model_name']} | retrying_with={llm_proposer.smart_model}"
-                    )
-                    suggestion = llm_proposer.propose(
-                        trial_history=trial_records[-50:],
-                        available_models=available_models,
-                        current_best=best_result,
-                        use_smart_model=True,
-                        search_progress=progress_context,
-                        research_brief=brief,
-                        experiment_memory=historical_memory,
-                        diversity_state={"historic_family_counts": progress_context.get("family_counts", {})},
-                    )
-                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
-                    log_status(
-                        "INFO llm_proposal_skipped_duplicate | "
-                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
-                    )
-                    suggestion = None
-                if suggestion:
-                    gate_result = gate_search_candidate(
-                        model_name=str(suggestion["model_name"]),
-                        params=dict(suggestion["params"]),
-                        available_models=available_models,
-                        current_run_signatures=current_run_signatures,
-                        historical_memory=historical_memory,
-                        trial_records=trial_records,
-                        family_state=family_state,
-                        llm_config=llm_config,
-                    )
-                    if not gate_result["accepted"]:
-                        log_status(
-                            "INFO llm_proposal_rejected | "
-                            f"model={suggestion['model_name']} | reason={gate_result['reason']['code']}"
-                        )
-                        suggestion = None
-                if suggestion and should_skip_duplicate_proposal(
-                    model_name=str(suggestion["model_name"]),
-                    params=dict(suggestion["params"]),
-                    current_run_signatures=current_run_signatures,
-                    memory_payload=historical_memory,
-                ):
-                    log_status(
-                        "INFO llm_proposal_skipped_historical_duplicate | "
-                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
-                    )
-                    suggestion = None
-                if suggestion:
-                    namespaced = {
-                        f"{suggestion['model_name']}__{key}": value
-                        for key, value in suggestion["params"].items()
-                    }
-                    namespaced["model_family"] = suggestion["model_name"]
-                    study.enqueue_trial(namespaced)
-                if llm_proposer is not None and llm_proposer.consecutive_invalid_responses >= 3:
-                    llm_proposer = None
-                    log_status("WARNING llm_proposer_disabled | 3_consecutive_failures")
-                    break
-                next_llm_interaction_seconds += llm_interaction_interval_seconds
-        elif llm_proposer is not None:
-            proposal_interval = int(llm_config.get("interval_trials", 15))
-            if proposal_interval > 0 and trial_number % proposal_interval == 0 and trial_number > 0:
-                family_state = build_search_family_state(
-                    available_models=available_models,
-                    best_result=best_result,
-                    trial_records=trial_records,
-                    historical_memory=historical_memory,
-                    llm_config=llm_config,
-                )
-                suggestion = llm_proposer.propose(
-                    trial_history=trial_records[-proposal_interval:],
-                    available_models=available_models,
-                    current_best=best_result,
-                    research_brief=brief,
-                    experiment_memory=historical_memory,
-                    diversity_state={"historic_family_counts": build_llm_progress_context(
-                        elapsed_seconds=elapsed_seconds,
-                        runtime_target_seconds=min_runtime_seconds,
-                        interaction_index=llm_interaction_count,
-                        trial_records=trial_records,
-                        available_models=available_models,
-                    )["family_counts"]},
-                )
-                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
-                    log_status(
-                        "INFO llm_proposal_duplicate | "
-                        f"model={suggestion['model_name']} | retrying_with={llm_proposer.smart_model}"
-                    )
-                    suggestion = llm_proposer.propose(
-                        trial_history=trial_records[-proposal_interval:],
-                        available_models=available_models,
-                        current_best=best_result,
-                        use_smart_model=True,
-                        research_brief=brief,
-                        experiment_memory=historical_memory,
-                        diversity_state={"historic_family_counts": {}},
-                    )
-                if suggestion and llm_suggestion_is_duplicate(suggestion, trial_records):
-                    log_status(
-                        "INFO llm_proposal_skipped_duplicate | "
-                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
-                    )
-                    suggestion = None
-                if suggestion:
-                    gate_result = gate_search_candidate(
-                        model_name=str(suggestion["model_name"]),
-                        params=dict(suggestion["params"]),
-                        available_models=available_models,
-                        current_run_signatures=current_run_signatures,
-                        historical_memory=historical_memory,
-                        trial_records=trial_records,
-                        family_state=family_state,
-                        llm_config=llm_config,
-                    )
-                    if not gate_result["accepted"]:
-                        log_status(
-                            "INFO llm_proposal_rejected | "
-                            f"model={suggestion['model_name']} | reason={gate_result['reason']['code']}"
-                        )
-                        suggestion = None
-                if suggestion and should_skip_duplicate_proposal(
-                    model_name=str(suggestion["model_name"]),
-                    params=dict(suggestion["params"]),
-                    current_run_signatures=current_run_signatures,
-                    memory_payload=historical_memory,
-                ):
-                    log_status(
-                        "INFO llm_proposal_skipped_historical_duplicate | "
-                        f"model={suggestion['model_name']} | params={format_hyperparameters(suggestion['params'])}"
-                    )
-                    suggestion = None
-                if suggestion:
-                    namespaced = {
-                        f"{suggestion['model_name']}__{key}": value
-                        for key, value in suggestion["params"].items()
-                    }
-                    namespaced["model_family"] = suggestion["model_name"]
-                    study.enqueue_trial(namespaced)
-                if llm_proposer is not None and llm_proposer.consecutive_invalid_responses >= 3:
-                    llm_proposer = None
-                    log_status("WARNING llm_proposer_disabled | 3_consecutive_failures")
-        trial = study.ask()
-        model_name, display_name, params = sample_model_configuration(trial, available_models)
-        trial_signature = build_config_signature(model_name, params)
-        family_state = build_search_family_state(
-            available_models=available_models,
-            best_result=best_result,
-            trial_records=trial_records,
-            historical_memory=historical_memory,
-            llm_config=llm_config,
-        )
-        gate_result = gate_search_candidate(
-            model_name=model_name,
-            params=params,
-            available_models=available_models,
-            current_run_signatures=current_run_signatures,
-            historical_memory=historical_memory,
-            trial_records=trial_records,
-            family_state=family_state,
-            llm_config=llm_config,
-        )
-        if not gate_result["accepted"]:
-            log_status(
-                "INFO optuna_candidate_rejected_pre_execution | "
-                f"model={model_name} | reason={gate_result['reason']['code']}"
-            )
-            continue
-        if should_skip_duplicate_proposal(
-            model_name=model_name,
-            params=params,
-            current_run_signatures=current_run_signatures,
-            memory_payload=historical_memory,
-        ):
-            log_status(
-                "INFO optuna_candidate_duplicate_pre_execution | "
-                f"model={model_name} | params={format_hyperparameters(params)}"
-            )
-            continue
-
-        current_run_signatures.add(trial_signature)
-        trial_started_at = time.perf_counter()
-        try:
-            model, result = evaluate_candidate(
-                model_name,
-                params,
-                x_train,
-                y_train,
-                x_val,
-                y_val,
-                validator,
-                config,
-            )
-            trial_elapsed_seconds = time.perf_counter() - trial_started_at
-            budget_state = trial_budget_status(
-                elapsed_seconds=trial_elapsed_seconds,
-                max_trial_seconds=max_trial_seconds,
-            )
-            verdict = result["validation_verdict"]
-            if budget_state == "budget_exceeded":
-                selection_status = "budget_exceeded"
-                study.tell(trial, -1e9)
-                trial_record = build_trial_record(
-                    trial_number,
-                    model_name,
-                    display_name,
-                    params,
-                    result,
-                    selection_status,
-                    error_message=(
-                        f"Trial runtime {trial_elapsed_seconds:.2f}s exceeded max_trial_seconds="
-                        f"{max_trial_seconds:.2f}s."
-                    ),
-                    trial_runtime_seconds=trial_elapsed_seconds,
-                    budget_status=budget_state,
-                )
-                trial_records.append(trial_record)
-                sync_writer.append_trial(trial_record)
-                record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
-                timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-                append_research_log(
-                    research_log_path,
-                    (
-                        f"[{timestamp}] Trial {trial_number:03d} | Model: {display_name} | "
-                        f"{format_hyperparameters(params)} | RMSE: {result['rmse']:.2f} | "
-                        f"R2: {result['r2']:.2f} | Composite: {result['composite_score']:.3f} | "
-                        f"Validation: {verdict} | Budget exceeded ({trial_elapsed_seconds:.2f}s)"
-                    ),
-                )
-            elif verdict == "FAIL":
-                selection_status = "rejected_validation_fail"
-                study.tell(trial, -1e9)
-                trial_record = build_trial_record(
-                    trial_number,
-                    model_name,
-                    display_name,
-                    params,
-                    result,
-                    selection_status,
-                    trial_runtime_seconds=trial_elapsed_seconds,
-                    budget_status=budget_state,
-                )
-                trial_records.append(trial_record)
-                sync_writer.append_trial(trial_record)
-                record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
-                timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-                append_research_log(
-                    research_log_path,
-                    (
-                        f"[{timestamp}] Trial {trial_number:03d} | Model: {display_name} | "
-                        f"{format_hyperparameters(params)} | RMSE: {result['rmse']:.2f} | "
-                        f"R2: {result['r2']:.2f} | Composite: {result['composite_score']:.3f} | "
-                        f"Validation: {verdict} | Rejected"
-                    ),
-                )
-            else:
-                composite_score = float(result["composite_score"])
-                study.tell(trial, composite_score)
-                improved = composite_score > current_best_composite
-                selection_status = "new_best" if improved else "no_improvement"
-                if improved:
-                    current_best_composite = composite_score
-                    current_best_name = display_name
-                    best_result = copy.deepcopy(result)
-                    best_result["source"] = "search"
-                    best_result["beats_baseline"] = True
-                    best_result["trial_number"] = trial_number
-                    best_result["best_trial"] = trial_number
-                    best_model_metadata = save_pickle_artifact(
-                        outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
-                        model,
-                        config=config,
-                        model_id=model_name,
-                        run_id=run_id,
-                        source_mode="search",
-                    )
-                    best_result["run_id"] = run_id
-                    best_result["model_artifact_id"] = best_model_metadata["artifact_id"]
-                    write_run_scoped_json_artifact(
-                        outputs_dir=outputs_dir,
-                        filename=SEARCH_STATE_BEST_RESULT_FILENAME,
-                        payload=best_result,
-                        run_id=run_id,
-                        source_mode="search",
-                        config=config,
-                        model_artifact_id=best_model_metadata["artifact_id"],
-                        model_id=model_name,
-                    )
-                    mark_json_artifact_stale(
-                        outputs_dir / FINAL_METRICS_FILENAME,
-                        active_run_id=run_id,
-                        reason="new best search-state model saved before final report refresh",
-                    )
-                    try:
-                        from uncertainty import recalibrate_uncertainty_artifacts
-
-                        recalibrate_uncertainty_artifacts(
-                            model_path=outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
-                            method=str(config["engineering"]["uncertainty_method"]),
-                            outputs_dir=outputs_dir,
-                            audit_partition="validation_audit",
-                        )
-                    except Exception as recalibration_exc:
-                        log_status(
-                            f"WARNING uncertainty_recalibration_failed | trial={trial_number} | "
-                            f"{recalibration_exc}"
-                        )
-
-                trial_record = build_trial_record(
-                    trial_number,
-                    model_name,
-                    display_name,
-                    params,
-                    result,
-                    selection_status,
-                    trial_runtime_seconds=trial_elapsed_seconds,
-                    budget_status=budget_state,
-                )
-                trial_records.append(trial_record)
-                if improved:
-                    sync_writer.record_new_best(trial_record=trial_record, best_result=best_result)
-                else:
-                    sync_writer.append_trial(trial_record)
-                record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
-                timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-                status_label = "New best" if improved else "No improvement"
-                append_research_log(
-                    research_log_path,
-                    (
-                        f"[{timestamp}] Trial {trial_number:03d} | Model: {display_name} | "
-                        f"{format_hyperparameters(params)} | RMSE: {result['rmse']:.2f} | "
-                        f"R2: {result['r2']:.2f} | Composite: {result['composite_score']:.3f} | "
-                        f"Validation: {verdict} | {status_label}"
-                    ),
-                )
-            sync_check(outputs_dir)
-        except Exception as exc:
-            trial_elapsed_seconds = time.perf_counter() - trial_started_at
-            budget_state = trial_budget_status(
-                elapsed_seconds=trial_elapsed_seconds,
-                max_trial_seconds=max_trial_seconds,
-            )
-            error_text = str(exc)
-            study.tell(trial, -1e9)
-            trial_record = build_trial_record(
-                trial_number,
-                model_name,
-                display_name,
-                params,
-                None,
-                "error",
-                error_message=error_text,
-                trial_runtime_seconds=trial_elapsed_seconds,
-                budget_status=budget_state,
-            )
-            trial_records.append(trial_record)
-            sync_writer.append_trial(trial_record)
-            record_experiment_memory(memory_path=memory_path, run_id=run_id, trial_record=trial_record)
-            timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-            append_research_log(
-                research_log_path,
-                (
-                    f"[{timestamp}] Trial {trial_number:03d} | Model: {display_name} | "
-                    f"{format_hyperparameters(params)} | Validation: ERROR | {error_text}"
-                ),
-            )
-            sync_check(outputs_dir)
-
-        elapsed_seconds = time.perf_counter() - search_start_time
-        trials_floor_reached = trial_number >= n_trials
-        runtime_floor_reached = elapsed_seconds >= min_runtime_seconds
-        progress_interval = int(config["search"]["progress_interval"])
-        if trial_number % progress_interval == 0:
-            valid_trials = [
-                row for row in trial_records if row["selection_status"] not in {"error", "rejected_validation_fail"}
-            ]
-            remaining_seconds = max(0.0, min_runtime_seconds - elapsed_seconds)
-            log_status(
-                f"Progress trial={trial_number} | target_trials={n_trials} | "
-                f"elapsed={elapsed_seconds / 60.0:.1f}m | "
-                f"min_runtime_remaining={remaining_seconds / 60.0:.1f}m | "
-                f"valid_trials={len(valid_trials)} | "
-                f"current_best_model={current_best_name} | "
-                f"current_best_composite={current_best_composite:.4f}"
-            )
-        if trials_floor_reached and runtime_floor_reached:
-            break
-
-    if bool(config["search"].get("build_ensemble_after_search", True)):
-        best_result = build_post_search_ensemble(
-            outputs_dir,
-            config,
-            run_id,
-            x_train,
-            y_train,
-            x_val,
-            y_val,
-            validator,
-            sync_writer=sync_writer,
-        )
-    final_best_result = finalize_search_artifacts(outputs_dir, baseline_metrics, config=config, run_id=run_id)
-    acceptance = write_final_acceptance_artifact(outputs_dir, brief, config=config, run_id=run_id)
-    log_status(
-        "INFO final_acceptance | "
-        f"accepted={acceptance['accepted']} | measured_improvement_pct={acceptance['measured_improvement_pct']:.4f} | "
-        f"required_min_improvement_pct={acceptance['required_min_improvement_pct']:.4f}"
-    )
-    return final_best_result
-
 
 def main() -> int:
-    """Run the full model search loop."""
-    parser = argparse.ArgumentParser(description="Optuna-driven research loop for AutoCivil-Lab.")
+    """Run the legacy compatibility wrapper for the canonical research loop."""
+    parser = argparse.ArgumentParser(
+        description="Deprecated compatibility wrapper. Use research_loop.py for canonical research execution."
+    )
     parser.add_argument(
         "--trials",
         type=int,
@@ -1873,9 +1411,9 @@ def main() -> int:
             config["experiment"]["optuna_trials"] = int(args.trials)
         if args.min_runtime_minutes is not None:
             config["search"]["min_runtime_minutes"] = float(args.min_runtime_minutes)
-        outputs_dir = get_outputs_dir(config)
-        available_models = get_available_model_configs(config)
         if args.repair:
+            outputs_dir = get_outputs_dir(config)
+            available_models = get_available_model_configs(config)
             if csv_is_stale(outputs_dir, available_models):
                 repair_optuna_results_csv(outputs_dir, config)
             else:
@@ -1883,9 +1421,19 @@ def main() -> int:
             return 0
 
         n_trials = int(config["experiment"]["optuna_trials"])
-        best_result = run_autocivil_loop(n_trials=n_trials, config=config)
+        normalized_config = _build_canonical_runtime_config(
+            config,
+            n_trials=n_trials,
+            min_runtime_minutes=args.min_runtime_minutes,
+        )
+        _warn_legacy_runtime("search.main")
+        best_result = research_loop.run_engineering_research_loop(
+            cycles_override=int(normalized_config["research"]["max_cycles"]),
+            with_report=False,
+            config_override=normalized_config,
+        )
         log_status(
-            f"Search complete. Best model: {best_result['model_name']} | "
+            f"Legacy search wrapper complete. Best model: {best_result['model_name']} | "
             f"Composite={best_result['composite_score']:.4f} | "
             f"Validation={best_result['validation_verdict']}"
         )
