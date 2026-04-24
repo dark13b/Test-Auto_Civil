@@ -2150,6 +2150,14 @@ function renderCandidateCard(cand, idx, isBest, appliedConstraints){
     </div>`;
 }
 
+function _showCdesignError(resultEl, message){
+  const errorEl = document.createElement('div');
+  errorEl.id = 'cdesign-error-banner';
+  errorEl.style.cssText = 'margin-bottom:12px;padding:10px 14px;background:rgba(220,53,69,.10);border:1px solid rgba(220,53,69,.35);border-radius:8px;font-size:13px;color:#f87171';
+  errorEl.textContent = message;
+  resultEl.insertAdjacentElement('beforebegin', errorEl);
+}
+
 async function runCustomerDesign(){
   const statusEl = document.getElementById('cdesign-status');
   const resultEl = document.getElementById('cdesign-result');
@@ -2159,11 +2167,21 @@ async function runCustomerDesign(){
     statusEl.textContent = 'Please enter a target strength.';
     return;
   }
+
+  // Clear previous error banner
+  const existingError = document.getElementById('cdesign-error-banner');
+  if(existingError) existingError.remove();
+
+  // Show loading indicator above result without erasing previous result
+  let loadingEl = document.getElementById('cdesign-loading');
+  if(!loadingEl){
+    loadingEl = document.createElement('div');
+    loadingEl.id = 'cdesign-loading';
+    resultEl.insertAdjacentElement('beforebegin', loadingEl);
+  }
+  loadingEl.style.cssText = 'padding:8px 0 4px;font-size:13px;color:var(--muted)';
+  loadingEl.textContent = 'Generating mix candidates…';
   statusEl.textContent = 'Generating mix candidates…';
-  resultEl.innerHTML = '';
-  document.getElementById('cdesign-disclaimer').style.display = 'none';
-  downloadBtn.disabled = true;
-  downloadBtn.style.opacity = '.5';
 
   const payload = {
     target_strength: target,
@@ -2181,15 +2199,21 @@ async function runCustomerDesign(){
       body: JSON.stringify(payload),
     });
   } catch(err){
-    statusEl.textContent = 'Request failed. Check the assistant connection and try again.';
+    loadingEl.remove();
+    _showCdesignError(resultEl, 'Request failed. Check the assistant connection and try again.');
+    statusEl.textContent = customerDesignLast ? 'Previous result shown. Generation failed.' : 'Generation failed.';
     return;
   }
   const result = await response.json().catch(() => ({}));
   if(!response.ok){
-    statusEl.textContent = result.message || 'Mix design generation failed. Check that the strength predictor is ready and try again.';
+    loadingEl.remove();
+    _showCdesignError(resultEl, result.message || 'Mix design generation failed. Check that the strength predictor is ready and try again.');
+    statusEl.textContent = customerDesignLast ? 'Previous result shown. Generation failed.' : 'Generation failed.';
     return;
   }
 
+  // Success: replace old result with new one
+  loadingEl.remove();
   customerDesignLast = result;
   const ranked = Array.isArray(result.ranked_candidates) && result.ranked_candidates.length
     ? result.ranked_candidates
