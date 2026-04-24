@@ -2,6 +2,17 @@
 
 AutoCivil-Lab now runs as an autoresearch-style engineering ML system for concrete compressive-strength regression. The repo uses a governed scout -> confirm -> keep/revert loop, with `research_lab.py` as the controlled research surface, `research_brief.md` as the human strategy input, and an internal LLM proposal stack that can run through Ollama/Qwen, OpenAI, or a hybrid fallback path.
 
+## AutoCivil MVP
+
+- Product: inverse concrete mix design assistant
+- User: civil/materials engineers and small labs
+- Workflow: target strength + constraints -> ranked mix candidates -> predicted strength + warnings -> JSON report
+- Run the dashboard locally with `python dashboard.py`
+- Normal mode URL: `http://localhost:5050/?mode=normal`
+- Experimental mode is internal/admin only: `http://localhost:5050/?mode=experimental`
+- Lab validation disclaimer: outputs are for lab validation and review, not production or field signoff
+- Required trained model artifact: keep the expected trained model file available, such as `outputs/best_search_model.pkl`, if your local workflow depends on it
+
 ## Official runtime
 
 The official runtime for core research is `research_loop.py`.
