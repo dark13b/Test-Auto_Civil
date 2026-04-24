@@ -1085,14 +1085,22 @@ def api_design_generate():
         "exposure_class": payload.get("exposure_class"),
         "structural_application": payload.get("structural_application"),
     }
+
+    raw_constraints = payload.get("constraints")
+    constraints = raw_constraints if isinstance(raw_constraints, dict) and raw_constraints else None
+
     try:
         optimizer_cls = MixDesignOptimizer
         if optimizer_cls is None:
             from design_tool import MixDesignOptimizer as optimizer_cls
         optimizer = optimizer_cls()
-        result = optimizer.optimize(target_strength, context=context)
+        result = optimizer.optimize(target_strength, constraints=constraints, context=context)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"[design_generate] predictor file error: {exc}")
+        return jsonify({"error": "design_generation_failed", "message": "Strength predictor is not available. Prepare the predictor before generating mix candidates."}), 500
     except Exception as exc:
-        return jsonify({"error": "design_generation_failed", "message": str(exc)}), 500
+        print(f"[design_generate] error: {exc}")
+        return jsonify({"error": "design_generation_failed", "message": "Mix design generation failed. Check that the strength predictor is ready and try again."}), 500
     return jsonify(sanitize_dashboard_payload(result))
 
 @app.route("/api/plots")
@@ -1649,7 +1657,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 <aside id="sidebar">
   <div class="sb-logo">
     <h1>AutoCivil-Lab</h1>
-    <span>AUTOMATED RESEARCH FRAMEWORK</span>
+    {% if dashboard_mode == "normal" %}<span>Concrete Mix Design Assistant</span>{% else %}<span>AUTOMATED RESEARCH FRAMEWORK</span>{% endif %}
     <div class="sb-status" id="sb-status">
       <div class="dot" id="status-dot"></div>
       <span id="status-text">Checking…</span>
@@ -1658,6 +1666,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
   <nav>
     {% if dashboard_mode == "normal" %}
     <a href="#project-health" class="active"><span class="icon">H</span> Project Health</a>
+    <a href="#customer-design"><span class="icon">D</span> Mix Design Assistant</a>
     {% endif %}
     {% if dashboard_mode == "experimental" %}
     <a href="#overview" class="active"><span class="icon">O</span> Overview</a>
@@ -1684,7 +1693,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
   </div>
   <div class="tb-right">
     <span class="share-status" id="share-status"></span>
-    <button class="refresh-btn share-btn" id="share-btn" onclick="shareLatestRun()">Share Latest Run</button>
+    <button class="refresh-btn share-btn" id="share-btn" onclick="shareLatestRun()">{% if dashboard_mode == "normal" %}Share Report{% else %}Share Latest Run{% endif %}</button>
     <button class="refresh-btn" onclick="loadAll()">⟳ Refresh</button>
   </div>
 </header>
@@ -1702,10 +1711,10 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 {% if dashboard_mode == "normal" %}
 <section class="section" id="project-health">
   <div class="section-title">Project Health</div>
-  <div class="section-sub">Evidence status, decision metric source, and the next action needed for confidence.</div>
+  <div class="section-sub">Strength predictor readiness and the next action needed before generating mix candidates.</div>
   <div class="card-grid" id="normal-summary-cards">
     <div class="card">
-      <div class="card-label">Evidence status</div>
+      <div class="card-label">Readiness status</div>
       <div class="skeleton" style="height:90px"></div>
     </div>
     <div class="card">
@@ -1713,11 +1722,92 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
       <div class="skeleton" style="height:90px"></div>
     </div>
     <div class="card">
-      <div class="card-label">Open Experimental View</div>
-      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Experimental View</a>
+      <div class="card-label">Advanced details</div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Advanced Details</a>
     </div>
   </div>
 </section>
+
+<!-- ══ MIX DESIGN ASSISTANT ═════════════════════════════════════════════ -->
+<section class="section" id="customer-design">
+  <div class="section-title">Mix Design Assistant</div>
+  <div class="section-sub">Enter a target compressive strength and optional constraints — get suggested concrete mixes with predicted strength, engineering warnings, and confidence.</div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-label">1 · Target &amp; context</div>
+    <div class="grid cols-3" style="margin-top:12px">
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Target strength (MPa)</span>
+        <input id="cdesign-target" type="number" min="5" max="120" step="0.5" value="35" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Exposure class</span>
+        <select id="cdesign-exposure" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px">
+          <option value="general">General</option>
+          <option value="structural">Structural</option>
+          <option value="exposed">Exposed</option>
+          <option value="severe">Severe</option>
+          <option value="marine">Marine</option>
+          <option value="freeze_thaw">Freeze-Thaw</option>
+          <option value="sulfate">Sulfate</option>
+        </select>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Structural application</span>
+        <select id="cdesign-application" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px">
+          <option value="column">Column</option>
+          <option value="beam">Beam</option>
+          <option value="slab">Slab</option>
+          <option value="footing">Footing</option>
+          <option value="wall">Wall</option>
+          <option value="pavement">Pavement</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-label">2 · Optional material constraints (leave blank to use defaults)</div>
+    <div class="grid cols-3" style="margin-top:12px;gap:12px">
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Cement min (kg/m³)</span>
+        <input id="cdesign-cement-min" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Cement max (kg/m³)</span>
+        <input id="cdesign-cement-max" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Max w/c ratio</span>
+        <input id="cdesign-wc-max" type="number" min="0.2" max="1.5" step="0.01" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Water min (kg/m³)</span>
+        <input id="cdesign-water-min" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Water max (kg/m³)</span>
+        <input id="cdesign-water-max" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Strength tolerance (± MPa)</span>
+        <input id="cdesign-tolerance" type="number" min="0" step="0.5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+    <button onclick="runCustomerDesign()" style="background:var(--accent);color:#08131d;border:none;border-radius:999px;padding:10px 18px;font-weight:700;cursor:pointer">Generate mix candidates</button>
+    <button id="cdesign-download" onclick="downloadCustomerDesign()" disabled style="background:var(--bg-soft);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:10px 18px;font-weight:600;cursor:pointer;opacity:.5">Download report (JSON)</button>
+    <div id="cdesign-status" style="font-size:12px;color:var(--muted)">Fill in target &amp; press generate.</div>
+  </div>
+
+  <div id="cdesign-disclaimer" style="display:none;margin-bottom:14px;padding:10px 14px;border-left:3px solid var(--accent);background:var(--bg-soft);border-radius:0 8px 8px 0;font-size:12px;color:var(--muted);line-height:1.55">
+    &#9888;&#xFE0E; <strong style="color:var(--text)">Lab validation required:</strong> These mix suggestions are model-based starting points. They must be verified through lab trial batches and standard testing before real construction use.
+  </div>
+  <div id="cdesign-result"></div>
+</section>
+
 {% endif %}
 {% if dashboard_mode == "experimental" %}
 <section class="section" id="overview">
@@ -1964,6 +2054,184 @@ async function loadNormalMode() {
   ]);
 }
 
+// ─── customer design tool (MVP) ─────────────────────────────────────────────
+let customerDesignLast = null;
+
+function numOrNull(id){
+  const el = document.getElementById(id);
+  if(!el) return null;
+  const raw = String(el.value || '').trim();
+  if(raw === '') return null;
+  const n = parseFloat(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function buildCustomerConstraints(){
+  const constraints = {};
+  const cementMin = numOrNull('cdesign-cement-min');
+  const cementMax = numOrNull('cdesign-cement-max');
+  if(cementMin != null || cementMax != null){
+    constraints.cement = {};
+    if(cementMin != null) constraints.cement.min = cementMin;
+    if(cementMax != null) constraints.cement.max = cementMax;
+  }
+  const waterMin = numOrNull('cdesign-water-min');
+  const waterMax = numOrNull('cdesign-water-max');
+  if(waterMin != null || waterMax != null){
+    constraints.water = {};
+    if(waterMin != null) constraints.water.min = waterMin;
+    if(waterMax != null) constraints.water.max = waterMax;
+  }
+  const wcMax = numOrNull('cdesign-wc-max');
+  if(wcMax != null){
+    constraints.water_cement_ratio = { max: wcMax };
+  }
+  const tol = numOrNull('cdesign-tolerance');
+  if(tol != null){
+    constraints.tolerance_mpa = tol;
+  }
+  return Object.keys(constraints).length ? constraints : null;
+}
+
+function renderCandidateCard(cand, idx, isBest, appliedConstraints){
+  const mix = cand.mix_design || {};
+  const unc = cand.uncertainty_interval || {};
+  const verdict = String(cand.validation_verdict || 'UNKNOWN');
+  const warnings = []
+    .concat(Array.isArray(cand.warn_reasons) ? cand.warn_reasons : [])
+    .concat(Array.isArray(cand.hard_constraint_reasons) ? cand.hard_constraint_reasons : [])
+    .concat(Array.isArray(cand.hard_constraints) ? cand.hard_constraints : [])
+    .concat(Array.isArray(cand.validation_failure_reasons) ? cand.validation_failure_reasons : [])
+    .concat(Array.isArray(cand.validation_warning_reasons) ? cand.validation_warning_reasons : [])
+    .concat(Array.isArray(cand.engineering_cautions) ? cand.engineering_cautions : []);
+  const uniqueWarnings = Array.from(new Set(warnings.filter(Boolean).map(w => String(w))));
+  const wc = (cand.engineered_ratios && cand.engineered_ratios.water_cement_ratio != null)
+    ? parseFloat(cand.engineered_ratios.water_cement_ratio).toFixed(3)
+    : '—';
+  const predicted = cand.predicted_strength != null ? parseFloat(cand.predicted_strength).toFixed(2) : '—';
+  const lower = unc.lower_90 != null ? parseFloat(unc.lower_90).toFixed(1) : null;
+  const upper = unc.upper_90 != null ? parseFloat(unc.upper_90).toFixed(1) : null;
+  const intervalText = (lower != null && upper != null) ? `${lower} – ${upper} MPa (90%)` : '—';
+  const confidence = unc.confidence_label ? String(unc.confidence_label) : '—';
+  const border = isBest ? '2px solid var(--accent)' : '1px solid var(--border)';
+  const badge = isBest ? `<span style="background:var(--accent);color:#08131d;border-radius:999px;padding:2px 10px;font-size:10px;font-weight:700;margin-left:8px">BEST</span>` : '';
+  return `
+    <div class="card" style="border:${border};display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div class="card-label">Candidate #${idx + 1}${badge}</div>
+        <span class="badge ${verdict.toLowerCase()}">${escapeHtml(verdict)}</span>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Predicted strength</div>
+        <div class="metric-value sm">${predicted} MPa</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Confidence</div>
+        <div style="font-size:13px">${escapeHtml(confidence)} <span style="color:var(--muted)">· ${intervalText}</span></div>
+      </div>
+      <div style="font-size:12px;line-height:1.6">
+        <div style="color:var(--muted);margin-bottom:4px">Mix composition (kg/m³)</div>
+        <div>Cement: <b>${mix.cement != null ? parseFloat(mix.cement).toFixed(1) : '—'}</b> · Slag: ${mix.slag != null ? parseFloat(mix.slag).toFixed(1) : '—'} · Fly ash: ${mix.fly_ash != null ? parseFloat(mix.fly_ash).toFixed(1) : '—'}</div>
+        <div>Water: <b>${mix.water != null ? parseFloat(mix.water).toFixed(1) : '—'}</b> · Superplast.: ${mix.superplasticizer != null ? parseFloat(mix.superplasticizer).toFixed(2) : '—'}</div>
+        <div>Coarse agg.: ${mix.coarse_aggregate != null ? parseFloat(mix.coarse_aggregate).toFixed(0) : '—'} · Fine agg.: ${mix.fine_aggregate != null ? parseFloat(mix.fine_aggregate).toFixed(0) : '—'}</div>
+        <div>w/c: <b>${wc}</b> · Age: ${mix.age != null ? parseFloat(mix.age).toFixed(0) : '—'} d</div>
+      </div>
+      ${uniqueWarnings.length ? `
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Warnings</div>
+          <ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">
+            ${uniqueWarnings.slice(0, 6).map(w => `<li>${escapeHtml(w)}</li>`).join('')}
+          </ul>
+        </div>` : `<div style="font-size:12px;color:var(--muted)">No major warnings.</div>`}
+      <div style="margin-top:8px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Applied constraints</div>
+        ${(appliedConstraints && Object.keys(appliedConstraints).length) ? `<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">${Object.entries(appliedConstraints).map(([k,v]) => `<li>${escapeHtml(String(k))}: ${escapeHtml(String(v))}</li>`).join('')}</ul>` : `<div style="font-size:12px;color:var(--muted)">No extra constraints applied.</div>`}
+      </div>
+    </div>`;
+}
+
+async function runCustomerDesign(){
+  const statusEl = document.getElementById('cdesign-status');
+  const resultEl = document.getElementById('cdesign-result');
+  const downloadBtn = document.getElementById('cdesign-download');
+  const target = numOrNull('cdesign-target');
+  if(target == null){
+    statusEl.textContent = 'Please enter a target strength.';
+    return;
+  }
+  statusEl.textContent = 'Generating mix candidates…';
+  resultEl.innerHTML = '';
+  document.getElementById('cdesign-disclaimer').style.display = 'none';
+  downloadBtn.disabled = true;
+  downloadBtn.style.opacity = '.5';
+
+  const payload = {
+    target_strength: target,
+    exposure_class: document.getElementById('cdesign-exposure').value,
+    structural_application: document.getElementById('cdesign-application').value,
+  };
+  const constraints = buildCustomerConstraints();
+  if(constraints) payload.constraints = constraints;
+
+  let response;
+  try {
+    response = await fetch('/api/design_generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch(err){
+    statusEl.textContent = 'Request failed. Check the assistant connection and try again.';
+    return;
+  }
+  const result = await response.json().catch(() => ({}));
+  if(!response.ok){
+    statusEl.textContent = result.message || 'Mix design generation failed. Check that the strength predictor is ready and try again.';
+    return;
+  }
+
+  customerDesignLast = result;
+  const ranked = Array.isArray(result.ranked_candidates) && result.ranked_candidates.length
+    ? result.ranked_candidates
+    : [result];
+  const shown = ranked.slice(0, 5);
+  const verdict = String(result.validation_verdict || 'UNKNOWN');
+
+  statusEl.textContent = `Generated ${shown.length} candidate${shown.length === 1 ? '' : 's'} · best verdict: ${verdict}.`;
+  downloadBtn.disabled = false;
+  downloadBtn.style.opacity = '1';
+
+  const summary = `
+    <div class="card-grid" style="margin-bottom:16px">
+      <div class="card"><div class="card-label">Target</div><div class="metric-value sm">${parseFloat(result.target_strength).toFixed(2)} MPa</div></div>
+      <div class="card"><div class="card-label">Best predicted</div><div class="metric-value sm">${result.predicted_strength != null ? parseFloat(result.predicted_strength).toFixed(2) : '—'} MPa</div></div>
+      <div class="card"><div class="card-label">Best verdict</div><div class="metric-value sm"><span class="badge ${verdict.toLowerCase()}">${escapeHtml(verdict)}</span></div></div>
+      <div class="card"><div class="card-label">Candidates</div><div class="metric-value sm">${shown.length}</div></div>
+    </div>`;
+  const cards = `<div class="card-grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr))">${shown.map((c, i) => renderCandidateCard(c, i, i === 0, constraints)).join('')}</div>`;
+  const disclaimer = `<div style="margin-top:16px;padding:12px 16px;border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.6"><strong style="color:var(--text)">Lab validation required.</strong> These mix candidates are model predictions, not certified mix designs. All mixes must be confirmed by laboratory trial batches and reviewed by a qualified structural or materials engineer before use in construction.</div>`;
+  document.getElementById('cdesign-disclaimer').style.display = 'block';
+  resultEl.innerHTML = summary + cards + disclaimer;
+}
+
+function downloadCustomerDesign(){
+  if(!customerDesignLast) return;
+  const target = customerDesignLast.target_strength != null ? parseFloat(customerDesignLast.target_strength).toFixed(0) : 'custom';
+  const fname = `autocivil_mix_design_${target}MPa.json`;
+  const blob = new Blob([JSON.stringify(customerDesignLast, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fname;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+window.runCustomerDesign = runCustomerDesign;
+window.downloadCustomerDesign = downloadCustomerDesign;
+
 async function loadExperimentalMode() {
   await Promise.all([
     loadStatus(),
@@ -2049,6 +2317,17 @@ function badgeClass(value){
   return ['pass','warn','fail','ok','low','moderate','high'].includes(cleaned) ? cleaned : 'warn';
 }
 
+function normalModeCopy(value){
+  return String(value ?? '')
+    .replace(/overview artifacts?/gi, 'mix design readiness details')
+    .replace(/dashboard summary artifacts?/gi, 'mix design readiness details')
+    .replace(/evidence artifacts?/gi, 'readiness details')
+    .replace(/artifacts?/gi, 'readiness files')
+    .replace(/model promotion/gi, 'mix candidate use')
+    .replace(/trained model/gi, 'strength predictor')
+    .replace(/pipeline/gi, 'assistant');
+}
+
 function hasValue(value){
   return value !== null && value !== undefined && value !== '';
 }
@@ -2071,12 +2350,14 @@ async function loadStatus() {
   const r = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
   const all = Object.values(r).every(v=>v.exists);
   document.getElementById('status-dot').className = 'dot' + (all?'':' red');
-  document.getElementById('status-text').textContent = all ? 'Pipeline Ready' : 'Incomplete';
+  document.getElementById('status-text').textContent = all
+    ? (isNormalMode() ? 'Ready' : 'Pipeline Ready')
+    : (isNormalMode() ? 'Setup needed' : 'Incomplete');
   // topbar time
   const times = Object.values(r).filter(v=>v.modified).map(v=>new Date(v.modified));
   if(times.length){
     const latest = new Date(Math.max(...times));
-    document.getElementById('tb-time').textContent = 'Last run: ' + latest.toLocaleString();
+    document.getElementById('tb-time').textContent = (isNormalMode() ? 'Last update: ' : 'Last run: ') + latest.toLocaleString();
   }
 }
 
@@ -2091,12 +2372,12 @@ async function loadNormalSummary() {
   document.getElementById('tb-dataset').textContent = `Dataset: ${d.dataset_rows || '—'} rows`;
   const decision = d.decision_metric || {};
   const fallbackWarnings = (!Array.isArray(d.warnings) || !d.warnings.length) && !decision.source_type
-    ? [{ title: 'Missing artifact', message: 'Overview artifacts not available.' }]
+    ? [{ title: 'Strength predictor unavailable', message: 'Mix design readiness details are not available.' }]
     : [];
   const warnings = Array.isArray(d.warnings) && d.warnings.length ? d.warnings : fallbackWarnings;
   const nextAction = Object.keys(d.next_action || {}).length ? d.next_action : {
-    title: 'Recover overview artifacts',
-    message: 'Generate the dashboard summary artifacts before trusting the current result.',
+    title: 'Prepare mix design inputs',
+    message: 'Prepare the strength predictor and input summary before relying on generated mix candidates.',
   };
   const evidence = Object.keys(d.evidence_status || {}).length ? d.evidence_status : {
     label: 'Action required',
@@ -2104,29 +2385,33 @@ async function loadNormalSummary() {
   };
 
   const warningHtml = warnings.length
-    ? `<ul style="margin:10px 0 0 18px;padding:0;font-family:var(--mono);font-size:11px;color:var(--yellow)">${warnings.map(w => `<li>${escapeHtml(w.message || 'Missing evidence artifact.')}</li>`).join('')}</ul>`
-    : `<div class="metric" style="margin-top:8px"><div class="metric-value sm" style="color:var(--green)">All required evidence artifacts available.</div></div>`;
+    ? `<ul style="margin:10px 0 0 18px;padding:0;font-family:var(--mono);font-size:11px;color:var(--yellow)">${warnings.map(w => `<li>${escapeHtml(normalModeCopy(w.message || 'Readiness warning.'))}</li>`).join('')}</ul>`
+    : `<div class="metric" style="margin-top:8px"><div class="metric-value sm" style="color:var(--green)">Ready to generate mix candidates.</div></div>`;
   mount.innerHTML = `
     <div class="card">
       <div class="card-label">Project Health</div>
-      <div class="card-title">${escapeHtml(evidence.label || 'Action required')}</div>
-      <div class="metric"><div class="metric-label">Decision source</div><div class="metric-value sm">${escapeHtml(decision.source_label || 'No decision evidence available')}</div></div>
-      <div class="metric"><div class="metric-label">Composite score</div><div class="metric-value sm">${formatMetric(decision.composite_score, 4)}</div></div>
+      <div class="card-title">${escapeHtml(normalModeCopy(evidence.label || 'Action required'))}</div>
+      <div class="metric"><div class="metric-label">Strength predictor</div><div class="metric-value sm">${escapeHtml((decision.model_name || decision.source_label) ? 'Ready' : 'Not ready')}</div></div>
     </div>
     <div class="card">
-      <div class="card-label">Evidence status</div>
+      <div class="card-label">Readiness status</div>
       <div class="metric"><div class="metric-label">Warnings</div><div class="metric-value">${evidence.warning_count != null ? evidence.warning_count : warnings.length}</div></div>
       ${warningHtml}
     </div>
     <div class="card">
       <div class="card-label">Next action</div>
-      <div class="card-title">${escapeHtml(nextAction.title || 'Review evidence artifacts')}</div>
-      <div class="metric"><div class="metric-label">Instruction</div><div class="metric-value sm">${escapeHtml(nextAction.message || 'Inspect artifact coverage before model promotion.')}</div></div>
+      <div class="card-title">${escapeHtml(normalModeCopy(nextAction.title || 'Review mix design readiness'))}</div>
+      <div class="metric"><div class="metric-label">Instruction</div><div class="metric-value sm">${escapeHtml(normalModeCopy(nextAction.message || 'Review readiness before generating mix candidates.'))}</div></div>
     </div>
     <div class="card">
-      <div class="card-label">Open Experimental View</div>
-      <div class="metric"><div class="metric-label">Detailed analysis</div><div class="metric-value sm">Run history, validation panels, design trade-offs, field records, and gallery.</div></div>
-      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Experimental View</a>
+      <div class="card-label">Advanced details</div>
+      <div class="metric"><div class="metric-label">Detailed validation</div><div class="metric-value sm">Validation panels, design trade-offs, field records, and charts.</div></div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Advanced Details</a>
+    </div>
+    <div class="card">
+      <div class="card-label">Mix Design Assistant</div>
+      <div class="metric"><div class="metric-label">Generate concrete mix candidates</div><div class="metric-value sm">Enter a target strength and get suggested mixes with confidence and engineering warnings.</div></div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="#customer-design">Go to Mix Design Assistant</a>
     </div>
   `;
 }
