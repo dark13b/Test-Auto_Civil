@@ -4,6 +4,7 @@ Append-only record of wiki ingest and maintenance actions.
 
 ## 2026-04-24
 
+- Polished the normal-mode mix design assistant candidate cards in `dashboard.py` and indexed the frontend-only change in `wiki/results/normal-mode-candidate-cards.md`.
 - Added a concise `AutoCivil MVP` section to `README.md` covering the inverse mix design assistant scope, target users, workflow, dashboard launch path, normal-mode URL, internal experimental mode, lab validation disclaimer, and the expected trained model artifact dependency.
 - Added `MVP_CLEANUP_NOTES.md` and indexed it from `wiki/index.md` as a short review list for stale or misleading files and claims.
 

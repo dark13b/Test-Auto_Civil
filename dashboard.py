@@ -2093,6 +2093,119 @@ function buildCustomerConstraints(){
   return Object.keys(constraints).length ? constraints : null;
 }
 
+function formatCandidateNumber(value, decimals = 2, suffix = ''){
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(decimals)}${suffix}` : 'N/A';
+}
+
+function candidateVerdict(value){
+  const verdict = String(value || 'UNKNOWN').toUpperCase();
+  return ['OK', 'WARN', 'FAIL', 'UNKNOWN'].includes(verdict) ? verdict : verdict;
+}
+
+function candidateVerdictClass(value){
+  const verdict = candidateVerdict(value).toLowerCase();
+  if(verdict === 'unknown') return 'warn';
+  return badgeClass(verdict);
+}
+
+function candidateWarnings(cand){
+  const warnings = []
+    .concat(Array.isArray(cand.warn_reasons) ? cand.warn_reasons : [])
+    .concat(Array.isArray(cand.hard_constraint_reasons) ? cand.hard_constraint_reasons : [])
+    .concat(Array.isArray(cand.hard_constraints) ? cand.hard_constraints : [])
+    .concat(Array.isArray(cand.validation_failure_reasons) ? cand.validation_failure_reasons : [])
+    .concat(Array.isArray(cand.validation_warning_reasons) ? cand.validation_warning_reasons : [])
+    .concat(Array.isArray(cand.engineering_cautions) ? cand.engineering_cautions : []);
+  return Array.from(new Set(warnings.filter(Boolean).map(w => String(w))));
+}
+
+function renderCustomerConstraintList(appliedConstraints){
+  if(!appliedConstraints || !Object.keys(appliedConstraints).length){
+    return '<div style="font-size:12px;color:var(--muted)">N/A</div>';
+  }
+  return `<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">${
+    Object.entries(appliedConstraints).map(([key, value]) => {
+      const text = value && typeof value === 'object'
+        ? Object.entries(value).map(([innerKey, innerValue]) => `${innerKey}: ${innerValue}`).join(', ')
+        : String(value);
+      return `<li>${escapeHtml(key)}: ${escapeHtml(text || 'N/A')}</li>`;
+    }).join('')
+  }</ul>`;
+}
+
+function renderCustomerWarningList(warnings){
+  if(!warnings.length){
+    return '<div style="font-size:12px;color:var(--muted)">N/A</div>';
+  }
+  return `<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">${
+    warnings.slice(0, 8).map(w => `<li>${escapeHtml(w)}</li>`).join('')
+  }</ul>`;
+}
+
+function candidateSummaryMetric(label, value){
+  return `<div class="card"><div class="card-label">${escapeHtml(label)}</div><div class="metric-value sm">${value}</div></div>`;
+}
+
+function renderPolishedCandidateCard(cand, idx, isBest, appliedConstraints, targetStrength){
+  const mix = cand.mix_design || {};
+  const unc = cand.uncertainty_interval || {};
+  const verdict = candidateVerdict(cand.validation_verdict || cand.sample_validation?.overall_verdict);
+  const uniqueWarnings = candidateWarnings(cand);
+  const predictedNumber = Number(cand.predicted_strength);
+  const targetNumber = Number(cand.target_strength ?? targetStrength);
+  const difference = Number.isFinite(predictedNumber) && Number.isFinite(targetNumber)
+    ? predictedNumber - targetNumber
+    : null;
+  const wc = (cand.engineered_ratios && cand.engineered_ratios.water_cement_ratio != null)
+    ? Number(cand.engineered_ratios.water_cement_ratio).toFixed(3)
+    : 'N/A';
+  const lower = unc.lower_90 ?? unc.lower;
+  const upper = unc.upper_90 ?? unc.upper;
+  const intervalText = (lower != null && upper != null)
+    ? `${formatCandidateNumber(lower, 1)} - ${formatCandidateNumber(upper, 1)} MPa${unc.confidence_level != null ? ` (${formatCandidateNumber(Number(unc.confidence_level) * 100, 0, '%')})` : ' (90%)'}`
+    : (unc.interval_width != null ? `Width ${formatCandidateNumber(unc.interval_width, 2, ' MPa')}` : 'N/A');
+  const confidence = unc.confidence_label || cand.confidence_label || 'N/A';
+  const border = isBest ? '2px solid var(--accent)' : '1px solid var(--border)';
+  const bestBadge = isBest ? `<span style="background:var(--accent);color:#08131d;border-radius:999px;padding:2px 10px;font-size:10px;font-weight:700;margin-left:8px">BEST</span>` : '';
+  return `
+    <div class="card" style="border:${border};display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <div class="card-label">Rank #${idx + 1}${bestBadge}</div>
+        <span class="badge ${candidateVerdictClass(verdict)}">${escapeHtml(verdict)}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Predicted strength</div>
+          <div class="metric-value sm">${formatCandidateNumber(cand.predicted_strength, 2, ' MPa')}</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Diff from target</div>
+          <div class="metric-value sm">${difference == null ? 'N/A' : `${difference >= 0 ? '+' : ''}${difference.toFixed(2)} MPa`}</div>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Confidence / interval</div>
+        <div style="font-size:13px">${escapeHtml(confidence)} <span style="color:var(--muted)">| ${escapeHtml(intervalText)}</span></div>
+      </div>
+      <div style="font-size:12px;line-height:1.6">
+        <div style="color:var(--muted);margin-bottom:4px">Key mix values</div>
+        <div>Cement: <b>${formatCandidateNumber(mix.cement, 1)}</b> kg/m3 | Slag: ${formatCandidateNumber(mix.slag, 1)} | Fly ash: ${formatCandidateNumber(mix.fly_ash, 1)}</div>
+        <div>Water: <b>${formatCandidateNumber(mix.water, 1)}</b> kg/m3 | Superplast.: ${formatCandidateNumber(mix.superplasticizer, 2)}</div>
+        <div>Coarse agg.: ${formatCandidateNumber(mix.coarse_aggregate, 0)} | Fine agg.: ${formatCandidateNumber(mix.fine_aggregate, 0)}</div>
+        <div>w/c: <b>${wc}</b> | Age: ${mix.age != null ? `${formatCandidateNumber(mix.age, 0)} d` : 'N/A'}</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Applied constraints</div>
+        ${renderCustomerConstraintList(appliedConstraints)}
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Warning list</div>
+        ${renderCustomerWarningList(uniqueWarnings)}
+      </div>
+    </div>`;
+}
+
 function renderCandidateCard(cand, idx, isBest, appliedConstraints){
   const mix = cand.mix_design || {};
   const unc = cand.uncertainty_interval || {};
@@ -2219,7 +2332,13 @@ async function runCustomerDesign(){
     ? result.ranked_candidates
     : [result];
   const shown = ranked.slice(0, 5);
-  const verdict = String(result.validation_verdict || 'UNKNOWN');
+  const bestCandidate = shown[0] || {};
+  const verdict = candidateVerdict(bestCandidate.validation_verdict || result.validation_verdict || bestCandidate.sample_validation?.overall_verdict);
+  const verdictsAvailable = ranked.some(c => c.validation_verdict || c.sample_validation?.overall_verdict);
+  const failCount = verdictsAvailable ? ranked.filter(c => candidateVerdict(c.validation_verdict || c.sample_validation?.overall_verdict) === 'FAIL').length : null;
+  const warningCount = ranked.filter(c => candidateWarnings(c).length > 0).length;
+  const bestUncertainty = bestCandidate.uncertainty_interval || {};
+  const bestConfidence = bestUncertainty.confidence_label || bestCandidate.confidence_label;
 
   statusEl.textContent = `Generated ${shown.length} candidate${shown.length === 1 ? '' : 's'} · best verdict: ${verdict}.`;
   downloadBtn.disabled = false;
@@ -2227,12 +2346,15 @@ async function runCustomerDesign(){
 
   const summary = `
     <div class="card-grid" style="margin-bottom:16px">
-      <div class="card"><div class="card-label">Target</div><div class="metric-value sm">${parseFloat(result.target_strength).toFixed(2)} MPa</div></div>
-      <div class="card"><div class="card-label">Best predicted</div><div class="metric-value sm">${result.predicted_strength != null ? parseFloat(result.predicted_strength).toFixed(2) : '—'} MPa</div></div>
-      <div class="card"><div class="card-label">Best verdict</div><div class="metric-value sm"><span class="badge ${verdict.toLowerCase()}">${escapeHtml(verdict)}</span></div></div>
-      <div class="card"><div class="card-label">Candidates</div><div class="metric-value sm">${shown.length}</div></div>
+      ${candidateSummaryMetric('Target strength', formatCandidateNumber(result.target_strength ?? target, 2, ' MPa'))}
+      ${candidateSummaryMetric('Candidates', String(ranked.length || 'N/A'))}
+      ${candidateSummaryMetric('Best predicted', formatCandidateNumber(bestCandidate.predicted_strength ?? result.predicted_strength, 2, ' MPa'))}
+      ${candidateSummaryMetric('Best confidence', escapeHtml(bestConfidence || 'N/A'))}
+      ${candidateSummaryMetric('Best verdict', `<span class="badge ${candidateVerdictClass(verdict)}">${escapeHtml(verdict)}</span>`)}
+      ${candidateSummaryMetric('Candidates with warnings', String(warningCount))}
+      ${candidateSummaryMetric('FAIL verdicts', failCount == null ? 'N/A' : String(failCount))}
     </div>`;
-  const cards = `<div class="card-grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr))">${shown.map((c, i) => renderCandidateCard(c, i, i === 0, constraints)).join('')}</div>`;
+  const cards = `<div class="card-grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">${shown.map((c, i) => renderPolishedCandidateCard(c, i, i === 0, constraints, result.target_strength ?? target)).join('')}</div>`;
   const disclaimer = `<div style="margin-top:16px;padding:12px 16px;border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.6"><strong style="color:var(--text)">Lab validation required.</strong> These mix candidates are model predictions, not certified mix designs. All mixes must be confirmed by laboratory trial batches and reviewed by a qualified structural or materials engineer before use in construction.</div>`;
   document.getElementById('cdesign-disclaimer').style.display = 'block';
   resultEl.innerHTML = summary + cards + disclaimer;
