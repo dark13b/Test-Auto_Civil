@@ -2,6 +2,10 @@
 
 Append-only record of wiki ingest and maintenance actions.
 
+## 2026-04-26
+
+- Added scientific candidate ranking notes for the mandatory `engineering_quality` scorecard component and indexed the page from `wiki/index.md`.
+
 ## 2026-04-24
 
 - Polished the normal-mode mix design assistant candidate cards in `dashboard.py` and indexed the frontend-only change in `wiki/results/normal-mode-candidate-cards.md`.

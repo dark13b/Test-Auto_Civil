@@ -238,6 +238,7 @@ class LegacyAdapterTests(unittest.TestCase):
         self.assertEqual(result["mix_design"], result["ranked_candidates"][0]["mix_design"])
         self.assertIn("estimated_cement_saving_vs_reference", result)
         self.assertIn("cost_proxy", result["ranking_breakdown"])
+        self.assertIn("engineering_quality", result["ranking_breakdown"])
         self.assertEqual(result["design_context"]["exposure_class"], "marine")
 
 

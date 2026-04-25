@@ -50,6 +50,7 @@ This wiki catalogs the concrete research workspace, the derived dataset lineage,
 | [Current artifacts](<E:\Random IDEA\AutoResearch\auto-civil-lab\wiki\results\current-artifacts.md>) | Canonical metrics from the latest live JSON artifacts. |
 | [Research ledger](<E:\Random IDEA\AutoResearch\auto-civil-lab\wiki\results\research-ledger.md>) | Summary of `research_results.csv` and its stage/status distribution. |
 | [Normal mode candidate cards](<E:\Random IDEA\AutoResearch\auto-civil-lab\wiki\results\normal-mode-candidate-cards.md>) | Frontend-only summary and candidate-card rendering for the mix design assistant. |
+| [Scientific candidate ranking](<E:\Random IDEA\AutoResearch\auto-civil-lab\wiki\results\scientific-candidate-ranking.md>) | Engineering-quality ranking inputs for generated mix design candidates. |
 
 ## Comparisons
 

@@ -1,21 +1,29 @@
 import unittest
 
 from mix_design.contracts import (
+    ConstraintCheck,
     ConstraintEvaluation,
     DesignConstraints,
     ObjectiveSpec,
     PredictionResult,
+    RangeConstraint,
     UncertaintyInterval,
     ValidatorOutcome,
 )
 from mix_design.objective_engine import MixObjectiveEngine
 
 
-def make_prediction(predicted_strength: float) -> PredictionResult:
+def make_prediction(
+    predicted_strength: float,
+    *,
+    water_cement_ratio: float = 0.55,
+    interval_width: float = 4.0,
+    target_window_overlap: float = 0.75,
+) -> PredictionResult:
     return PredictionResult(
         predicted_strength_mpa=predicted_strength,
         engineered_features={
-            "water_cement_ratio": 0.55,
+            "water_cement_ratio": water_cement_ratio,
             "fly_ash_replacement_ratio": 0.20,
             "slag_replacement_ratio": 0.30,
         },
@@ -23,9 +31,9 @@ def make_prediction(predicted_strength: float) -> PredictionResult:
             predicted=predicted_strength,
             lower_90=predicted_strength - 2.0,
             upper_90=predicted_strength + 2.0,
-            interval_width=4.0,
+            interval_width=interval_width,
             confidence_label="HIGH",
-            target_window_overlap=0.75,
+            target_window_overlap=target_window_overlap,
         ),
         model_artifact_id="model-artifact-1",
     )
@@ -66,13 +74,14 @@ class ObjectiveEngineTests(unittest.TestCase):
 
         self.assertEqual(
             [component.name for component in scorecard.components],
-            ["target_fit", "cement_penalty", "co2_proxy", "validator_risk"],
+            ["target_fit", "cement_penalty", "co2_proxy", "validator_risk", "engineering_quality"],
         )
         self.assertTrue(all(component.explanation for component in scorecard.components))
         self.assertAlmostEqual(
             scorecard.total_score,
             sum(component.weighted_score for component in scorecard.components),
         )
+        self.assertIn("water/cement", scorecard.components[-1].explanation)
 
     def test_validator_risk_scores_fail_higher_than_warn(self) -> None:
         engine = MixObjectiveEngine()
@@ -117,10 +126,50 @@ class ObjectiveEngineTests(unittest.TestCase):
 
         self.assertEqual(
             [component.name for component in scorecard.components],
-            ["strength_fit", "cost_proxy"],
+            ["strength_fit", "cost_proxy", "engineering_quality"],
         )
         self.assertEqual(scorecard.components[1].raw_value, 150.0)
         self.assertIn("water", scorecard.components[1].explanation.lower())
+
+    def test_engineering_quality_penalizes_constraint_uncertainty_and_validator_risk(self) -> None:
+        engine = MixObjectiveEngine()
+        objectives = (ObjectiveSpec(name="target_fit", weight=1.0),)
+
+        safer_score = engine.score_candidate(
+            mix_design={"cement": 180.0, "slag": 80.0, "fly_ash": 40.0, "water": 150.0},
+            prediction=make_prediction(32.0, water_cement_ratio=0.45, interval_width=2.0),
+            constraints=ConstraintEvaluation(passed=True, checks=(), hard_failures=()),
+            validator=make_validator("PASS"),
+            target_strength_mpa=32.0,
+            design_constraints=DesignConstraints(tolerance_mpa=2.0, water_cement_ratio=RangeConstraint(max=0.55)),
+            objectives=objectives,
+        )
+        risky_score = engine.score_candidate(
+            mix_design={"cement": 180.0, "slag": 80.0, "fly_ash": 40.0, "water": 180.0},
+            prediction=make_prediction(32.0, water_cement_ratio=0.62, interval_width=8.0, target_window_overlap=0.0),
+            constraints=ConstraintEvaluation(
+                passed=False,
+                checks=(
+                    ConstraintCheck(
+                        name="water.max",
+                        passed=False,
+                        actual=180.0,
+                        limit=170.0,
+                        message="water must be at most 170.",
+                    ),
+                ),
+                hard_failures=("water.max", "water_cement_ratio.max"),
+            ),
+            validator=make_validator("WARN", warnings=("workability caution",)),
+            target_strength_mpa=32.0,
+            design_constraints=DesignConstraints(tolerance_mpa=2.0, water_cement_ratio=RangeConstraint(max=0.55)),
+            objectives=objectives,
+        )
+
+        self.assertGreater(
+            next(component.raw_value for component in risky_score.components if component.name == "engineering_quality"),
+            next(component.raw_value for component in safer_score.components if component.name == "engineering_quality"),
+        )
 
 
 if __name__ == "__main__":

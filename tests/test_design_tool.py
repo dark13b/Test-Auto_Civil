@@ -280,6 +280,7 @@ class DesignToolTests(unittest.TestCase):
         self.assertEqual(result["design_context"]["structural_application"], "column")
         self.assertIn("cost_proxy", result["ranking_breakdown"])
         self.assertIn("target_fit", result["ranking_breakdown"])
+        self.assertIn("engineering_quality", result["ranking_breakdown"])
 
     def test_stale_official_uncertainty_artifact_is_not_reused_silently(self) -> None:
         optimizer = make_optimizer()

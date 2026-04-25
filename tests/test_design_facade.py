@@ -216,7 +216,8 @@ class DesignFacadeTests(unittest.TestCase):
 
         self.assertEqual(result.best_scenario_id, result.scenarios[0].scenario_id)
         self.assertGreaterEqual(len(result.scenarios), 2)
-        self.assertTrue(result.scenarios[0].success)
+        self.assertTrue(result.scenarios[0].constraints.passed)
+        self.assertNotEqual(result.scenarios[0].validator.overall_verdict, "FAIL")
         self.assertTrue(result.comparison_summary)
         self.assertTrue(any("cost_proxy" in line or "validator_risk" in line for line in result.comparison_summary))
         self.assertTrue(all(scenario.constraints.checks for scenario in result.scenarios))

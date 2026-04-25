@@ -276,7 +276,7 @@ class MixDesignSpaceOptimizer:
         if not best_by_signature:
             raise RuntimeError("No candidate mixes were evaluated during optimization.")
 
-        proposal_pool_limit = max(int(candidate_limit) * 3, int(self.design_config.get("top_ranked_candidates", 5)), 8)
+        proposal_pool_limit = max(int(candidate_limit) * 8, int(self.design_config.get("top_ranked_candidates", 5)), 16)
         ordered_proposals = tuple(
             proposal
             for proposal, _ in sorted(

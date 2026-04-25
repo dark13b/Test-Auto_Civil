@@ -112,6 +112,84 @@ class MixObjectiveEngine:
         )
         return raw_value, explanation
 
+    def _score_engineering_quality(
+        self,
+        mix_design: dict[str, float],
+        prediction: PredictionResult,
+        constraints: ConstraintEvaluation,
+        validator: ValidatorOutcome,
+        target_strength_mpa: float,
+        design_constraints: DesignConstraints,
+    ) -> tuple[float, str]:
+        tolerance = max(float(design_constraints.tolerance_mpa or 0.0), 1e-6)
+        target_gap = abs(float(prediction.predicted_strength_mpa) - float(target_strength_mpa))
+        target_penalty = (target_gap / tolerance) * 25.0
+
+        failed_checks = tuple(check for check in constraints.checks if not check.passed)
+        material_failures = tuple(
+            check for check in failed_checks if str(check.name).split(".", 1)[0] in {
+                "cement",
+                "slag",
+                "fly_ash",
+                "water",
+                "superplasticizer",
+                "coarse_aggregate",
+                "fine_aggregate",
+                "age",
+            }
+        )
+        constraint_penalty = float(len(constraints.hard_failures) * 250.0)
+        material_penalty = float(len(material_failures) * 150.0)
+
+        water_cement_ratio = prediction.engineered_features.get("water_cement_ratio")
+        water_cement_penalty = 0.0
+        water_cement_note = "no configured W/C ceiling was available"
+        if water_cement_ratio is not None and design_constraints.water_cement_ratio.max is not None:
+            ratio = float(water_cement_ratio)
+            ceiling = max(float(design_constraints.water_cement_ratio.max), 1e-6)
+            utilization = ratio / ceiling
+            water_cement_penalty = max(utilization, 0.0) * 20.0
+            if ratio > ceiling:
+                water_cement_penalty += ((ratio - ceiling) / ceiling) * 500.0
+            water_cement_note = f"W/C={ratio:.3f} against max={ceiling:.3f}"
+
+        uncertainty_width = max(float(prediction.uncertainty_interval.interval_width), 0.0)
+        uncertainty_penalty = (uncertainty_width / tolerance) * 10.0
+        if float(prediction.uncertainty_interval.target_window_overlap) <= 0.0:
+            uncertainty_penalty += 50.0
+
+        verdict_penalty = {
+            "PASS": 0.0,
+            "WARN": 75.0,
+            "FAIL": 1000.0,
+        }.get(str(validator.overall_verdict), 300.0)
+        constructability_penalty = (
+            float(len(validator.engineering_cautions) * 35.0)
+            + float(len(validator.data_review_flags) * 20.0)
+            + float(len(validator.warning_reasons) * 10.0)
+            + float(len(validator.failure_reasons) * 200.0)
+        )
+
+        raw_value = (
+            target_penalty
+            + constraint_penalty
+            + material_penalty
+            + water_cement_penalty
+            + uncertainty_penalty
+            + verdict_penalty
+            + constructability_penalty
+        )
+        explanation = (
+            "Engineering quality combines target distance, explicit constraint failures, material range failures, "
+            f"water/cement safety ({water_cement_note}), uncertainty interval width={uncertainty_width:.2f} MPa, "
+            f"validator verdict={validator.overall_verdict}, and practical constructability cautions from the validator. "
+            f"Penalty terms: target={target_penalty:.2f}, constraints={constraint_penalty:.2f}, "
+            f"materials={material_penalty:.2f}, water_cement={water_cement_penalty:.2f}, "
+            f"uncertainty={uncertainty_penalty:.2f}, verdict={verdict_penalty:.2f}, "
+            f"constructability={constructability_penalty:.2f}."
+        )
+        return raw_value, explanation
+
     def score_candidate(
         self,
         *,
@@ -156,6 +234,25 @@ class MixObjectiveEngine:
                 f"{objective.name} contributed {weighted_score:.2f} (raw={raw_value:.2f}, weight={objective.weight:.2f})."
             )
 
+        raw_value, explanation = self._score_engineering_quality(
+            mix_design,
+            prediction,
+            constraints,
+            validator,
+            target_strength_mpa,
+            design_constraints,
+        )
+        components.append(
+            ObjectiveComponentScore(
+                name="engineering_quality",
+                weight=1.0,
+                raw_value=float(raw_value),
+                weighted_score=float(raw_value),
+                explanation=explanation,
+            )
+        )
+        explanations.append(f"engineering_quality contributed {raw_value:.2f} as a mandatory safety ranking term.")
+
         total_score = float(sum(component.weighted_score for component in components))
         if explanations:
             explanations.append(f"Total weighted score is {total_score:.2f}. Lower scores rank better.")
@@ -188,6 +285,7 @@ class MixObjectiveEngine:
                     0 if scenario.success else 1,
                     verdict_rank.get(str(scenario.validator.overall_verdict), 3),
                     float(scenario.objective_scorecard.total_score),
+                    self._component_raw(scenario.objective_scorecard, "engineering_quality"),
                     self._component_raw(scenario.objective_scorecard, "target_fit", "strength_fit"),
                     self._component_raw(scenario.objective_scorecard, "cost_proxy", "cement_penalty"),
                     float(scenario.mix_design.get("cement", 0.0)),
