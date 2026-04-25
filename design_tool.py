@@ -191,9 +191,12 @@ class MixDesignOptimizer:
             "interval_width": float(scenario.prediction.uncertainty_interval.interval_width),
             "confidence_label": str(scenario.prediction.uncertainty_interval.confidence_label),
             "target_window_overlap": float(scenario.prediction.uncertainty_interval.target_window_overlap),
+            "is_calibrated": bool(scenario.prediction.uncertainty_interval.is_calibrated),
+            "warning_reasons": list(scenario.prediction.uncertainty_interval.warning_reasons),
         }
         sample_validation = dict(scenario.validator.raw_report)
         deviation = abs(float(scenario.prediction.predicted_strength_mpa) - float(request.target_strength_mpa))
+        uncertainty_warnings = list(scenario.prediction.uncertainty_interval.warning_reasons)
         return {
             "objective": float(scenario.objective_scorecard.total_score),
             "success": bool(scenario.success),
@@ -217,6 +220,7 @@ class MixDesignOptimizer:
             "validation_failure_reasons": list(scenario.validator.failure_reasons),
             "design_constraint_violations": list(scenario.constraints.hard_failures),
             "uncertainty_interval": uncertainty_interval,
+            "uncertainty_warnings": uncertainty_warnings,
             "ranking_breakdown": self._ranking_breakdown(scenario),
             "plausibility_penalty": 0.0,
             "deviation_mpa": float(deviation),
@@ -269,6 +273,10 @@ class MixDesignOptimizer:
             "water_cement_ratio": result["engineered_ratios"]["water_cement_ratio"],
             "water_binder_ratio": result["engineered_ratios"]["water_binder_ratio"],
             "total_binder": result["engineered_ratios"]["total_binder"],
+            "uncertainty_interval_width": result["uncertainty_interval"]["interval_width"],
+            "uncertainty_confidence": result["uncertainty_interval"]["confidence_label"],
+            "uncertainty_is_calibrated": result["uncertainty_interval"].get("is_calibrated", False),
+            "uncertainty_warning_count": len(result.get("uncertainty_warnings", [])),
             "cement_saving_kg_per_m3": reference["cement_saving_kg_per_m3"],
             "cement_saving_percent": reference["cement_saving_percent"],
         }
@@ -282,6 +290,10 @@ class MixDesignOptimizer:
     ) -> dict[str, Any]:
         payload = dict(result)
         payload["source_mode"] = source_mode
+        payload["prediction_precision_note"] = (
+            "Predicted strength is a model estimate. Use the uncertainty interval, calibration status, and warnings "
+            "when comparing candidates; lab validation is required before production use."
+        )
         payload["material_units"] = {
             "superplasticizer": self._superplasticizer_unit_metadata(),
         }

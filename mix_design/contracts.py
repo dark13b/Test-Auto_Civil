@@ -93,6 +93,8 @@ class UncertaintyInterval:
     interval_width: float
     confidence_label: str
     target_window_overlap: float
+    is_calibrated: bool = True
+    warning_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

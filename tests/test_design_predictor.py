@@ -90,7 +90,7 @@ class DesignPredictorTests(unittest.TestCase):
         self.assertEqual(result.model_artifact_id, "model-artifact-1")
         self.assertGreater(result.uncertainty_interval.target_window_overlap, 0.0)
 
-    def test_predictor_falls_back_to_tolerance_window_without_estimator(self) -> None:
+    def test_predictor_marks_missing_estimator_as_uncalibrated(self) -> None:
         config = make_config()
         predictor = MixPerformancePredictor(
             model=StubModel(),
@@ -117,7 +117,38 @@ class DesignPredictorTests(unittest.TestCase):
         )
 
         self.assertEqual(result.uncertainty_interval.interval_width, 4.0)
-        self.assertEqual(result.uncertainty_interval.confidence_label, "UNKNOWN")
+        self.assertEqual(result.uncertainty_interval.confidence_label, "UNCALIBRATED")
+        self.assertFalse(result.uncertainty_interval.is_calibrated)
+        self.assertTrue(result.uncertainty_interval.warning_reasons)
+
+    def test_predictor_warns_when_interval_is_wide(self) -> None:
+        config = make_config()
+        config["uncertainty"] = {"wide_threshold_mpa": 3.0}
+        predictor = MixPerformancePredictor(
+            model=StubModel(),
+            config=config,
+            base_columns=config["task"]["input_columns"],
+            feature_columns=config["task"]["input_columns"] + list(ENGINEERED_FEATURE_COLUMNS),
+            model_artifact_id="model-artifact-3",
+            uncertainty_estimator=StubUncertaintyEstimator(StubModel(), config),
+        )
+
+        result = predictor.predict(
+            mix_design={
+                "cement": 170.0,
+                "slag": 110.0,
+                "fly_ash": 35.0,
+                "water": 168.0,
+                "superplasticizer": 7.0,
+                "coarse_aggregate": 1015.0,
+                "fine_aggregate": 770.0,
+                "age": 28.0,
+            },
+            target_strength_mpa=13.0,
+            tolerance_mpa=2.0,
+        )
+
+        self.assertTrue(any("wide threshold" in reason for reason in result.uncertainty_interval.warning_reasons))
 
 
 if __name__ == "__main__":

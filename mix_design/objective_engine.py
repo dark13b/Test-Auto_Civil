@@ -157,6 +157,12 @@ class MixObjectiveEngine:
         uncertainty_penalty = (uncertainty_width / tolerance) * 10.0
         if float(prediction.uncertainty_interval.target_window_overlap) <= 0.0:
             uncertainty_penalty += 50.0
+        confidence_label = str(prediction.uncertainty_interval.confidence_label).strip().upper()
+        if not bool(prediction.uncertainty_interval.is_calibrated):
+            uncertainty_penalty += 100.0
+        if confidence_label in {"LOW", "UNKNOWN", "UNCALIBRATED"}:
+            uncertainty_penalty += 75.0
+        uncertainty_penalty += float(len(prediction.uncertainty_interval.warning_reasons) * 25.0)
 
         verdict_penalty = {
             "PASS": 0.0,
@@ -182,6 +188,7 @@ class MixObjectiveEngine:
         explanation = (
             "Engineering quality combines target distance, explicit constraint failures, material range failures, "
             f"water/cement safety ({water_cement_note}), uncertainty interval width={uncertainty_width:.2f} MPa, "
+            f"uncertainty confidence={confidence_label}, calibrated={prediction.uncertainty_interval.is_calibrated}, "
             f"validator verdict={validator.overall_verdict}, and practical constructability cautions from the validator. "
             f"Penalty terms: target={target_penalty:.2f}, constraints={constraint_penalty:.2f}, "
             f"materials={material_penalty:.2f}, water_cement={water_cement_penalty:.2f}, "

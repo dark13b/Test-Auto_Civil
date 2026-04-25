@@ -274,6 +274,10 @@ class DesignToolTests(unittest.TestCase):
         self.assertIn("mix_design", result)
         self.assertIn("predicted_strength", result)
         self.assertIn("uncertainty_interval", result)
+        self.assertIn("interval_width", result["uncertainty_interval"])
+        self.assertIn("is_calibrated", result["uncertainty_interval"])
+        self.assertIn("warning_reasons", result["uncertainty_interval"])
+        self.assertIn("uncertainty_warnings", result)
         self.assertIn("ranking_breakdown", result)
         self.assertIn("design_context", result)
         self.assertEqual(result["design_context"]["exposure_class"], "marine")
@@ -441,6 +445,9 @@ class DesignToolTests(unittest.TestCase):
         self.assertEqual(float(csv_frame.loc[csv_frame["target_strength"] == 30.0, "cement"].iloc[0]), design_30["mix_design"]["cement"])
         self.assertEqual(str(csv_frame.loc[csv_frame["target_strength"] == 25.0, "validation_verdict"].iloc[0]), design_25["validation_verdict"])
         self.assertEqual(bool(csv_frame.loc[csv_frame["target_strength"] == 30.0, "success"].iloc[0]), design_30["success"])
+        self.assertEqual(float(csv_frame.loc[csv_frame["target_strength"] == 25.0, "uncertainty_interval_width"].iloc[0]), design_25["uncertainty_interval"]["interval_width"])
+        self.assertEqual(str(csv_frame.loc[csv_frame["target_strength"] == 30.0, "uncertainty_confidence"].iloc[0]), design_30["uncertainty_interval"]["confidence_label"])
+        self.assertIn("prediction_precision_note", design_25)
 
     def test_batch_and_single_exports_share_same_winner_contract(self) -> None:
         optimizer = make_optimizer()

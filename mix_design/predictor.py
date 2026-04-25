@@ -80,13 +80,38 @@ class MixPerformancePredictor:
         target_strength_mpa: float,
         tolerance_mpa: float,
     ) -> UncertaintyInterval:
+        warning_reasons: list[str] = []
+        is_calibrated = True
         if self.uncertainty_estimator is None:
-            lower = predicted_strength - float(tolerance_mpa)
-            upper = predicted_strength + float(tolerance_mpa)
+            is_calibrated = False
+            configured_wide_threshold = (
+                self.config.get("uncertainty", {}).get("wide_threshold_mpa")
+                if isinstance(self.config.get("uncertainty", {}), dict)
+                else None
+            )
+            fallback_width = max(
+                float(tolerance_mpa) * 2.0,
+                float(configured_wide_threshold or 0.0),
+            )
+            if fallback_width <= 0.0:
+                fallback_width = 1.0
+            half_width = fallback_width / 2.0
+            lower = predicted_strength - half_width
+            upper = predicted_strength + half_width
             width = upper - lower
-            confidence_label = "UNKNOWN"
+            confidence_label = "UNCALIBRATED"
+            warning_reasons.append(
+                "Calibrated uncertainty estimator is unavailable; interval is a conservative fallback, not a validated 90% interval."
+            )
         else:
             interval_frame = self.uncertainty_estimator.predict_with_interval(candidate_frame)
+            required_columns = {"predicted", "lower_90", "upper_90", "interval_width"}
+            missing_columns = sorted(required_columns.difference(interval_frame.columns))
+            if missing_columns:
+                raise RuntimeError(
+                    "Uncertainty estimator returned an incomplete interval payload: "
+                    + ", ".join(missing_columns)
+                )
             lower = float(interval_frame.iloc[0]["lower_90"])
             upper = float(interval_frame.iloc[0]["upper_90"])
             predicted_strength = float(interval_frame.iloc[0]["predicted"])
@@ -97,6 +122,17 @@ class MixPerformancePredictor:
         target_upper = float(target_strength_mpa) + float(tolerance_mpa)
         overlap = max(0.0, min(upper, target_upper) - max(lower, target_lower))
         window_width = max(target_upper - target_lower, 1e-6)
+        uncertainty_config = self.config.get("uncertainty", {})
+        wide_threshold = None
+        if isinstance(uncertainty_config, dict) and uncertainty_config.get("wide_threshold_mpa") is not None:
+            wide_threshold = float(uncertainty_config["wide_threshold_mpa"])
+        if wide_threshold is not None and float(width) >= wide_threshold:
+            warning_reasons.append(
+                f"Uncertainty interval width is {float(width):.2f} MPa, meeting or exceeding the configured wide threshold of {wide_threshold:.2f} MPa."
+            )
+        normalized_label = str(confidence_label).strip().upper()
+        if normalized_label in {"LOW", "UNKNOWN", "UNCALIBRATED"}:
+            warning_reasons.append(f"Uncertainty confidence is {normalized_label}.")
         return UncertaintyInterval(
             predicted=float(predicted_strength),
             lower_90=float(lower),
@@ -104,6 +140,8 @@ class MixPerformancePredictor:
             interval_width=float(width),
             confidence_label=confidence_label,
             target_window_overlap=float(overlap / window_width),
+            is_calibrated=is_calibrated,
+            warning_reasons=tuple(warning_reasons),
         )
 
     def predict(

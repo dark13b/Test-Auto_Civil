@@ -4,6 +4,7 @@ Append-only record of wiki ingest and maintenance actions.
 
 ## 2026-04-26
 
+- Documented uncertainty handling in generated mix recommendations, including interval exposure, ranking penalties, warning generation, and precision limits.
 - Added scientific candidate ranking notes for the mandatory `engineering_quality` scorecard component and indexed the page from `wiki/index.md`.
 
 ## 2026-04-24

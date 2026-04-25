@@ -285,6 +285,12 @@ class ConcreteMixDesignService:
         if float(scenario.prediction.uncertainty_interval.target_window_overlap) <= 0.0:
             penalty += float(scenario.prediction.uncertainty_interval.interval_width) * 150.0
         penalty += float(scenario.prediction.uncertainty_interval.interval_width) * 25.0
+        confidence_label = str(scenario.prediction.uncertainty_interval.confidence_label).strip().upper()
+        if not bool(scenario.prediction.uncertainty_interval.is_calibrated):
+            penalty += 10000.0
+        if confidence_label in {"LOW", "UNKNOWN", "UNCALIBRATED"}:
+            penalty += 5000.0
+        penalty += float(len(scenario.prediction.uncertainty_interval.warning_reasons) * 1000.0)
         return penalty
 
     def _evaluate_proposal(
