@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONHASHSEED: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: python scripts/run_ci_checks.py --only lint
+
+      - name: Type checks
+        run: python scripts/run_ci_checks.py --only types
+
+      - name: Unit tests
+        run: python scripts/run_ci_checks.py --only unit
+
+      - name: Contract/schema tests
+        run: python scripts/run_ci_checks.py --only contract
+
+      - name: Golden run
+        run: python scripts/run_ci_checks.py --only golden

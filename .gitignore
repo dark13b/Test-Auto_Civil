@@ -1,14 +1,50 @@
+# Python caches and bytecode
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
-outputs/
-data/concrete_data.csv
-*.pkl
-*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtualenv and local env files
 .env
+.env.*
+!.env.example
 .venv/
+venv/
+.python-version
+
+# Generated outputs and archives
+output/
+outputs/
+outputs_archive_*/
+tmp/
+temp/
+*.zip
+files.zip
+
+# Generated artifacts (reports/plots)
+*.pdf
+*.png
+
+# Notebook junk
+.ipynb_checkpoints/
+
+# Build/runtime residue
+*.log
+*.tmp
+*.cache
+*.pid
+*.seed
+*.stackdump
 dist/
 build/
-.csv
-Outputs/
+*.egg-info/
+
+# Keep intentional tracked data/docs only
+data/concrete_data.csv
+.gitnexus

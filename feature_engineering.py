@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import Any, Iterable
 
 import numpy as np
@@ -110,6 +111,33 @@ def resolve_feature_engineering_options(config: dict[str, Any] | None = None) ->
     return options
 
 
+def _load_promoted_feature_entries(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if not config:
+        return []
+    engineering = config.get("engineering", {})
+    module_names = list(engineering.get("experimental_feature_modules", []))
+    if not module_names:
+        module_names = ["experimental_features"]
+    loaded_entries: list[dict[str, Any]] = []
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(str(module_name))
+        except Exception:
+            continue
+        entries = getattr(module, "PROMOTED_EXPERIMENTAL_FEATURES", [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            function = entry.get("function")
+            name = str(entry.get("name", "")).strip()
+            if not name or not callable(function):
+                continue
+            loaded_entries.append({"name": name, "function": function, "source": entry.get("source", "unknown")})
+    return loaded_entries
+
+
 def build_engineering_features(
     df: pd.DataFrame,
     config: dict[str, Any] | None = None,
@@ -175,6 +203,14 @@ def build_engineering_features(
     frame["cement_fraction_of_binder"] = _safe_divide(cement, total_binder)
     frame["cement_fraction_of_effective_binder"] = _safe_divide(cement, effective_binder)
     frame["scm_fraction_of_effective_binder"] = _safe_divide(effective_scm_content, effective_binder)
+    for entry in _load_promoted_feature_entries(config):
+        try:
+            series = entry["function"](frame.copy())
+            if not isinstance(series, pd.Series):
+                series = pd.Series(series, index=frame.index)
+            frame[entry["name"]] = pd.to_numeric(series, errors="coerce").fillna(0.0)
+        except Exception:
+            continue
     return frame
 
 

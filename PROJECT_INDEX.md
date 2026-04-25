@@ -23,7 +23,7 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 4. `uncertainty.py`
    Builds conformal and optional quantile intervals, then writes `outputs/uncertainty_calibration.json`.
 5. `report.py`
-   Regenerates plots and `outputs/final_metrics.json` from the saved artifacts.
+   Regenerates plots and writes `outputs/final_holdout_evaluation.json` from the saved artifacts.
 6. `design_tool.py`
    Uses the saved best model to search for feasible inverse mix designs.
 7. `dashboard.py`
@@ -41,7 +41,7 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 | `research_protocol.py` | governance helpers | Brief parsing, memory, surface ratcheting, artifact validation | `load_human_research_brief`, `record_experiment_memory`, `validate_final_artifact_consistency` | governance JSON artifacts |
 | `research_loop.py` | governed research loop | Scout/confirm execution and keep/revert orchestration | `run_engineering_research_loop`, `main` | `outputs/research_results.csv`, `outputs/experiment_memory.json`, `outputs/final_artifact_validation.json` |
 | `uncertainty.py` | 447 lines | Conformal and quantile uncertainty estimation | `UncertaintyEstimator._fit_estimators`, `predict_with_interval`, `calibration_report`, `recalibrate_uncertainty_artifacts`, `main` | `outputs/uncertainty_calibration.json` |
-| `report.py` | 358 lines | Plot and summary artifact generation | `create_search_progress_plot`, `create_uncertainty_plot`, `compute_feature_importance`, `main` | `outputs/final_metrics.json`, plot PNGs |
+| `report.py` | 358 lines | Plot and summary artifact generation | `create_search_progress_plot`, `create_uncertainty_plot`, `compute_feature_importance`, `main` | `outputs/final_holdout_evaluation.json`, plot PNGs |
 | `design_tool.py` | 533 lines | Inverse mix design optimization | `MixDesignOptimizer.optimize`, `_sample_trial_mix`, `_evaluate_mix`, `_warm_start_mixes`, `batch_optimize`, `main` | `outputs/design_*MPa.json`, `outputs/batch_design_results.csv` |
 | `dashboard.py` | 1309 lines | Flask dashboard and artifact API | `api_overview`, `api_research_log`, `api_optuna_results`, `api_status`, `index` | HTTP endpoints over `outputs/` |
 
@@ -89,7 +89,7 @@ Workspace: `E:\Random IDEA\AutoResearch\auto-civil-lab`
 
 ### Reporting and uncertainty
 
-- `outputs/final_metrics.json`
+- `outputs/final_holdout_evaluation.json`
 - `outputs/uncertainty_calibration.json`
 - `outputs/search_progress.png`
 - `outputs/actual_vs_predicted.png`

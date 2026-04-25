@@ -1,4 +1,4 @@
-"""Academic benchmark runner for AutoCivil-Lab."""
+"""Evaluation-only academic benchmark runner for AutoCivil-Lab."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import numpy as np
 import optuna
 import pandas as pd
 
+from artifact_contracts import coalesce_artifact_lineage, map_deprecated_artifact_payload, normalize_uncertainty_artifact
 from search import csv_is_stale, repair_optuna_results_csv, sync_check
 from train import (
     EngineeringValidator,
@@ -180,37 +181,86 @@ def load_reference_payload(outputs_dir: Path, config: dict[str, Any]) -> dict[st
     benchmark_config = config["benchmark"]
     reference_result_path = outputs_dir / Path(str(benchmark_config["reference_result_path"])).name
     reference_uncertainty_path = outputs_dir / Path(str(benchmark_config["reference_uncertainty_path"])).name
-    reference_result = load_json_artifact(reference_result_path)
+    reference_result = load_json_artifact(reference_result_path) if reference_result_path.exists() else {}
     baseline_result = load_json_artifact(outputs_dir / "baseline_metrics.json")
+    search_selection = (
+        load_json_artifact(outputs_dir / "best_search_result.json")
+        if (outputs_dir / "best_search_result.json").exists()
+        else {}
+    )
+    final_holdout = (
+        load_json_artifact(outputs_dir / "final_holdout_evaluation.json")
+        if (outputs_dir / "final_holdout_evaluation.json").exists()
+        else {}
+    )
+    if not search_selection and (outputs_dir / "final_metrics.json").exists():
+        mapped_legacy = map_deprecated_artifact_payload(
+            "final_metrics.json",
+            load_json_artifact(outputs_dir / "final_metrics.json"),
+        )
+        search_selection = mapped_legacy.get("selected_model", {})
+        final_holdout = mapped_legacy
+    finalized_best = search_selection if isinstance(search_selection, dict) else {}
+    finalized_holdout = (
+        final_holdout.get("holdout_metrics", {})
+        if isinstance(final_holdout, dict)
+        else {}
+    )
+    finalized_holdout_aggregate = (
+        finalized_holdout.get("aggregate", {})
+        if isinstance(finalized_holdout, dict)
+        else {}
+    )
     reference_uncertainty = load_json_artifact(reference_uncertainty_path) if reference_uncertainty_path.exists() else {}
+    if isinstance(reference_uncertainty, dict) and reference_uncertainty:
+        reference_uncertainty = normalize_uncertainty_artifact(
+            reference_uncertainty,
+            expected_lineage=coalesce_artifact_lineage(
+                reference_result,
+                finalized_best,
+                fallback_model_id=str(reference_result.get("model_name", finalized_best.get("model_name", ""))).strip()
+                or None,
+            ),
+            allow_provenance_fill=False,
+            fallback_model_id=str(reference_result.get("model_name", finalized_best.get("model_name", ""))).strip()
+            or None,
+        )
 
     reference_payload = {
         "baseline": {
             "model_name": baseline_result["model_name"],
-            "holdout_rmse": float(baseline_result["holdout_rmse"]),
-            "holdout_mae": float(baseline_result["holdout_mae"]),
-            "holdout_r2": float(baseline_result["holdout_r2"]),
-            "holdout_composite": float(baseline_result["holdout_composite"]),
+            "holdout_rmse": baseline_result.get("holdout_rmse"),
+            "holdout_mae": baseline_result.get("holdout_mae"),
+            "holdout_r2": baseline_result.get("holdout_r2"),
+            "holdout_composite": baseline_result.get("holdout_composite"),
         },
         "reference_run": {
-            "model_name": reference_result["model_name"],
-            "trial_number": reference_result.get("trial_number", reference_result.get("best_trial")),
-            "holdout_rmse": float(reference_result["holdout_rmse"]),
-            "holdout_mae": float(reference_result["holdout_mae"]),
-            "holdout_r2": float(reference_result["holdout_r2"]),
-            "holdout_composite": float(reference_result["holdout_composite"]),
-            "cv_rmse": float(reference_result["cv_rmse"]),
-            "cv_mae": float(reference_result["cv_mae"]),
-            "cv_r2": float(reference_result["cv_r2"]),
-            "cv_composite": float(reference_result["cv_composite"]),
-            "validation_verdict": str(reference_result["validation_verdict"]),
-            "validation_pass_rate": float(reference_result["validation_pass_rate"]),
+            "model_name": reference_result.get("model_name", finalized_best.get("model_name")),
+            "trial_number": reference_result.get(
+                "trial_number",
+                reference_result.get("best_trial", finalized_best.get("trial_number", finalized_best.get("best_trial"))),
+            ),
+            "holdout_rmse": reference_result.get("holdout_rmse", finalized_holdout_aggregate.get("rmse")),
+            "holdout_mae": reference_result.get("holdout_mae", finalized_holdout_aggregate.get("mae")),
+            "holdout_r2": reference_result.get("holdout_r2", finalized_holdout_aggregate.get("r2")),
+            "holdout_composite": reference_result.get(
+                "holdout_composite",
+                finalized_holdout_aggregate.get("composite_score"),
+            ),
+            "cv_rmse": reference_result.get("cv_rmse", finalized_best.get("cv_rmse")),
+            "cv_mae": reference_result.get("cv_mae", finalized_best.get("cv_mae")),
+            "cv_r2": reference_result.get("cv_r2", finalized_best.get("cv_r2")),
+            "cv_composite": reference_result.get("cv_composite", finalized_best.get("cv_composite")),
+            "validation_verdict": str(reference_result.get("validation_verdict", finalized_best.get("validation_verdict"))),
+            "validation_pass_rate": reference_result.get("validation_pass_rate", finalized_best.get("validation_pass_rate")),
         },
         "reference_uncertainty": {
             "method": reference_uncertainty.get("method"),
             "coverage": reference_uncertainty.get("coverage"),
             "mean_interval_width": reference_uncertainty.get("mean_interval_width"),
             "global_status": reference_uncertainty.get("coverage_audit", {}).get("global_status"),
+            "lineage_status": reference_uncertainty.get("lineage_status"),
+            "source_label": reference_uncertainty.get("source_label"),
         },
     }
     return reference_payload
@@ -293,7 +343,7 @@ def evaluate_benchmark_model(
     cv_splitter: Any,
     range_thresholds: dict[str, float],
 ) -> tuple[Any, dict[str, Any]]:
-    """Fit, validate, and summarize one benchmark model."""
+    """Fit, validate, and summarize one benchmark model on the selection partition only."""
     cv_metrics = cross_validate_model(
         instantiate_model(model_name, params, config),
         x_train,
@@ -318,7 +368,7 @@ def evaluate_benchmark_model(
         model.predict(x_val)
     repeated_prediction_seconds = float(time.perf_counter() - repeated_prediction_start) / repeat_count
 
-    holdout_metrics = compute_regression_metrics(y_val, y_pred, config, float(y_train.mean()))
+    validation_metrics = compute_regression_metrics(y_val, y_pred, config, float(y_train.mean()))
     validation_report = validator.validate_predictions(y_pred, x_val, y_val)
     validation_summary = summarize_validation_report(validation_report)
     range_metrics = compute_rmse_by_range(y_val, y_pred, range_thresholds)
@@ -336,10 +386,11 @@ def evaluate_benchmark_model(
         "cv_composite": float(cv_metrics["composite_score"]),
         "cv_composite_std": float(cv_metrics.get("composite_std", 0.0)),
         "fold_metrics": copy.deepcopy(cv_metrics.get("fold_metrics", {})),
-        "holdout_rmse": float(holdout_metrics["rmse"]),
-        "holdout_mae": float(holdout_metrics["mae"]),
-        "holdout_r2": float(holdout_metrics["r2"]),
-        "holdout_composite": float(holdout_metrics["composite_score"]),
+        "selection_partition": "validation",
+        "validation_rmse": float(validation_metrics["rmse"]),
+        "validation_mae": float(validation_metrics["mae"]),
+        "validation_r2": float(validation_metrics["r2"]),
+        "validation_composite": float(validation_metrics["composite_score"]),
         "training_time_seconds": training_time_seconds,
         "prediction_time_seconds": prediction_time_seconds,
         "inference_time_ms_per_sample": float((repeated_prediction_seconds * 1000.0) / max(len(x_val), 1)),
@@ -382,14 +433,66 @@ def compare_against_reference(result: dict[str, Any], reference: dict[str, Any])
     return enriched
 
 
+def evaluate_final_holdout_winner(
+    model_name: str,
+    display_name: str,
+    params: dict[str, Any],
+    x_train_full: pd.DataFrame,
+    y_train_full: pd.Series,
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    config: dict[str, Any],
+    validator: EngineeringValidator,
+    range_thresholds: dict[str, float],
+) -> tuple[Any, dict[str, Any]]:
+    """Refit the selected winner on all non-holdout data and score the locked holdout once."""
+    model = instantiate_model(model_name, params, config)
+    fit_start = time.perf_counter()
+    model.fit(x_train_full, y_train_full)
+    training_time_seconds = float(time.perf_counter() - fit_start)
+
+    prediction_start = time.perf_counter()
+    y_pred = np.asarray(model.predict(x_test), dtype=float)
+    prediction_time_seconds = float(time.perf_counter() - prediction_start)
+
+    repeated_prediction_start = time.perf_counter()
+    repeat_count = 20
+    for _ in range(repeat_count):
+        model.predict(x_test)
+    repeated_prediction_seconds = float(time.perf_counter() - repeated_prediction_start) / repeat_count
+
+    holdout_metrics = compute_regression_metrics(y_test, y_pred, config, float(y_train_full.mean()))
+    holdout_validation_report = validator.validate_predictions(y_pred, x_test, y_test)
+    holdout_validation_summary = summarize_validation_report(holdout_validation_report)
+    range_metrics = compute_rmse_by_range(y_test, y_pred, range_thresholds)
+    return model, {
+        "model_name": model_name,
+        "display_name": display_name,
+        "hyperparameters": copy.deepcopy(params),
+        "holdout_rmse": float(holdout_metrics["rmse"]),
+        "holdout_mae": float(holdout_metrics["mae"]),
+        "holdout_r2": float(holdout_metrics["r2"]),
+        "holdout_composite": float(holdout_metrics["composite_score"]),
+        "holdout_validation_verdict": holdout_validation_summary["verdict"],
+        "holdout_validation_summary": holdout_validation_summary,
+        "training_time_seconds": training_time_seconds,
+        "prediction_time_seconds": prediction_time_seconds,
+        "inference_time_ms_per_sample": float((repeated_prediction_seconds * 1000.0) / max(len(x_test), 1)),
+        "range_metrics": range_metrics,
+        "range_low_rmse": float(range_metrics["low"]),
+        "range_mid_rmse": float(range_metrics["mid"]),
+        "range_high_rmse": float(range_metrics["high"]),
+    }
+
+
 def rank_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Rank models using holdout RMSE, MAE, R2, CV stability, and compute cost."""
+    """Rank models using CV+validation selection metrics, never the locked holdout."""
     ranked = sorted(
         results,
         key=lambda item: (
-            float(item["holdout_rmse"]),
-            float(item["holdout_mae"]),
-            -float(item["holdout_r2"]),
+            1 if str(item.get("validation_verdict", "")).upper() == "FAIL" else 0,
+            -float(item["cv_composite"]),
+            -float(item["validation_composite"]),
             float(item["cv_rmse_std"]),
             float(item["training_time_seconds"]),
         ),
@@ -399,18 +502,16 @@ def rank_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ranked
 
 
-def create_holdout_plot(results_frame: pd.DataFrame, reference_rmse: float, output_path: Path) -> None:
-    """Create a ranked holdout-RMSE plot."""
-    plot_frame = results_frame.sort_values("holdout_rmse", ascending=True).copy()
+def create_selection_plot(results_frame: pd.DataFrame, output_path: Path) -> None:
+    """Create a ranked validation-composite plot for model selection."""
+    plot_frame = results_frame.sort_values("final_rank", ascending=True).copy()
     colors = ["#2a9d8f" if rank == 1 else "#457b9d" if name == "LGBMRegressor" else "#9aa5b1" for rank, name in zip(plot_frame["final_rank"], plot_frame["model_name"], strict=False)]
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.figure(figsize=(10, 6))
-    plt.barh(plot_frame["display_name"], plot_frame["holdout_rmse"], color=colors)
-    plt.axvline(reference_rmse, linestyle="--", color="#e63946", linewidth=1.5, label="Current LightGBM reference")
-    plt.xlabel("Holdout RMSE (MPa)")
+    plt.barh(plot_frame["display_name"], plot_frame["validation_composite"], color=colors)
+    plt.xlabel("Validation Composite Score")
     plt.ylabel("Model")
-    plt.title("Academic Benchmark: Holdout RMSE by Model")
-    plt.legend()
+    plt.title("Academic Benchmark: Selection Ranking by Validation Composite")
     plt.gca().invert_yaxis()
     save_figure(output_path)
 
@@ -448,7 +549,7 @@ def create_range_heatmap(range_frame: pd.DataFrame, output_path: Path) -> None:
 
 
 def build_summary_frame(results: list[dict[str, Any]]) -> pd.DataFrame:
-    """Build the main model-comparison table."""
+    """Build the main model-selection comparison table."""
     rows = []
     for result in results:
         rows.append(
@@ -459,32 +560,23 @@ def build_summary_frame(results: list[dict[str, Any]]) -> pd.DataFrame:
                 "display_name": result["display_name"],
                 "family_id": result["model_name"],
                 "model_name": result["model_name"],
-                "holdout_rmse": float(result["holdout_rmse"]),
-                "holdout_mae": float(result["holdout_mae"]),
-                "holdout_r2": float(result["holdout_r2"]),
-                "holdout_composite": float(result["holdout_composite"]),
-                "delta_vs_reference_rmse": float(result["delta_vs_reference_rmse"]),
-                "delta_vs_reference_mae": float(result["delta_vs_reference_mae"]),
-                "delta_vs_reference_r2": float(result["delta_vs_reference_r2"]),
-                "delta_vs_reference_composite": float(result["delta_vs_reference_composite"]),
-                "delta_rmse_vs_reference": float(result["delta_vs_reference_rmse"]),
-                "delta_mae_vs_reference": float(result["delta_vs_reference_mae"]),
-                "delta_r2_vs_reference": float(result["delta_vs_reference_r2"]),
-                "delta_composite_vs_reference": float(result["delta_vs_reference_composite"]),
                 "cv_rmse": float(result["cv_rmse"]),
                 "cv_rmse_std": float(result["cv_rmse_std"]),
                 "cv_mae": float(result["cv_mae"]),
                 "cv_mae_std": float(result["cv_mae_std"]),
                 "cv_r2": float(result["cv_r2"]),
                 "cv_r2_std": float(result["cv_r2_std"]),
+                "cv_composite": float(result["cv_composite"]),
+                "validation_rmse": float(result["validation_rmse"]),
+                "validation_mae": float(result["validation_mae"]),
+                "validation_r2": float(result["validation_r2"]),
+                "validation_composite": float(result["validation_composite"]),
                 "validation_verdict": result["validation_verdict"],
                 "validation_pass_rate": float(result["validation_pass_rate"]),
                 "hard_failed_count": int(result["hard_failed_count"]),
                 "warning_count": int(result["warning_count"]),
                 "training_time_seconds": float(result["training_time_seconds"]),
                 "inference_time_ms_per_sample": float(result["inference_time_ms_per_sample"]),
-                "beats_reference_rmse": bool(result["beats_reference_rmse"]),
-                "beats_reference_all_primary_metrics": bool(result["beats_reference_all_primary_metrics"]),
                 "hyperparameters": json.dumps(to_serializable(result["hyperparameters"]), sort_keys=True),
             }
         )
@@ -537,12 +629,13 @@ def build_uncertainty_summary(
     best_result: dict[str, Any],
     reference_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run conformal uncertainty for the benchmark winner and compare it to the reference."""
+    """Run conformal uncertainty for the benchmark winner on the final holdout audit."""
     estimator = UncertaintyEstimator(
         model_path=best_model_path,
         method=str(config["benchmark"]["uncertainty_method"]),
         outputs_dir=outputs_dir,
         report_filename="benchmark_uncertainty_calibration.json",
+        audit_partition="holdout",
     )
     winner_uncertainty = estimator.calibration_report()
     reference_uncertainty = reference_payload.get("reference_uncertainty", {})
@@ -577,7 +670,6 @@ def write_markdown_report(
 ) -> None:
     """Write the paper-ready benchmark comparison markdown."""
     top_row = summary_frame.sort_values("rank", ascending=True).iloc[0]
-    lightgbm_row = summary_frame.loc[summary_frame["family_id"] == "LGBMRegressor"].copy()
     lightgbm_is_best = str(top_row["family_id"]) == "LGBMRegressor"
     reference_run = reference_payload["reference_run"]
     baseline_reference = reference_payload["baseline"]
@@ -610,7 +702,19 @@ def write_markdown_report(
     )
 
     cv_table = summary_frame[
-        ["rank", "model", "cv_rmse", "cv_rmse_std", "cv_mae", "cv_mae_std", "cv_r2", "cv_r2_std"]
+        ["rank", "model", "cv_rmse", "cv_rmse_std", "cv_mae", "cv_mae_std", "cv_r2", "cv_r2_std", "cv_composite"]
+    ].copy()
+    selection_table = summary_frame[
+        [
+            "rank",
+            "model",
+            "cv_composite",
+            "validation_composite",
+            "validation_rmse",
+            "validation_mae",
+            "validation_r2",
+            "validation_verdict",
+        ]
     ].copy()
     uncertainty_table = pd.DataFrame(
         [
@@ -632,20 +736,13 @@ def write_markdown_report(
     lightgbm_note = "LightGBM remains the best-performing family in the updated academic benchmark." if lightgbm_is_best else (
         f"LightGBM no longer ranks first; the updated benchmark winner is {best_result['display_name']}."
     )
-    lightgbm_detail = ""
-    if not lightgbm_row.empty:
-        row = lightgbm_row.iloc[0]
-        lightgbm_detail = (
-            f"The re-run LightGBM benchmark row achieved holdout RMSE `{format_float(row['holdout_rmse'])}` MPa, "
-            f"delta `{format_float(row['delta_rmse_vs_reference'])}` MPa versus the current reference trial."
-        )
 
     report_lines = [
         "# Academic Benchmark Comparison Against the Current LightGBM Reference",
         "",
         "## Summary",
         "",
-        f"The benchmark was executed against the current finalized LightGBM reference run (trial `{reference_run['trial_number']}`) using the existing AutoCivil-Lab data preparation, feature engineering, engineering validator, composite scoring rule, and conformal uncertainty workflow.",
+        f"The benchmark ranked candidate model families using cross-validation composite score with validation-composite tie-breaking, then evaluated only the selected winner on the locked holdout. The current finalized LightGBM reference run remains the external holdout comparator (trial `{reference_run['trial_number']}`).",
         "",
         f"- Current baseline RF reference: RMSE `{format_float(baseline_reference['holdout_rmse'])}` MPa, MAE `{format_float(baseline_reference['holdout_mae'])}` MPa, R2 `{format_float(baseline_reference['holdout_r2'])}`, composite `{format_float(baseline_reference['holdout_composite'])}`.",
         f"- Current LightGBM reference: RMSE `{format_float(reference_run['holdout_rmse'])}` MPa, MAE `{format_float(reference_run['holdout_mae'])}` MPa, R2 `{format_float(reference_run['holdout_r2'])}`, composite `{format_float(reference_run['holdout_composite'])}`.",
@@ -654,31 +751,13 @@ def write_markdown_report(
         "",
         f"**Conclusion:** {lightgbm_note}",
         "",
-        lightgbm_detail,
-        "",
         "## Executive Comparison",
         "",
         markdown_table(executive_table),
         "",
-        "## Ranked Holdout Results",
+        "## Selection Ranking",
         "",
-        markdown_table(
-            summary_frame[
-                [
-                    "rank",
-                    "model",
-                    "holdout_rmse",
-                    "holdout_mae",
-                    "holdout_r2",
-                    "holdout_composite",
-                    "delta_rmse_vs_reference",
-                    "delta_mae_vs_reference",
-                    "delta_r2_vs_reference",
-                    "delta_composite_vs_reference",
-                    "validation_verdict",
-                ]
-            ]
-        ),
+        markdown_table(selection_table),
         "",
         "## Cross-Validation Stability",
         "",
@@ -695,9 +774,9 @@ def write_markdown_report(
         "## Recommendation",
         "",
         f"The benchmark winner is `{best_result['display_name']}`. "
-        f"This model {'improves upon' if bool(top_row['beats_reference_rmse']) else 'does not improve upon'} "
+        f"This model {'improves upon' if bool(best_result['beats_reference_rmse']) else 'does not improve upon'} "
         f"the current LightGBM reference in holdout RMSE. "
-        f"The benchmark should therefore {'replace' if bool(top_row['beats_reference_rmse']) else 'retain'} "
+        f"The benchmark should therefore {'replace' if bool(best_result['beats_reference_rmse']) else 'retain'} "
         f"the current LightGBM reference as the primary model recommendation.",
         "",
     ]
@@ -705,7 +784,7 @@ def write_markdown_report(
 
 
 def main() -> int:
-    """Run the academic benchmark and save comparison artifacts."""
+    """Run the evaluation-only academic benchmark and save comparison artifacts."""
     try:
         config = load_config()
         set_global_seed(int(config["experiment"]["random_seed"]))
@@ -715,8 +794,8 @@ def main() -> int:
         reference_payload = load_reference_payload(outputs_dir, config)
 
         dataset = load_dataset(config)
-        # x_test is the locked holdout — used ONLY here for final benchmark reporting.
-        # x_val is kept for any internal use but must NOT touch benchmark evaluation.
+        # x_test is the locked holdout. It is reserved for one-time final
+        # reporting after winner selection is complete.
         x_train, x_val, x_test, y_train, y_val, y_test = split_dataset(dataset, config)
         # Integrity check: confirm holdout is separate from the training partition.
         assert len(set(x_test.index) & set(x_train.index)) == 0, (
@@ -738,7 +817,6 @@ def main() -> int:
 
         all_results: list[dict[str, Any]] = []
         all_trial_records: list[dict[str, Any]] = []
-        trained_models: dict[str, Any] = {}
 
         for model_name, model_config in benchmark_models.items():
             display_name = str(model_config.get("display_name", model_name))
@@ -758,24 +836,43 @@ def main() -> int:
                 best_params,
                 x_train,
                 y_train,
-                x_test,
-                y_test,
+                x_val,
+                y_val,
                 config,
                 validator,
                 cv_splitter,
                 range_thresholds,
             )
-            compared_result = compare_against_reference(result, reference_payload)
-            all_results.append(compared_result)
-            trained_models[model_name] = model
+            all_results.append(result)
             log_status(
-                f"Completed {display_name} | holdout RMSE={compared_result['holdout_rmse']:.4f} | "
-                f"delta_vs_reference={compared_result['delta_vs_reference_rmse']:.4f}"
+                f"Completed {display_name} | cv_composite={result['cv_composite']:.4f} | "
+                f"validation_composite={result['validation_composite']:.4f}"
             )
 
         ranked_results = rank_results(all_results)
-        best_result = ranked_results[0]
-        best_model = trained_models[best_result["model_name"]]
+        selection_winner = ranked_results[0]
+        x_train_full = pd.concat([x_train, x_val], axis=0)
+        y_train_full = pd.concat([y_train, y_val], axis=0)
+        best_model, holdout_result = evaluate_final_holdout_winner(
+            selection_winner["model_name"],
+            selection_winner["display_name"],
+            dict(selection_winner["hyperparameters"]),
+            x_train_full,
+            y_train_full,
+            x_test,
+            y_test,
+            config,
+            validator,
+            range_thresholds,
+        )
+        best_result = compare_against_reference(
+            {
+                **selection_winner,
+                **holdout_result,
+                "selected_by": "cv_composite_then_validation_composite",
+            },
+            reference_payload,
+        )
 
         best_model_path = outputs_dir / "benchmark_best_model.pkl"
         best_result_path = outputs_dir / "benchmark_best_result.json"
@@ -804,18 +901,17 @@ def main() -> int:
         )
         save_json_artifact(outputs_dir / "benchmark_uncertainty.json", uncertainty_summary)
 
-        create_holdout_plot(
+        create_selection_plot(
             summary_frame,
-            float(reference_payload["reference_run"]["holdout_rmse"]),
-            outputs_dir / "benchmark_holdout_rmse.png",
+            outputs_dir / "benchmark_selection_composite.png",
         )
-        create_reference_delta_plot(summary_frame, outputs_dir / "benchmark_reference_deltas.png")
         create_range_heatmap(range_frame, outputs_dir / "benchmark_strength_range_heatmap.png")
 
         benchmark_payload = {
             "artifact_health": artifact_health,
             "reference_payload": reference_payload,
             "range_thresholds": range_thresholds,
+            "selection_winner": selection_winner,
             "best_result": best_result,
             "uncertainty_summary": uncertainty_summary,
             "results": ranked_results,
@@ -835,7 +931,7 @@ def main() -> int:
         log_status(
             f"Benchmark complete. Winner={best_result['display_name']} | "
             f"Holdout RMSE={best_result['holdout_rmse']:.4f} | "
-            f"Reference RMSE={reference_payload['reference_run']['holdout_rmse']:.4f}"
+            f"Reference RMSE={format_float(reference_payload['reference_run']['holdout_rmse'])}"
         )
         return 0
     except Exception as exc:

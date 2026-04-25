@@ -5,22 +5,64 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import sys
+import research_lab
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from dataclasses import asdict
 
 import pandas as pd
 
 from artifact_sync import AtomicArtifactWriter
-import research_lab
-from llm_backend import get_llm_config, resolve_backend
-from proposal_engine import ProposalEngine, ProposalExtractionError
+from deterministic_proposal_provider import DeterministicProposalProvider
+from failure_analyzer import FailureAnalyzer
+from hypothesis_archive import HypothesisArchive
+from llm_admission_policy import evaluate_llm_admission_policy
+from hybrid_proposal_provider import HybridProposalProvider
+from llm_proposal_provider import LLMProposalProvider
+from loop_candidate_selection import select_scout_candidates
+from proposal_engine import (
+    ProposalBackendFailure,
+    ProposalContext,
+    ProposalExtractionError,
+    ProposalParseFailure,
+    ProposalPreflightFailure,
+    ProposalProvider,
+    ProposalSemanticFailure,
+    ProposalSchemaFailure,
+    get_proposals,
+)
+from research_loop_helpers import (
+    _archive_outcome_for_selection,
+    _build_knowledge_context_for_loop,
+    _build_record,
+    _build_proposal_engine,
+    _build_stage_config,
+    _compute_actual_delta_rmse,
+    _evaluate_reference_if_possible,
+    _evaluate_stage_candidate,
+    _load_current_best_result,
+    _read_baseline_metrics,
+    _propagate_confirm_metadata,
+    _register_llm_hypothesis_if_needed,
+    _resolve_llm_hypothesis_if_needed,
+    calculate_improvement_percentage,
+    _safe_float,
+)
+from research_loop_smoke import (
+    _apply_llm_smoke_overrides,
+    _run_llm_preflight,
+    analyze_interaction_log,
+    run_repeated_llm_smoke_test,
+    summarize_smoke_test_trials,
+)
 from research_protocol import (
     RESEARCH_RESULTS_COLUMNS,
     apply_keep_to_research_surface,
     build_acceptance_decision,
-    filter_diverse_candidates,
     load_human_research_brief,
     load_json_file,
     load_or_initialize_experiment_memory,
@@ -31,506 +73,61 @@ from research_protocol import (
     write_json_file,
 )
 from search import get_available_model_configs
-from train import (
+from train_impl import (
     EngineeringValidator,
-    evaluate_candidate,
     get_outputs_dir,
     load_config,
     load_dataset,
     log_status,
-    save_json_artifact,
     save_pickle_artifact,
     set_global_seed,
     split_dataset,
 )
+from loop_artifacts import (
+    BEST_MODEL_FILENAME,
+    BEST_RESULT_FILENAME,
+    FINAL_ACCEPTANCE_FILENAME,
+    FINAL_ARTIFACT_VALIDATION_FILENAME,
+    PROPOSAL_DIVERSITY_FILENAME,
+    RESEARCH_LOG_FILENAME,
+    RESEARCH_RESULTS_FILENAME,
+    RUN_MANIFEST_FILENAME,
+    SEARCH_STATE_BEST_MODEL_FILENAME,
+    SEARCH_STATE_BEST_RESULT_FILENAME,
+    _append_research_log,
+    _append_results_row,
+    _append_synchronized_results,
+    _build_search_selection_payload,
+    _build_results_sync_writer,
+    _build_run_manifest_payload,
+    _increment_count,
+    _initialize_research_log,
+    _initialize_results_csv,
+    _load_run_manifest_counts,
+    _sync_final_artifacts_from_source_of_truth,
+    _write_diversity_summary,
+    _write_run_manifest,
+)
+
+LOGGER = logging.getLogger("research_loop")
 from validator import summarize_validation_report
 
-
-RESEARCH_RESULTS_FILENAME = "research_results.csv"
-RESEARCH_LOG_FILENAME = "research_log.txt"
-PROPOSAL_DIVERSITY_FILENAME = "proposal_diversity.json"
-FINAL_ARTIFACT_VALIDATION_FILENAME = "final_artifact_validation.json"
-FINAL_ACCEPTANCE_FILENAME = "final_acceptance.json"
-FINAL_METRICS_FILENAME = "final_metrics.json"
-BEST_RESULT_FILENAME = "best_search_result.json"
-BEST_MODEL_FILENAME = "best_search_model.pkl"
-SEARCH_STATE_BEST_RESULT_FILENAME = "search_state_best_result.json"
-SEARCH_STATE_BEST_MODEL_FILENAME = "search_state_best_model.pkl"
 EXPERIMENT_MEMORY_FILENAME = "experiment_memory.json"
+HYPOTHESIS_ARCHIVE_FILENAME = "hypothesis_archive.json"
 LLM_RUN_SUMMARY_FILENAME = "llm_run_summary.json"
+LLM_SMOKE_TEST_FILENAME = "llm_smoke_test.json"
+LLM_SMOKE_RELIABILITY_FILENAME = "llm_smoke_reliability.json"
 
-
-def _safe_float(value: Any, fallback: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(fallback)
-
-
-def calculate_improvement_percentage(reference_score: float, candidate_score: float) -> float:
-    denominator = max(abs(reference_score), 1e-8)
-    return ((candidate_score - reference_score) / denominator) * 100.0
-
-
-def _initialize_results_csv(path: Path) -> None:
-    if path.exists() and path.stat().st_size > 0:
-        return
-    pd.DataFrame(columns=RESEARCH_RESULTS_COLUMNS).to_csv(path, index=False)
-
-
-def _append_results_row(path: Path, record: dict[str, Any]) -> None:
-    pd.DataFrame([record], columns=RESEARCH_RESULTS_COLUMNS).to_csv(
-        path,
-        mode="a",
-        header=not path.exists() or path.stat().st_size == 0,
-        index=False,
-    )
-
-
-def _build_results_sync_writer(outputs_dir: Path) -> AtomicArtifactWriter:
-    return AtomicArtifactWriter(
-        outputs_dir=outputs_dir,
-        csv_targets=[
-            (RESEARCH_RESULTS_FILENAME, RESEARCH_RESULTS_COLUMNS),
-            ("optuna_results.csv", RESEARCH_RESULTS_COLUMNS),
-        ],
-    )
-
-
-def _append_synchronized_results(sync_writer: AtomicArtifactWriter, record: dict[str, Any]) -> None:
-    sync_writer.append_trial(record)
-
-
-def _initialize_research_log(path: Path, baseline_metrics: dict[str, Any]) -> None:
-    timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-    baseline_line = (
-        f"[{timestamp}] Baseline | Model: {baseline_metrics['model_name']} | "
-        f"Composite: {baseline_metrics['composite_score']:.4f} | "
-        f"Validation: {baseline_metrics['validation_verdict']}"
-    )
-    if path.exists() and path.stat().st_size > 0:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n=== New Research Run {timestamp} ===\n")
-            handle.write(baseline_line + "\n")
-        return
-    with path.open("w", encoding="utf-8") as handle:
-        handle.write("AutoCivil-Lab Engineering Research Log\n")
-        handle.write(baseline_line + "\n")
-
-
-def _append_research_log(path: Path, line: str) -> None:
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
-
-
-def _read_baseline_metrics(outputs_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
-    baseline_path = outputs_dir / "baseline_metrics.json"
-    if baseline_path.exists():
-        return load_json_file(baseline_path)
-
-    import train
-
-    original_load_config = train.load_config
-    train.load_config = lambda: config
-    try:
-        exit_code = train.main()
-    finally:
-        train.load_config = original_load_config
-    if exit_code != 0:
-        raise RuntimeError("Baseline training failed while preparing the research loop.")
-    return load_json_file(baseline_path)
-
-
-def _load_current_best_result(outputs_dir: Path, baseline_metrics: dict[str, Any]) -> dict[str, Any]:
-    final_metrics_path = outputs_dir / FINAL_METRICS_FILENAME
-    if final_metrics_path.exists():
-        final_metrics = load_json_file(final_metrics_path)
-        best_search_metrics = final_metrics.get("best_search_metrics")
-        if isinstance(best_search_metrics, dict) and best_search_metrics:
-            payload = copy.deepcopy(best_search_metrics)
-            payload.setdefault("source", "final_metrics")
-            return payload
-
-    best_result_path = outputs_dir / BEST_RESULT_FILENAME
-    if best_result_path.exists():
-        payload = load_json_file(best_result_path)
-        payload.setdefault("source", "best_search_result")
-        return payload
-
-    payload = copy.deepcopy(baseline_metrics)
-    payload["source"] = "baseline"
-    payload["trial_number"] = None
-    payload["best_trial"] = None
-    return payload
-
-
-def _build_validation_summary(validation_report: dict[str, Any]) -> dict[str, Any]:
-    return summarize_validation_report(validation_report)
-
-
-def _build_final_metrics_payload(
-    baseline_metrics: dict[str, Any],
-    best_result: dict[str, Any],
-) -> dict[str, Any]:
-    improvement_pct = calculate_improvement_percentage(
-        _safe_float(baseline_metrics.get("composite_score")),
-        _safe_float(best_result.get("composite_score")),
-    )
-    validation_report = dict(best_result.get("validation_report", {}))
-    return {
-        "baseline_metrics": copy.deepcopy(baseline_metrics),
-        "best_search_metrics": copy.deepcopy(best_result),
-        "improvement_percentage": improvement_pct,
-        "composite_improvement_pct": improvement_pct,
-        "validation_verdict": best_result["validation_verdict"],
-        "best_model_name": best_result["model_name"],
-        "best_model_hyperparameters": copy.deepcopy(best_result["hyperparameters"]),
-        "validation_summary": _build_validation_summary(validation_report),
-        "validation_metrics": copy.deepcopy(best_result.get("val_metrics", best_result.get("test_metrics", {}))),
-    }
-
-
-def _sync_final_artifacts_from_source_of_truth(
-    *,
-    outputs_dir: Path,
-    baseline_metrics: dict[str, Any],
-    best_result: dict[str, Any],
-    best_model_source_path: Path,
-) -> dict[str, Any]:
-    final_metrics_payload = _build_final_metrics_payload(baseline_metrics, best_result)
-    save_json_artifact(outputs_dir / FINAL_METRICS_FILENAME, final_metrics_payload)
-
-    best_from_truth = copy.deepcopy(final_metrics_payload["best_search_metrics"])
-    save_json_artifact(outputs_dir / BEST_RESULT_FILENAME, best_from_truth)
-    save_json_artifact(outputs_dir / SEARCH_STATE_BEST_RESULT_FILENAME, best_from_truth)
-
-    if not best_model_source_path.exists():
-        raise FileNotFoundError(f"Best model artifact is missing: {best_model_source_path}")
-    best_model_bytes = best_model_source_path.read_bytes()
-    (outputs_dir / BEST_MODEL_FILENAME).write_bytes(best_model_bytes)
-    (outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME).write_bytes(best_model_bytes)
-
-    validation_report = validate_final_artifact_consistency(outputs_dir)
-    write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
-    if not validation_report["consistent"]:
-        raise RuntimeError(f"Final artifact mismatch: {validation_report['mismatches']}")
-    return final_metrics_payload
-
-
-def _build_record(
-    *,
-    trial_number: int,
-    experiment: dict[str, Any],
-    selection_status: str,
-    result: dict[str, Any] | None,
-    error_message: str | None,
-    trial_runtime_seconds: float | None,
-    budget_status: str | None,
-    scout_improvement_pct: float | None,
-    confirm_improvement_pct: float | None,
-) -> dict[str, Any]:
-    record = {column: None for column in RESEARCH_RESULTS_COLUMNS}
-    record.update(
-        {
-            "trial_number": trial_number,
-            "experiment_id": experiment.get("experiment_id"),
-            "stage": experiment.get("stage"),
-            "model_name": experiment.get("model_name"),
-            "display_name": experiment.get("display_name", experiment.get("model_name")),
-            "proposal_family": experiment.get("proposal_family"),
-            "hypothesis": experiment.get("hypothesis"),
-            "hyperparameters": json.dumps(experiment.get("params", {}), sort_keys=True),
-            "selection_status": selection_status,
-            "validation_verdict": None if result is None else result.get("validation_verdict"),
-            "error_message": error_message,
-            "trial_runtime_seconds": trial_runtime_seconds,
-            "budget_status": budget_status,
-            "scout_improvement_pct": scout_improvement_pct,
-            "confirm_improvement_pct": confirm_improvement_pct,
-        }
-    )
-    if result is None:
-        return record
-
-    validation_report = result.get("validation_report", {})
-    val_metrics = result.get("val_metrics", result.get("test_metrics", {}))
-    record.update(
-        {
-            "rmse": result.get("rmse"),
-            "mae": result.get("mae"),
-            "r2": result.get("r2"),
-            "composite_score": result.get("composite_score"),
-            "test_rmse": val_metrics.get("rmse"),
-            "test_mae": val_metrics.get("mae"),
-            "test_r2": val_metrics.get("r2"),
-            "test_composite_score": val_metrics.get("composite_score"),
-            "validation_pass_rate": validation_report.get("pass_rate"),
-            "failed_count": validation_report.get("failed_count"),
-            "hard_failed_count": validation_report.get("hard_failed_count", validation_report.get("failed_count")),
-            "warning_count": validation_report.get("warning_count"),
-            "suspicious_count": validation_report.get("suspicious_count"),
-            "durability_caution_count": validation_report.get("durability_caution_count", 0),
-            "dataset_anomaly_count": validation_report.get("dataset_anomaly_count", 0),
-        }
-    )
-    return record
-
-
-def _evaluate_stage_candidate(
-    *,
-    experiment: dict[str, Any],
-    config: dict[str, Any],
-    x_train: pd.DataFrame,
-    y_train: pd.Series,
-    x_val: pd.DataFrame,
-    y_val: pd.Series,
-    validator: EngineeringValidator,
-) -> tuple[Any, dict[str, Any]]:
-    return evaluate_candidate(
-        experiment["model_name"],
-        dict(experiment["params"]),
-        x_train,
-        y_train,
-        x_val,
-        y_val,
-        validator,
-        config,
-    )
-
-
-def _build_stage_config(base_config: dict[str, Any], cv_repeats: int) -> dict[str, Any]:
-    stage_config = copy.deepcopy(base_config)
-    stage_config["experiment"]["cv_repeats"] = max(1, int(cv_repeats))
-    return stage_config
-
-
-def _evaluate_reference_if_possible(
-    *,
-    current_best_result: dict[str, Any],
-    available_models: dict[str, dict[str, Any]],
-    confirm_config: dict[str, Any],
-    x_train: pd.DataFrame,
-    y_train: pd.Series,
-    x_val: pd.DataFrame,
-    y_val: pd.Series,
-    validator: EngineeringValidator,
-) -> dict[str, Any]:
-    model_name = str(current_best_result.get("model_name", ""))
-    if model_name not in available_models:
-        return current_best_result
-    try:
-        _, confirmed_reference = evaluate_candidate(
-            model_name,
-            dict(current_best_result.get("hyperparameters", {})),
-            x_train,
-            y_train,
-            x_val,
-            y_val,
-            validator,
-            confirm_config,
-        )
-    except Exception:
-        return current_best_result
-    confirmed_reference["source"] = "confirm_reference"
-    return confirmed_reference
-
-
-def _write_diversity_summary(
-    *,
-    outputs_dir: Path,
-    run_id: str,
-    current_run_signatures: set[tuple[str, str]],
-    memory_payload: dict[str, Any],
-) -> None:
-    family_counts: dict[str, int] = {}
-    for run in memory_payload.get("runs", []):
-        for trial in run.get("trials", []):
-            proposal_family = str(trial.get("proposal_family", "unknown"))
-            family_counts[proposal_family] = family_counts.get(proposal_family, 0) + 1
-    payload = {
-        "run_id": run_id,
-        "unique_signatures_this_run": len(current_run_signatures),
-        "historic_family_counts": family_counts,
-    }
-    write_json_file(outputs_dir / PROPOSAL_DIVERSITY_FILENAME, payload)
-
-
-def _build_diversity_state(memory_payload: dict[str, Any]) -> dict[str, Any]:
-    family_counts: dict[str, int] = {}
-    for run in memory_payload.get("runs", []):
-        for trial in run.get("trials", []):
-            proposal_family = str(trial.get("proposal_family", "unknown"))
-            family_counts[proposal_family] = family_counts.get(proposal_family, 0) + 1
-    return {"historic_family_counts": family_counts}
-
-
-def _normalize_llm_candidates(
-    candidates: list[dict[str, Any]],
-    available_models: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for index, candidate in enumerate(candidates, start=1):
-        model_name = str(candidate.get("model_name", ""))
-        display_name = str(
-            candidate.get(
-                "display_name",
-                available_models.get(model_name, {}).get("display_name", model_name),
-            )
-        )
-        normalized.append(
-            {
-                "experiment_id": str(candidate.get("experiment_id", f"llm-scout-{index:03d}")),
-                "stage": str(candidate.get("stage", "scout")),
-                "model_name": model_name,
-                "display_name": display_name,
-                "proposal_family": str(candidate.get("proposal_family", f"{model_name}-llm")),
-                "hypothesis": str(candidate.get("hypothesis", "LLM-generated suggestion")),
-                "params": dict(candidate.get("params", {})),
-            }
-        )
-    return normalized
-
-
-def _build_proposal_engine(config: dict[str, Any], outputs_dir: Path) -> ProposalEngine | None:
-    llm_config = get_llm_config(config)
-    if not llm_config.get("enabled", False):
-        return None
-    interaction_log_path = outputs_dir / str(llm_config.get("interaction_log_filename", "llm_interactions.jsonl"))
-    return ProposalEngine(
-        backend=resolve_backend(config),
-        interaction_log_path=interaction_log_path,
-        log_interactions=bool(llm_config.get("log_interactions", True)),
-        include_no_think_directive=bool(llm_config.get("include_no_think_directive", False)),
-        llm_config=llm_config,
-    )
-
-
-def _select_scout_candidates(
-    *,
-    brief: dict[str, Any],
-    lab_state: dict[str, Any],
-    available_models: dict[str, dict[str, Any]],
-    memory_payload: dict[str, Any],
-    current_best: dict[str, Any],
-    scout_limit: int,
-    family_limit: int,
-    current_run_signatures: set[tuple[str, str]],
-    proposal_engine: ProposalEngine | None,
-    allow_deterministic_fallback: bool = True,
-    trial_history: list[dict[str, Any]] | None = None,
-    search_progress: dict[str, Any] | None = None,
-    exploit_delta_ratio: float = 0.15,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    llm_candidates: list[dict[str, Any]] = []
-    if proposal_engine is not None and proposal_engine.is_available():
-        try:
-            llm_candidates = proposal_engine.generate_experiment_proposals(
-                available_models=available_models,
-                research_brief=brief,
-                current_best=current_best,
-                experiment_memory=memory_payload,
-                diversity_state=_build_diversity_state(memory_payload),
-                proposal_count=scout_limit,
-                trial_history=trial_history or [],
-                search_progress=search_progress or {},
-            )
-        except ProposalExtractionError:
-            llm_candidates = []
-        llm_candidates = _normalize_llm_candidates(llm_candidates, available_models)
-        llm_candidates = filter_diverse_candidates(
-            candidates=llm_candidates,
-            memory_payload=memory_payload,
-            current_run_signatures=current_run_signatures,
-            family_limit=family_limit,
-            scout_limit=scout_limit,
-        )
-        if llm_candidates:
-            interaction_summary = getattr(proposal_engine, "last_interaction_summary", {})
-            return llm_candidates, {
-                "proposal_mode": "llm",
-                "proposal_backend": proposal_engine.backend_name,
-                "proposal_count": len(llm_candidates),
-                "proposal_model": interaction_summary.get("model"),
-                "prompt_variant": interaction_summary.get("prompt_variant"),
-            }
-        if not allow_deterministic_fallback:
-            return [], {
-                "proposal_mode": "llm_unavailable",
-                "proposal_backend": proposal_engine.backend_name,
-                "proposal_count": 0,
-                "proposal_model": None,
-                "prompt_variant": None,
-            }
-
-    deterministic_candidates = research_lab.scout_experiments(
-        brief=brief,
-        lab_state=lab_state,
-        available_models=available_models,
-        experiment_memory=memory_payload,
-        current_best=current_best,
-        scout_limit=scout_limit * 2,
-        exploit_delta_ratio=exploit_delta_ratio,
-    )
-    deterministic_candidates = filter_diverse_candidates(
-        candidates=deterministic_candidates,
-        memory_payload=memory_payload,
-        current_run_signatures=current_run_signatures,
-        family_limit=family_limit,
-        scout_limit=scout_limit,
-    )
-    return deterministic_candidates, {
-        "proposal_mode": "deterministic_fallback",
-        "proposal_backend": "fallback",
-        "proposal_count": len(deterministic_candidates),
-        "proposal_model": None,
-        "prompt_variant": None,
-    }
-
-
-def analyze_interaction_log(outputs_dir: Path, *, filename: str = "llm_interactions.jsonl") -> dict[str, Any]:
-    interaction_path = outputs_dir / filename
-    if not interaction_path.exists():
-        return {
-            "exists": False,
-            "interaction_count": 0,
-            "channel_counts": {},
-            "rejection_counts": {},
-        }
-
-    channel_counts: dict[str, int] = {}
-    rejection_counts: dict[str, int] = {}
-    repair_count = 0
-    parse_success_count = 0
-    with interaction_path.open("r", encoding="utf-8") as handle:
-        records = [json.loads(line) for line in handle if line.strip()]
-    for record in records:
-        channel = str(record.get("extracted_from_channel", "unknown"))
-        channel_counts[channel] = channel_counts.get(channel, 0) + 1
-        if bool(record.get("repair_used", False)):
-            repair_count += 1
-        if bool(record.get("parse_success", False)):
-            parse_success_count += 1
-        rejection = record.get("rejection_reason")
-        if isinstance(rejection, dict):
-            code = str(rejection.get("code", "unknown"))
-            rejection_counts[code] = rejection_counts.get(code, 0) + 1
-    return {
-        "exists": True,
-        "interaction_count": len(records),
-        "channel_counts": channel_counts,
-        "rejection_counts": rejection_counts,
-        "repair_count": repair_count,
-        "parse_success_count": parse_success_count,
-    }
-
+_select_scout_candidates = select_scout_candidates
 
 def run_engineering_research_loop(
     *,
     cycles_override: int | None = None,
     with_report: bool = False,
+    config_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the governed scout-confirm-keep research loop."""
-    config = load_config()
+    config = copy.deepcopy(config_override) if config_override is not None else load_config()
     set_global_seed(int(config["experiment"]["random_seed"]))
     outputs_dir = get_outputs_dir(config)
     baseline_metrics = _read_baseline_metrics(outputs_dir, config)
@@ -563,9 +160,11 @@ def run_engineering_research_loop(
     _initialize_research_log(log_path, baseline_metrics)
 
     run_id = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    run_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     current_run_signatures: set[tuple[str, str]] = set()
     proposal_engine = _build_proposal_engine(config, outputs_dir)
-    llm_config = get_llm_config(config)
+    llm_config = dict(config.get("llm", {}))
+    allow_deterministic_fallback = bool(llm_config.get("allow_deterministic_fallback", False))
     max_cycles = max(1, int(cycles_override or research_config.get("max_cycles", 6)))
     family_limit = max(1, int(research_config.get("max_family_repeats_per_cycle", 1)))
     scout_repeats = max(1, int(research_config.get("scout_cv_repeats", 1)))
@@ -579,6 +178,65 @@ def run_engineering_research_loop(
     trial_number = 0
     scout_config = _build_stage_config(config, scout_repeats)
     confirm_config = _build_stage_config(config, confirm_repeats)
+    archive_path = outputs_dir / str(research_config.get("hypothesis_archive_filename", HYPOTHESIS_ARCHIVE_FILENAME))
+    hypothesis_archive = HypothesisArchive(archive_path)
+    knowledge_context = _build_knowledge_context_for_loop(current_best=current_best_result, x_train=x_train)
+    failure_patterns = FailureAnalyzer(memory_path).extract_failure_patterns()
+    archive_records = hypothesis_archive.load().get("records", [])
+    preflight_result: dict[str, Any] | None = None
+    final_metrics: dict[str, Any] | None = None
+    acceptance: dict[str, Any] | None = None
+    validation_report: dict[str, Any] | None = None
+    final_abort_reason: str | None = None
+    final_run_status = "running"
+    try:
+        preflight_result = _run_llm_preflight(
+            proposal_engine=proposal_engine,
+            outputs_dir=outputs_dir,
+            available_models=available_models,
+            brief=brief,
+            current_best=current_best_result,
+            memory_payload=memory_payload,
+            knowledge_context=knowledge_context,
+            failure_patterns=failure_patterns,
+            archive_records=archive_records,
+            llm_enabled=bool(llm_config.get("enabled", False)),
+            allow_deterministic_fallback=allow_deterministic_fallback,
+        )
+    except ProposalPreflightFailure as exc:
+        preflight_result = dict(getattr(exc, "interaction", {}) or {})
+        final_abort_reason = str(exc)
+        final_run_status = "aborted"
+        proposal_status_counts, semantic_rejection_counts, llm_failure_counts, archive_update_summary = _load_run_manifest_counts(
+            memory_path=memory_path,
+            archive_path=archive_path,
+            run_id=run_id,
+        )
+        manifest = _build_run_manifest_payload(
+            run_id=run_id,
+            run_started_at=run_started_at,
+            run_finished_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            config=config,
+            brief=brief,
+            llm_config=llm_config,
+            allow_deterministic_fallback=allow_deterministic_fallback,
+            preflight_result=preflight_result,
+            proposal_metadata=None,
+            smoke_summary=None,
+            proposal_status_counts=proposal_status_counts,
+            semantic_rejection_counts=semantic_rejection_counts,
+            llm_failure_counts=llm_failure_counts,
+            archive_update_summary=archive_update_summary,
+            number_of_candidates_evaluated=0,
+            holdout_touched_during_search=False,
+            final_abort_reason=final_abort_reason,
+            final_run_status=final_run_status,
+            final_metrics=None,
+            acceptance=None,
+            validation_report=None,
+        )
+        _write_run_manifest(outputs_dir, manifest)
+        raise
 
     for cycle_number in range(1, max_cycles + 1):
         elapsed_runtime = time.perf_counter() - research_start
@@ -588,12 +246,15 @@ def run_engineering_research_loop(
 
         lab_state = read_research_surface_state(research_lab_path)
         memory_payload = load_or_initialize_experiment_memory(memory_path)
+        failure_patterns = FailureAnalyzer(memory_path).extract_failure_patterns()
+        archive_records = hypothesis_archive.load().get("records", [])
+        knowledge_context = _build_knowledge_context_for_loop(current_best=current_best_result, x_train=x_train)
         scout_limit = max(
             1,
             int(brief.get("scout_candidates_per_cycle", research_config.get("scout_candidates_per_cycle", 8))),
         )
         confirm_top_k = max(1, int(brief.get("confirm_top_k", research_config.get("confirm_top_k", 2))))
-        scout_candidates, proposal_metadata = _select_scout_candidates(
+        scout_candidates, proposal_metadata = select_scout_candidates(
             brief=brief,
             lab_state=lab_state,
             available_models=available_models,
@@ -603,7 +264,22 @@ def run_engineering_research_loop(
             family_limit=family_limit,
             current_run_signatures=current_run_signatures,
             proposal_engine=proposal_engine,
-            allow_deterministic_fallback=bool(llm_config.get("allow_deterministic_fallback", True)),
+            allow_deterministic_fallback=allow_deterministic_fallback,
+            trial_history=[
+                trial
+                for run in memory_payload.get("runs", [])
+                for trial in run.get("trials", [])
+            ],
+            search_progress={
+                "phase": "scout",
+                "cycle": cycle_number,
+                "trial_number": trial_number,
+                "current_best_model": current_best_result.get("model_name"),
+            },
+            failure_patterns=failure_patterns,
+            knowledge_context=knowledge_context,
+            archive_records=archive_records,
+            preflight_result=preflight_result,
             exploit_delta_ratio=float(research_config.get("exploit_delta_ratio", 0.15)),
         )
         log_status(
@@ -628,6 +304,12 @@ def run_engineering_research_loop(
             )
             trial_number += 1
             started_at = time.perf_counter()
+            _register_llm_hypothesis_if_needed(
+                archive=hypothesis_archive,
+                experiment=experiment,
+                run_id=run_id,
+                cycle_number=cycle_number,
+            )
             try:
                 _, result = _evaluate_stage_candidate(
                     experiment=experiment,
@@ -647,6 +329,15 @@ def run_engineering_research_loop(
                     _safe_float(current_best_result.get("composite_score")),
                     _safe_float(result.get("composite_score")),
                 )
+                actual_delta_rmse = _compute_actual_delta_rmse(current_best_result, result)
+                result["actual_delta_rmse"] = actual_delta_rmse
+                if experiment.get("expected_delta_rmse") is not None and actual_delta_rmse is not None:
+                    result["calibration_error"] = round(
+                        abs(float(experiment["expected_delta_rmse"]) - float(actual_delta_rmse)),
+                        4,
+                    )
+                else:
+                    result["calibration_error"] = None
                 if budget_status == "budget_exceeded":
                     selection_status = "budget_exceeded"
                     error_message = (
@@ -664,6 +355,16 @@ def run_engineering_research_loop(
                 else:
                     selection_status = "scout_no_improvement"
                     error_message = None
+
+                if selection_status != "scout_promising":
+                    _resolve_llm_hypothesis_if_needed(
+                        archive=hypothesis_archive,
+                        experiment=experiment,
+                        trial_number=trial_number,
+                        selection_status=selection_status,
+                        actual_delta_rmse=actual_delta_rmse,
+                        actual_result=result,
+                    )
 
                 record = _build_record(
                     trial_number=trial_number,
@@ -693,6 +394,14 @@ def run_engineering_research_loop(
                     elapsed_seconds=runtime_seconds,
                     max_trial_seconds=max_trial_seconds,
                 )
+                _resolve_llm_hypothesis_if_needed(
+                    archive=hypothesis_archive,
+                    experiment=experiment,
+                    trial_number=trial_number,
+                    selection_status="error",
+                    actual_delta_rmse=None,
+                    actual_result={"error": str(exc)},
+                )
                 record = _build_record(
                     trial_number=trial_number,
                     experiment=experiment,
@@ -711,6 +420,10 @@ def run_engineering_research_loop(
             scout_results=scout_results,
             current_best=current_best_result,
             confirm_top_k=confirm_top_k,
+        )
+        confirm_candidates = _propagate_confirm_metadata(
+            confirm_candidates=confirm_candidates,
+            scout_results=scout_results,
         )
         confirmed_reference = (
             _evaluate_reference_if_possible(
@@ -737,6 +450,12 @@ def run_engineering_research_loop(
             trial_number += 1
             started_at = time.perf_counter()
             try:
+                _register_llm_hypothesis_if_needed(
+                    archive=hypothesis_archive,
+                    experiment=experiment,
+                    run_id=run_id,
+                    cycle_number=cycle_number,
+                )
                 model, result = _evaluate_stage_candidate(
                     experiment=experiment,
                     config=confirm_config,
@@ -755,6 +474,15 @@ def run_engineering_research_loop(
                     _safe_float(confirmed_reference.get("composite_score")),
                     _safe_float(result.get("composite_score")),
                 )
+                actual_delta_rmse = _compute_actual_delta_rmse(confirmed_reference, result)
+                result["actual_delta_rmse"] = actual_delta_rmse
+                if experiment.get("expected_delta_rmse") is not None and actual_delta_rmse is not None:
+                    result["calibration_error"] = round(
+                        abs(float(experiment["expected_delta_rmse"]) - float(actual_delta_rmse)),
+                        4,
+                    )
+                else:
+                    result["calibration_error"] = None
                 if budget_status == "budget_exceeded":
                     selection_status = "budget_exceeded"
                     error_message = (
@@ -774,6 +502,8 @@ def run_engineering_research_loop(
                         model,
                         config=confirm_config,
                         model_id=experiment["model_name"],
+                        run_id=run_id,
+                        source_mode="research_loop",
                     )
                     current_best_result = copy.deepcopy(result)
                     _sync_final_artifacts_from_source_of_truth(
@@ -781,6 +511,7 @@ def run_engineering_research_loop(
                         baseline_metrics=baseline_metrics,
                         best_result=current_best_result,
                         best_model_source_path=outputs_dir / SEARCH_STATE_BEST_MODEL_FILENAME,
+                        run_id=run_id,
                     )
                     apply_keep_to_research_surface(
                         research_lab_path=research_lab_path,
@@ -800,19 +531,19 @@ def run_engineering_research_loop(
                         outputs_dir=outputs_dir,
                         audit_partition="validation_audit",
                     )
-                    if rebuild_reports_on_keep:
-                        import report
-
-                        if report.main() != 0:
-                            raise RuntimeError("Report generation failed after a kept confirm experiment.")
-                        validation_report = validate_final_artifact_consistency(outputs_dir)
-                        write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
-                        if not validation_report["consistent"]:
-                            raise RuntimeError(f"Post-report artifact mismatch: {validation_report['mismatches']}")
                     confirmed_reference = current_best_result
                 else:
                     selection_status = "reverted"
                     error_message = None
+
+                _resolve_llm_hypothesis_if_needed(
+                    archive=hypothesis_archive,
+                    experiment=experiment,
+                    trial_number=trial_number,
+                    selection_status=selection_status,
+                    actual_delta_rmse=actual_delta_rmse,
+                    actual_result=result,
+                )
 
                 record = _build_record(
                     trial_number=trial_number,
@@ -841,6 +572,14 @@ def run_engineering_research_loop(
                 budget_status = trial_budget_status(
                     elapsed_seconds=runtime_seconds,
                     max_trial_seconds=max_trial_seconds,
+                )
+                _resolve_llm_hypothesis_if_needed(
+                    archive=hypothesis_archive,
+                    experiment=experiment,
+                    trial_number=trial_number,
+                    selection_status="error",
+                    actual_delta_rmse=None,
+                    actual_result={"error": str(exc)},
                 )
                 record = _build_record(
                     trial_number=trial_number,
@@ -874,27 +613,20 @@ def run_engineering_research_loop(
             baseline_metrics=baseline_metrics,
             best_result=current_best_result,
             best_model_source_path=baseline_model_path,
+            run_id=run_id,
         )
 
-    if with_report and not rebuild_reports_on_keep:
-        from uncertainty import recalibrate_uncertainty_artifacts
-        import report
-
-        recalibrate_uncertainty_artifacts(
-            model_path=outputs_dir / BEST_MODEL_FILENAME,
-            method=str(config["engineering"]["uncertainty_method"]),
-            outputs_dir=outputs_dir,
-            audit_partition="validation_audit",
-        )
-        if report.main() != 0:
-            raise RuntimeError("Report generation failed at end of research loop.")
-
-    final_metrics = load_json_file(outputs_dir / FINAL_METRICS_FILENAME)
+    final_best_result_path = outputs_dir / BEST_RESULT_FILENAME
+    if final_best_result_path.exists():
+        final_metrics = load_json_file(final_best_result_path)
+    else:
+        final_metrics = _build_search_selection_payload(baseline_metrics, current_best_result)
+        write_json_file(final_best_result_path, final_metrics)
     acceptance = build_acceptance_decision(final_metrics=final_metrics, brief=brief)
     write_json_file(outputs_dir / FINAL_ACCEPTANCE_FILENAME, acceptance)
     if (
         proposal_engine is not None
-        and proposal_engine.is_available()
+        and hasattr(proposal_engine, "summarize_run")
         and bool(llm_config.get("tasks", {}).get("summary_enabled", True))
     ):
         llm_summary = proposal_engine.summarize_run(
@@ -907,7 +639,53 @@ def run_engineering_research_loop(
     write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
     if not validation_report["consistent"]:
         raise RuntimeError(f"Final artifact mismatch: {validation_report['mismatches']}")
-    return final_metrics["best_search_metrics"]
+    if with_report:
+        from uncertainty import recalibrate_uncertainty_artifacts
+        import report
+
+        recalibrate_uncertainty_artifacts(
+            model_path=outputs_dir / BEST_MODEL_FILENAME,
+            method=str(config["engineering"]["uncertainty_method"]),
+            outputs_dir=outputs_dir,
+            audit_partition="validation_audit",
+        )
+        if report.main() != 0:
+            raise RuntimeError("Report generation failed after search finalization.")
+        validation_report = validate_final_artifact_consistency(outputs_dir)
+        write_json_file(outputs_dir / FINAL_ARTIFACT_VALIDATION_FILENAME, validation_report)
+        if not validation_report["consistent"]:
+            raise RuntimeError(f"Post-report artifact mismatch: {validation_report['mismatches']}")
+    final_run_status = "success"
+    proposal_status_counts, semantic_rejection_counts, llm_failure_counts, archive_update_summary = _load_run_manifest_counts(
+        memory_path=memory_path,
+        archive_path=archive_path,
+        run_id=run_id,
+    )
+    manifest = _build_run_manifest_payload(
+        run_id=run_id,
+        run_started_at=run_started_at,
+        run_finished_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        config=config,
+        brief=brief,
+        llm_config=llm_config,
+        allow_deterministic_fallback=allow_deterministic_fallback,
+        preflight_result=preflight_result,
+        proposal_metadata=proposal_metadata,
+        smoke_summary=None,
+        proposal_status_counts=proposal_status_counts,
+        semantic_rejection_counts=semantic_rejection_counts,
+        llm_failure_counts=llm_failure_counts,
+        archive_update_summary=archive_update_summary,
+        number_of_candidates_evaluated=trial_number,
+        holdout_touched_during_search=bool(with_report),
+        final_abort_reason=final_abort_reason,
+        final_run_status=final_run_status,
+        final_metrics=final_metrics,
+        acceptance=acceptance,
+        validation_report=validation_report,
+    )
+    _write_run_manifest(outputs_dir, manifest)
+    return final_metrics
 
 
 def main() -> int:
@@ -928,6 +706,33 @@ def main() -> int:
         action="store_true",
         help="Summarize llm_interactions.jsonl and exit.",
     )
+    parser.add_argument(
+        "--llm-smoke-test",
+        action="store_true",
+        help="Run the strict proposal-engine preflight check and exit.",
+    )
+    parser.add_argument(
+        "--llm-smoke-repeat",
+        type=int,
+        default=None,
+        help="Run the strict proposal-engine smoke test repeatedly and export a reliability summary.",
+    )
+    parser.add_argument(
+        "--llm-backend-mode",
+        choices=["ollama", "openai", "hybrid"],
+        default=None,
+        help="Override llm.backend_mode for smoke-test commands.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Override the proposal model hint for smoke-test commands.",
+    )
+    parser.add_argument(
+        "--llm-smoke-summary",
+        default=None,
+        help="Optional path for the repeated smoke-test JSON summary artifact.",
+    )
     args = parser.parse_args()
 
     try:
@@ -946,10 +751,96 @@ def main() -> int:
                 f"count={interaction_summary['interaction_count']} | "
                 f"channels={json.dumps(interaction_summary['channel_counts'], sort_keys=True)} | "
                 f"rejections={json.dumps(interaction_summary['rejection_counts'], sort_keys=True)} | "
+                f"semantic_rejections={json.dumps(interaction_summary.get('semantic_rejection_counts', {}), sort_keys=True)} | "
                 f"repairs={interaction_summary.get('repair_count', 0)} | "
                 f"parse_success={interaction_summary.get('parse_success_count', 0)}"
             )
             return 0
+
+        if args.llm_smoke_test or args.llm_smoke_repeat is not None:
+            config = _apply_llm_smoke_overrides(
+                load_config(),
+                backend_mode=args.llm_backend_mode,
+            )
+            outputs_dir = get_outputs_dir(config)
+            baseline_metrics = _read_baseline_metrics(outputs_dir, config)
+            current_best_result = _load_current_best_result(outputs_dir, baseline_metrics)
+            research_config = dict(config.get("research", {}))
+            project_root = Path(__file__).resolve().parent
+            brief_path = project_root / str(research_config.get("brief_path", "research_brief.md"))
+            brief = load_human_research_brief(brief_path)
+            available_models = get_available_model_configs(config)
+            data = load_dataset(config)
+            x_train, _, _, _, _, _ = split_dataset(data, config)
+            memory_path = outputs_dir / str(research_config.get("memory_filename", EXPERIMENT_MEMORY_FILENAME))
+            memory_payload = load_or_initialize_experiment_memory(memory_path)
+            proposal_engine = _build_proposal_engine(config, outputs_dir)
+            llm_config = dict(config.get("llm", {}))
+            archive_path = outputs_dir / str(
+                research_config.get("hypothesis_archive_filename", HYPOTHESIS_ARCHIVE_FILENAME)
+            )
+            hypothesis_archive = HypothesisArchive(archive_path)
+            knowledge_context = _build_knowledge_context_for_loop(
+                current_best=current_best_result,
+                x_train=x_train,
+            )
+            failure_patterns = FailureAnalyzer(memory_path).extract_failure_patterns()
+            archive_records = hypothesis_archive.load().get("records", [])
+
+            if args.llm_smoke_repeat is not None:
+                summary_path = (
+                    Path(args.llm_smoke_summary)
+                    if args.llm_smoke_summary
+                    else outputs_dir / LLM_SMOKE_RELIABILITY_FILENAME
+                )
+                report = run_repeated_llm_smoke_test(
+                    proposal_engine=proposal_engine,
+                    available_models=available_models,
+                    brief=brief,
+                    current_best=current_best_result,
+                    memory_payload=memory_payload,
+                    knowledge_context=knowledge_context,
+                    failure_patterns=failure_patterns,
+                    archive_records=archive_records,
+                    trials=args.llm_smoke_repeat,
+                    summary_path=summary_path,
+                    requested_backend=args.llm_backend_mode,
+                    model_hint=args.llm_model,
+                    admission_policy_config=llm_config.get("admission_policy"),
+                )
+                log_status(
+                    "LLM smoke reliability | "
+                    f"trials={report['requested_trials']} | "
+                    f"success_rate={report['summary']['success_rate']:.3f} | "
+                    f"semantic_failure_rate={report['summary'].get('semantic_failure_rate', 0.0):.3f} | "
+                    f"verdict={report['summary']['admission_policy']['verdict']} | "
+                    f"interpretation={report['summary']['compatibility']['interpretation']} | "
+                    f"summary={summary_path}"
+                )
+                return 0 if report["summary"]["success_count"] == report["summary"]["total_trials"] else 1
+
+            smoke_result = _run_llm_preflight(
+                proposal_engine=proposal_engine,
+                outputs_dir=outputs_dir,
+                available_models=available_models,
+                brief=brief,
+                current_best=current_best_result,
+                memory_payload=memory_payload,
+                knowledge_context=knowledge_context,
+                failure_patterns=failure_patterns,
+                archive_records=archive_records,
+                llm_enabled=bool(llm_config.get("enabled", False)),
+                allow_deterministic_fallback=bool(llm_config.get("allow_deterministic_fallback", False)),
+                model_hint=args.llm_model,
+            )
+            log_status(
+                "LLM smoke test | "
+                f"ok={None if smoke_result is None else smoke_result.get('ok')} | "
+                f"status={None if smoke_result is None else smoke_result.get('status')} | "
+                f"backend={None if smoke_result is None else smoke_result.get('backend')} | "
+                f"model={None if smoke_result is None else smoke_result.get('model')}"
+            )
+            return 0 if smoke_result is not None and bool(smoke_result.get("ok", False)) else 1
 
         best_result = run_engineering_research_loop(
             cycles_override=args.cycles,

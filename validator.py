@@ -557,6 +557,40 @@ class EngineeringValidator:
             )
         return violations
 
+    _TOTAL_MASS_MIN_KG_M3: float = 1800.0
+    _TOTAL_MASS_MAX_KG_M3: float = 2700.0
+
+    def _volumetric_hard_constraints(self, sample: "pd.Series") -> list[tuple[str, str]]:
+        """Return a hard-constraint violation if total mix mass is outside physical bounds."""
+        coarse = _safe_float(sample.get("coarse_aggregate"))
+        fine = _safe_float(sample.get("fine_aggregate"))
+        cement = _safe_float(sample.get(self.cement_column))
+        slag = _safe_float(sample.get("slag"))
+        fly_ash = _safe_float(sample.get("fly_ash"))
+        water = _safe_float(sample.get(self.water_column))
+        sp = _safe_float(sample.get("superplasticizer"))
+        components = [coarse, fine, cement, slag, fly_ash, water, sp]
+        if any(v is None for v in components):
+            return []
+        total_mass = sum(float(v) for v in components)  # type: ignore[arg-type]
+        if total_mass < self._TOTAL_MASS_MIN_KG_M3:
+            return [
+                (
+                    "invalid_mix_total_mass_too_low",
+                    f"Total mix mass {total_mass:.0f} kg/m\u00b3 is below the physical minimum "
+                    f"({self._TOTAL_MASS_MIN_KG_M3:.0f} kg/m\u00b3). Mix proportions are unrealistic.",
+                )
+            ]
+        if total_mass > self._TOTAL_MASS_MAX_KG_M3:
+            return [
+                (
+                    "invalid_mix_total_mass_too_high",
+                    f"Total mix mass {total_mass:.0f} kg/m\u00b3 exceeds the physical maximum "
+                    f"({self._TOTAL_MASS_MAX_KG_M3:.0f} kg/m\u00b3). Mix proportions are unrealistic.",
+                )
+            ]
+        return []
+
     def _build_contextual_summary(
         self,
         *,
@@ -756,6 +790,35 @@ class EngineeringValidator:
                     "invalid mixture state rather than a debatable engineering warning."
                 ),
                 recommended_review_action="Verify the raw mix metadata before accepting the record.",
+                assessment_confidence=CONFIDENCE_HIGH,
+            )
+
+        for warning_code, message in self._volumetric_hard_constraints(sample):
+            add_warning(
+                hard_constraints_by_code,
+                warning_code=warning_code,
+                warning_category=WARNING_CATEGORY_HARD_CONSTRAINT,
+                severity=SEVERITY_HIGH,
+                message=message,
+                triggering_factors={
+                    "coarse_aggregate": _safe_float(sample.get("coarse_aggregate")),
+                    "fine_aggregate": _safe_float(sample.get("fine_aggregate")),
+                    "cement_content": context["cement_content"],
+                    "water_content": context["water_content"],
+                    "total_binder": context["total_binder"],
+                    "superplasticizer": context["superplasticizer"],
+                    "total_mass_min_kg_m3": self._TOTAL_MASS_MIN_KG_M3,
+                    "total_mass_max_kg_m3": self._TOTAL_MASS_MAX_KG_M3,
+                },
+                academic_note=(
+                    "Normal-weight concrete has a fresh density of 2300–2500 kg/m\u00b3. "
+                    "Mixes outside [1800, 2700] kg/m\u00b3 indicate a proportioning error, "
+                    "not a legitimate lightweight or heavyweight concrete design."
+                ),
+                recommended_review_action=(
+                    "Verify aggregate, binder, and water quantities are in kg/m\u00b3 "
+                    "and that no constituent was duplicated or omitted."
+                ),
                 assessment_confidence=CONFIDENCE_HIGH,
             )
 

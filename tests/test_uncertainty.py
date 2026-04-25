@@ -201,6 +201,17 @@ class UncertaintyTests(unittest.TestCase):
         )
         self.assertEqual(len(report["coverage_by_strength_bin"]), len(report["reliability_plot_data"]))
 
+    def test_calibration_report_includes_exact_lineage(self) -> None:
+        estimator, _, _, _ = self._build_estimator()
+
+        report = estimator.calibration_report()
+
+        self.assertEqual(report["artifact_kind"], "uncertainty_audit")
+        for key in ("run_id", "model_id", "model_fingerprint", "config_hash"):
+            self.assertTrue(report.get(key), key)
+        self.assertEqual(report["model_fingerprint"], report["model_artifact_id"])
+        self.assertEqual(report["artifact_metadata"]["run_id"], report["run_id"])
+
     def test_explicit_strength_bins_are_used_when_configured(self) -> None:
         estimator, _, _ = self._build_heteroscedastic_estimator()
 

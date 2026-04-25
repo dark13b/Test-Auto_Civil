@@ -15,9 +15,15 @@ import numpy as np
 import pandas as pd
 from sklearn.inspection import permutation_importance
 
-from train import (
+from artifact_contracts import (
+    extract_artifact_lineage,
+    normalize_uncertainty_artifact,
+    map_deprecated_artifact_payload,
+)
+from train_impl import (
     artifact_id,
     artifact_run_id,
+    compute_config_hash,
     compute_regression_metrics,
     EngineeringValidator,
     get_outputs_dir,
@@ -393,25 +399,32 @@ def main() -> int:
         config = load_config()
         set_global_seed(int(config["experiment"]["random_seed"]))
         outputs_dir = get_outputs_dir(config)
+        final_acceptance_path = outputs_dir / "final_acceptance.json"
+        if not final_acceptance_path.exists():
+            raise FileNotFoundError(
+                "final_acceptance.json is required before running the final holdout report."
+            )
 
         baseline_metrics = load_json_artifact(outputs_dir / "baseline_metrics.json")
         baseline_model = load_pickle_artifact(outputs_dir / "baseline_model.pkl")
-        existing_final_metrics = (
-            load_json_artifact(outputs_dir / "final_metrics.json")
-            if (outputs_dir / "final_metrics.json").exists()
-            else {}
-        )
+        final_holdout_path = outputs_dir / "final_holdout_evaluation.json"
+        existing_final_metrics = load_json_artifact(final_holdout_path) if final_holdout_path.exists() else {}
+        if not existing_final_metrics and (outputs_dir / "final_metrics.json").exists():
+            existing_final_metrics = map_deprecated_artifact_payload(
+                "final_metrics.json",
+                load_json_artifact(outputs_dir / "final_metrics.json"),
+            )
         best_search_result = load_json_artifact(outputs_dir / "best_search_result.json")
         active_run_id = infer_active_run_id(outputs_dir, best_search_result, existing_final_metrics)
         if existing_final_metrics and artifact_run_id(existing_final_metrics) not in {None, active_run_id}:
             log_status(
-                "WARNING stale_final_metrics_ignored | "
-                f"final_metrics_run_id={artifact_run_id(existing_final_metrics)} | active_run_id={active_run_id}"
+                "WARNING stale_final_holdout_ignored | "
+                f"final_holdout_run_id={artifact_run_id(existing_final_metrics)} | active_run_id={active_run_id}"
             )
             mark_json_artifact_stale(
-                outputs_dir / "final_metrics.json",
+                final_holdout_path,
                 active_run_id=active_run_id,
-                reason="stale final metrics ignored during report generation",
+                reason="stale final holdout evaluation ignored during report generation",
             )
             existing_final_metrics = {}
         mark_json_artifact_stale(
@@ -457,10 +470,8 @@ def main() -> int:
             config=config,
             target_mean=float(y_train.mean()),
         )
-        validation_report = validator.validate_model(best_model, best_features, y_test)
-        validation_result = dict(best_search_result)
-        validation_result["validation_verdict"] = validation_report["verdict"]
-        validation_result["validation_report"] = validation_report
+        holdout_validation_report = validator.validate_model(best_model, best_features, y_test)
+        selection_validation_report = dict(best_search_result.get("validation_report", {}))
         baseline_rmse_by_range = compute_rmse_by_range(y_test, baseline_pred)
 
         create_search_progress_plot(optuna_results, float(baseline_metrics["composite_score"]), outputs_dir)
@@ -482,7 +493,20 @@ def main() -> int:
             outputs_dir=outputs_dir,
             audit_partition="holdout",
         )
-        uncertainty_audit = uncertainty_estimator.calibration_report()
+        uncertainty_expected_lineage = extract_artifact_lineage(
+            best_search_result,
+            fallback_model_id=str(best_search_result.get("model_name", "")).strip() or None,
+        )
+        if active_run_id:
+            uncertainty_expected_lineage["run_id"] = str(active_run_id)
+        if not uncertainty_expected_lineage.get("config_hash"):
+            uncertainty_expected_lineage["config_hash"] = compute_config_hash(config)
+        uncertainty_audit = normalize_uncertainty_artifact(
+            uncertainty_estimator.calibration_report(),
+            expected_lineage=uncertainty_expected_lineage,
+            allow_provenance_fill=True,
+            fallback_model_id=str(best_search_result.get("model_name", "")).strip() or None,
+        )
         interval_frame = uncertainty_estimator.predict_with_interval(best_features)
         audit_coverages = {
             int(row["bin_id"]): float(row["observed_coverage"])
@@ -502,29 +526,41 @@ def main() -> int:
             float(baseline_metrics["composite_score"]),
             float(best_search_result["composite_score"]),
         )
-        validation_summary = summarize_validation_report(validation_report)
+        selection_validation_summary = summarize_validation_report(selection_validation_report)
+        holdout_validation_summary = summarize_validation_report(holdout_validation_report)
         final_metrics = dict(existing_final_metrics) if isinstance(existing_final_metrics, dict) else {}
         final_metrics.update(
             {
+                "artifact_kind": "final_holdout_evaluation",
                 "baseline_metrics": baseline_metrics,
-                "best_search_metrics": validation_result,
+                "selected_model": dict(best_search_result),
                 "improvement_percentage": improvement_percentage,
                 "composite_improvement_pct": improvement_percentage,
-                "validation_verdict": validation_result["validation_verdict"],
-                "best_model_name": validation_result["model_name"],
-                "best_model_hyperparameters": validation_result["hyperparameters"],
-                "validation_summary": validation_summary,
-                "holdout_metrics": holdout_metrics,
+                "validation_verdict": best_search_result["validation_verdict"],
+                "validation_summary": selection_validation_summary,
+                "holdout_validation_verdict": holdout_validation_report["verdict"],
+                "holdout_validation_report": holdout_validation_report,
+                "holdout_validation_summary": holdout_validation_summary,
+                "holdout_metrics": {
+                    "stage": "final_holdout",
+                    "partition": "holdout",
+                    "aggregate": holdout_metrics,
+                    "rmse_by_strength_range": rmse_by_range,
+                },
+                "holdout_metric_name": "composite_score",
+                "selection_metric_name": best_search_result.get("selection_metric_name", "composite_score"),
                 "rmse_by_range": rmse_by_range,
                 "baseline_rmse_by_range": baseline_rmse_by_range,
                 "uncertainty_summary": uncertainty_summary,
-                "uncertainty_audit": uncertainty_audit.get("coverage_audit", {}),
+                "uncertainty_audit": uncertainty_audit,
+                "uncertainty_source_label": uncertainty_audit.get("source_label"),
+                "uncertainty_lineage_status": uncertainty_audit.get("lineage_status"),
                 "regime_specific_modeling": regime_specific_modeling,
             }
         )
         write_run_scoped_json_artifact(
             outputs_dir=outputs_dir,
-            filename="final_metrics.json",
+            filename="final_holdout_evaluation.json",
             payload=final_metrics,
             run_id=active_run_id,
             source_mode="report",
@@ -539,13 +575,14 @@ def main() -> int:
         )
 
         log_status(
-            f"Final report ready. Best model={validation_result['model_name']} | "
-            f"Composite={validation_result['composite_score']:.4f} | "
+            f"Final report ready. Best model={best_search_result['model_name']} | "
+            f"Composite={best_search_result['composite_score']:.4f} | "
             f"Improvement={improvement_percentage:.2f}% | "
-            f"Validation={validation_result['validation_verdict']} | "
-            f"HardConstraints={validation_summary['hard_constraint_count']} | "
-            f"EngineeringCautions={validation_summary['engineering_caution_count']} | "
-            f"DataReviewFlags={validation_summary['data_review_flag_count']}"
+            f"SelectionValidation={best_search_result['validation_verdict']} | "
+            f"HoldoutValidation={holdout_validation_report['verdict']} | "
+            f"HardConstraints={holdout_validation_summary['hard_constraint_count']} | "
+            f"EngineeringCautions={holdout_validation_summary['engineering_caution_count']} | "
+            f"DataReviewFlags={holdout_validation_summary['data_review_flag_count']}"
         )
         return 0
     except Exception as exc:

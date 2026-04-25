@@ -23,7 +23,7 @@ confirm_top_k: 2
 ## Constraints
 - Do not change the concrete preprocessing, feature engineering, validator, or conformal uncertainty logic.
 - Use `research_lab.py` as the only research-editable Python surface.
-- Treat `outputs/final_metrics.json` as the final source of truth.
+- Treat `outputs/best_search_result.json` as the selection-time source of truth and `outputs/final_holdout_evaluation.json` as terminal-only.
 
 ## Notes
 - Start broad with scout experiments, then confirm only the promising candidates.

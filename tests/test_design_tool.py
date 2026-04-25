@@ -9,6 +9,11 @@ import pandas as pd
 
 from design_tool import MixDesignOptimizer
 from feature_engineering import ENGINEERED_FEATURE_COLUMNS, build_engineering_features
+from mix_design import DesignContext, DesignConstraints, MixDesignRequest, ObjectiveSpec
+from mix_design.facade import ConcreteMixDesignService
+from mix_design.objective_engine import MixObjectiveEngine
+from mix_design.optimizer import MixDesignSpaceOptimizer
+from mix_design.predictor import MixPerformancePredictor
 from validator import EngineeringValidator
 
 
@@ -158,124 +163,165 @@ def make_reference_dataset() -> pd.DataFrame:
 
 
 def make_optimizer() -> MixDesignOptimizer:
+    config = make_config()
+    outputs_dir = Path(tempfile.mkdtemp())
+    base_columns = list(config["task"]["input_columns"])
+    predictor = MixPerformancePredictor(
+        model=StubModel(),
+        config=config,
+        base_columns=base_columns,
+        feature_columns=base_columns + list(ENGINEERED_FEATURE_COLUMNS),
+        model_artifact_id="model-artifact-1",
+        uncertainty_estimator=StubUncertaintyEstimator(StubModel()),
+    )
+    service = ConcreteMixDesignService(
+        config=config,
+        predictor=predictor,
+        optimizer=MixDesignSpaceOptimizer(
+            reference_dataset=make_reference_dataset(),
+            base_columns=base_columns,
+            target_column="compressive_strength",
+            design_config=config["engineering"]["design_tool"],
+            seed=42,
+        ),
+        objective_engine=MixObjectiveEngine(cost_proxy="cement_content"),
+        validator=EngineeringValidator.from_config(config),
+        reference_dataset=make_reference_dataset(),
+        base_columns=base_columns,
+        target_column="compressive_strength",
+        design_config=config["engineering"]["design_tool"],
+        project_root=Path.cwd(),
+        outputs_dir=outputs_dir,
+        model_artifact_id="model-artifact-1",
+        current_best_payload={
+            "artifact_id": "best-search-artifact",
+            "run_id": "run-current",
+            "config_hash": "config-hash-current",
+            "model_artifact_id": "model-artifact-1",
+            "model_id": "StubModel",
+            "model_fingerprint": "model-artifact-1",
+        },
+        current_uncertainty_payload={
+            "artifact_id": "uncertainty-artifact",
+            "run_id": "run-current",
+            "config_hash": "config-hash-current",
+            "model_artifact_id": "model-artifact-1",
+            "model_id": "StubModel",
+            "model_fingerprint": "model-artifact-1",
+        },
+        active_run_id="run-current",
+    )
+
     optimizer = MixDesignOptimizer.__new__(MixDesignOptimizer)
+    optimizer.service = service
     optimizer.project_root = Path.cwd()
-    optimizer.config = make_config()
-    optimizer.outputs_dir = Path(tempfile.mkdtemp())
+    optimizer.config = config
+    optimizer.outputs_dir = outputs_dir
     optimizer.seed = 42
-    optimizer.base_columns = list(optimizer.config["task"]["input_columns"])
-    optimizer.feature_columns = optimizer.base_columns + list(ENGINEERED_FEATURE_COLUMNS)
+    optimizer.base_columns = base_columns
+    optimizer.feature_columns = predictor.feature_columns
     optimizer.target_column = "compressive_strength"
-    optimizer.design_config = optimizer.config["engineering"]["design_tool"]
+    optimizer.design_config = config["engineering"]["design_tool"]
     optimizer.reference_dataset = make_reference_dataset()
-    optimizer.model = StubModel()
+    optimizer.model = predictor.model
     optimizer.model_artifact_id = "model-artifact-1"
-    optimizer.current_best_payload = {"artifact_id": "best-search-artifact", "run_id": "run-current"}
-    optimizer.current_uncertainty_payload = {"artifact_id": "uncertainty-artifact", "run_id": "run-current"}
+    optimizer.current_best_payload = {
+        "artifact_id": "best-search-artifact",
+        "run_id": "run-current",
+        "config_hash": "config-hash-current",
+        "model_artifact_id": "model-artifact-1",
+        "model_id": "StubModel",
+        "model_fingerprint": "model-artifact-1",
+    }
+    optimizer.current_uncertainty_payload = {
+        "artifact_id": "uncertainty-artifact",
+        "run_id": "run-current",
+        "config_hash": "config-hash-current",
+        "model_artifact_id": "model-artifact-1",
+        "model_id": "StubModel",
+        "model_fingerprint": "model-artifact-1",
+    }
     optimizer.active_run_id = "run-current"
-    optimizer.uncertainty_estimator = StubUncertaintyEstimator(optimizer.model)
-    optimizer.validator = EngineeringValidator.from_config(optimizer.config)
+    optimizer.expected_uncertainty_lineage = {
+        "run_id": "run-current",
+        "config_hash": "config-hash-current",
+        "model_artifact_id": "model-artifact-1",
+        "model_id": "StubModel",
+        "model_fingerprint": "model-artifact-1",
+    }
+    optimizer.current_uncertainty_lineage = {
+        "status": "verified",
+        "lineage": dict(optimizer.expected_uncertainty_lineage),
+        "mismatches": [],
+        "missing_fields": [],
+    }
+    optimizer.uncertainty_estimator = predictor.uncertainty_estimator
+    optimizer.validator = service.validator
     return optimizer
 
 
 class DesignToolTests(unittest.TestCase):
-    def test_frame_from_mix_preserves_selected_design_context(self) -> None:
-        optimizer = make_optimizer()
-
-        frame = optimizer._frame_from_mix(
-            {
-                "cement": 170.0,
-                "slag": 110.0,
-                "fly_ash": 35.0,
-                "water": 168.0,
-                "superplasticizer": 7.0,
-                "coarse_aggregate": 1015.0,
-                "fine_aggregate": 770.0,
-                "age": 28.0,
-            },
-            context={"exposure_class": "marine", "structural_application": "column"},
-        )
-
-        self.assertEqual(frame.loc[0, "exposure_class"], "marine")
-        self.assertEqual(frame.loc[0, "structural_application"], "column")
-
-    def test_low_strength_engineering_priors_are_dataset_conditioned(self) -> None:
-        optimizer = make_optimizer()
-        constraints = optimizer._normalize_constraints(None)
-        constraints = optimizer._apply_target_dependent_bounds(25.0, constraints)
-
-        priors = optimizer._engineering_prior_mixes(25.0, constraints)
-
-        self.assertTrue(priors)
-        self.assertLessEqual(min(prior["cement"] for prior in priors), 190.0)
-        self.assertTrue(any((prior["slag"] + prior["fly_ash"]) > 0.0 for prior in priors))
-
-    def test_candidate_evaluation_reports_uncertainty_and_plausibility(self) -> None:
-        optimizer = make_optimizer()
-        constraints = optimizer._normalize_constraints(None)
-        constraints = optimizer._apply_target_dependent_bounds(25.0, constraints)
-        candidate = optimizer._evaluate_mix(
-            {
-                "cement": 170.0,
-                "slag": 110.0,
-                "fly_ash": 35.0,
-                "water": 168.0,
-                "superplasticizer": 7.0,
-                "coarse_aggregate": 1015.0,
-                "fine_aggregate": 770.0,
-                "age": 28.0,
-            },
-            target_strength=25.0,
-            tolerance=2.0,
-            constraints=constraints,
-            context={"exposure_class": "marine", "structural_application": "column"},
-        )
-
-        self.assertIn("uncertainty_interval", candidate)
-        self.assertIn("plausibility_penalty", candidate)
-        self.assertIn("ranking_breakdown", candidate)
-        self.assertIn("target_window_overlap", candidate["uncertainty_interval"])
-        self.assertEqual(candidate["design_context"]["exposure_class"], "marine")
-        self.assertEqual(candidate["design_context"]["structural_application"], "column")
-        self.assertEqual(candidate["sample_validation"]["exposure_class"], "marine")
-
     def test_optimize_returns_ranked_candidates_and_legacy_winner_fields(self) -> None:
         optimizer = make_optimizer()
 
-        result = optimizer.optimize(25.0)
+        result = optimizer.optimize(
+            25.0,
+            context={"exposure_class": "marine", "structural_application": "column"},
+        )
 
         self.assertIn("ranked_candidates", result)
         self.assertTrue(result["ranked_candidates"])
         self.assertIn("mix_design", result)
         self.assertIn("predicted_strength", result)
         self.assertIn("uncertainty_interval", result)
+        self.assertIn("interval_width", result["uncertainty_interval"])
+        self.assertIn("is_calibrated", result["uncertainty_interval"])
+        self.assertIn("warning_reasons", result["uncertainty_interval"])
+        self.assertIn("uncertainty_warnings", result)
         self.assertIn("ranking_breakdown", result)
         self.assertIn("design_context", result)
+        self.assertEqual(result["design_context"]["exposure_class"], "marine")
+        self.assertEqual(result["design_context"]["structural_application"], "column")
+        self.assertIn("cost_proxy", result["ranking_breakdown"])
+        self.assertIn("target_fit", result["ranking_breakdown"])
+        self.assertIn("engineering_quality", result["ranking_breakdown"])
 
-    def test_uncertainty_summary_matches_official_estimator_output(self) -> None:
+    def test_stale_official_uncertainty_artifact_is_not_reused_silently(self) -> None:
         optimizer = make_optimizer()
-        candidate_frame = pd.DataFrame(
-            [
+        optimizer.current_uncertainty_payload = {
+            "artifact_id": "uncertainty-artifact-stale",
+            "run_id": "run-stale",
+            "config_hash": "config-hash-stale",
+            "model_artifact_id": "model-artifact-stale",
+            "model_id": "StubModel",
+            "model_fingerprint": "model-artifact-stale",
+        }
+        optimizer.current_uncertainty_lineage = {
+            "status": "mismatch",
+            "lineage": {
+                "run_id": "run-stale",
+                "config_hash": "config-hash-stale",
+                "model_artifact_id": "model-artifact-stale",
+                "model_id": "StubModel",
+                "model_fingerprint": "model-artifact-stale",
+            },
+            "mismatches": [
                 {
-                    "cement": 170.0,
-                    "slag": 110.0,
-                    "fly_ash": 35.0,
-                    "water": 168.0,
-                    "superplasticizer": 7.0,
-                    "coarse_aggregate": 1015.0,
-                    "fine_aggregate": 770.0,
-                    "age": 28.0,
+                    "field": "model_fingerprint",
+                    "expected": "model-artifact-1",
+                    "actual": "model-artifact-stale",
                 }
-            ]
-        )
+            ],
+            "missing_fields": [],
+        }
 
-        summary = optimizer._uncertainty_interval_summary(candidate_frame, target_strength=25.0, tolerance=2.0)
-        official = optimizer.uncertainty_estimator.predict_with_interval(candidate_frame).iloc[0]
+        metadata = optimizer._uncertainty_metadata()
 
-        self.assertAlmostEqual(summary["predicted"], float(official["predicted"]))
-        self.assertAlmostEqual(summary["lower_90"], float(official["lower_90"]))
-        self.assertAlmostEqual(summary["upper_90"], float(official["upper_90"]))
-        self.assertAlmostEqual(summary["interval_width"], float(official["interval_width"]))
+        self.assertFalse(metadata["derived_from_official_estimator"])
+        self.assertEqual(metadata["official_calibration_lineage_status"], "mismatch")
+        self.assertIsNone(metadata["official_calibration_artifact_id"])
+        self.assertEqual(metadata["official_calibration_lineage_mismatches"][0]["field"], "model_fingerprint")
+        self.assertEqual(optimizer._design_parent_artifact_ids(), ["best-search-artifact"])
 
     def test_batch_export_writes_matching_csv_and_per_target_jsons_from_same_results(self) -> None:
         optimizer = make_optimizer()
@@ -399,6 +445,9 @@ class DesignToolTests(unittest.TestCase):
         self.assertEqual(float(csv_frame.loc[csv_frame["target_strength"] == 30.0, "cement"].iloc[0]), design_30["mix_design"]["cement"])
         self.assertEqual(str(csv_frame.loc[csv_frame["target_strength"] == 25.0, "validation_verdict"].iloc[0]), design_25["validation_verdict"])
         self.assertEqual(bool(csv_frame.loc[csv_frame["target_strength"] == 30.0, "success"].iloc[0]), design_30["success"])
+        self.assertEqual(float(csv_frame.loc[csv_frame["target_strength"] == 25.0, "uncertainty_interval_width"].iloc[0]), design_25["uncertainty_interval"]["interval_width"])
+        self.assertEqual(str(csv_frame.loc[csv_frame["target_strength"] == 30.0, "uncertainty_confidence"].iloc[0]), design_30["uncertainty_interval"]["confidence_label"])
+        self.assertIn("prediction_precision_note", design_25)
 
     def test_batch_and_single_exports_share_same_winner_contract(self) -> None:
         optimizer = make_optimizer()
@@ -412,6 +461,39 @@ class DesignToolTests(unittest.TestCase):
         self.assertAlmostEqual(float(row["cement"]), float(single_result["mix_design"]["cement"]))
         self.assertEqual(str(row["validation_verdict"]), str(single_result["validation_verdict"]))
         self.assertEqual(bool(row["success"]), bool(single_result["success"]))
+
+    def test_adapter_constructs_typed_request_for_canonical_service(self) -> None:
+        optimizer = make_optimizer()
+        captured: dict[str, object] = {}
+        comparison = optimizer.service.compare_scenarios(
+            MixDesignRequest(
+                target_strength_mpa=25.0,
+                constraints=DesignConstraints(),
+                context=DesignContext(exposure_class="marine", structural_application="column"),
+                objectives=(
+                    ObjectiveSpec(name="target_fit", weight=1.0),
+                    ObjectiveSpec(name="cost_proxy", weight=0.5),
+                ),
+                candidate_limit=3,
+            )
+        )
+
+        def _capture(request: MixDesignRequest):
+            captured["request"] = request
+            return comparison
+
+        with patch.object(optimizer.service, "compare_scenarios", side_effect=_capture):
+            optimizer.optimize(
+                25.0,
+                constraints={"water": {"max": 180.0}, "tolerance_mpa": 1.5},
+                context={"exposure_class": "marine", "structural_application": "column"},
+            )
+
+        request = captured["request"]
+        self.assertIsInstance(request, MixDesignRequest)
+        self.assertEqual(request.context.exposure_class, "marine")
+        self.assertEqual(request.constraints.water.max, 180.0)
+        self.assertEqual(request.constraints.tolerance_mpa, 1.5)
 
 
 if __name__ == "__main__":

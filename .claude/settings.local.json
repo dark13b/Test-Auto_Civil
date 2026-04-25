@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/python dashboard.py)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python -m pytest tests/test_scientific_guardrails.py -v)",
+      "Bash(python -m pytest tests/test_scientific_guardrails.py::GuardrailWarningsInScorecardTests::test_scorecard_exposes_guardrail_warnings_field -v)",
+      "Bash(python -m pytest tests/test_scientific_guardrails.py -k \"not Scorecard\" -v)",
+      "Bash(python -m pytest tests/ -q --ignore=tests/test_dashboard.py)",
+      "Bash(python -m pytest tests/test_objective_engine.py tests/test_design_constraints.py -v)"
+    ]
+  }
+}

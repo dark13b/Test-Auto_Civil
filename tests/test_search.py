@@ -1,15 +1,76 @@
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from search import build_post_search_ensemble, finalize_search_artifacts, resolve_final_best_result
+import search
+from search import build_post_search_ensemble, build_trial_record, finalize_search_artifacts, resolve_final_best_result
 
 
 class SearchTests(unittest.TestCase):
+    def test_run_autocivil_loop_delegates_to_research_loop_with_deprecation_warning(self) -> None:
+        config = {
+            "experiment": {"optuna_trials": 30},
+            "research": {"max_cycles": 4, "max_runtime_minutes": 0},
+            "search": {
+                "min_runtime_minutes": 25,
+                "max_trial_seconds": 90,
+                "research_brief_path": "program.md",
+            },
+        }
+
+        with warnings.catch_warnings(record=True) as caught, patch(
+            "search.research_loop.run_engineering_research_loop",
+            return_value={"model_name": "LGBMRegressor", "composite_score": 0.91, "validation_verdict": "PASS"},
+        ) as run_mock, patch("search.log_status"):
+            warnings.simplefilter("always")
+            result = search.run_autocivil_loop(n_trials=12, config=config)
+
+        self.assertEqual(result["model_name"], "LGBMRegressor")
+        run_mock.assert_called_once()
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["cycles_override"], 12)
+        self.assertFalse(kwargs["with_report"])
+        delegated_config = kwargs["config_override"]
+        self.assertEqual(delegated_config["research"]["max_cycles"], 12)
+        self.assertEqual(delegated_config["research"]["max_runtime_minutes"], 25)
+        self.assertEqual(delegated_config["research"]["max_trial_seconds"], 90)
+        self.assertEqual(delegated_config["research"]["brief_path"], "program.md")
+        self.assertTrue(any("deprecated" in str(item.message).lower() for item in caught))
+
+    def test_search_main_routes_runtime_execution_through_research_loop(self) -> None:
+        config = {
+            "experiment": {"optuna_trials": 7},
+            "research": {"max_cycles": 3, "max_runtime_minutes": 0},
+            "search": {"min_runtime_minutes": 11},
+        }
+
+        with warnings.catch_warnings(record=True) as caught, patch(
+            "search.load_config",
+            return_value=config,
+        ), patch(
+            "search.research_loop.run_engineering_research_loop",
+            return_value={"model_name": "RandomForestRegressor", "composite_score": 0.88, "validation_verdict": "PASS"},
+        ) as run_mock, patch(
+            "search.log_status"
+        ), patch(
+            "sys.argv",
+            ["search.py"],
+        ):
+            warnings.simplefilter("always")
+            exit_code = search.main()
+
+        self.assertEqual(exit_code, 0)
+        run_mock.assert_called_once()
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["cycles_override"], 7)
+        self.assertFalse(kwargs["with_report"])
+        self.assertTrue(any("deprecated" in str(item.message).lower() for item in caught))
+
     def test_build_post_search_ensemble_promotes_on_cv_r2_not_holdout_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs_dir = Path(tmpdir)
@@ -55,10 +116,14 @@ class SearchTests(unittest.TestCase):
                         "cv_rmse": 1.1,
                         "cv_mae": 0.8,
                         "cv_metrics": {"r2": 0.72, "rmse": 1.1, "mae": 0.8, "composite_score": 0.50},
-                        "val_r2": 0.40,
-                        "val_rmse": 2.5,
-                        "val_mae": 1.7,
-                        "val_metrics": {"r2": 0.40, "rmse": 2.5, "mae": 1.7, "composite_score": 0.20},
+                        "validation_r2": 0.40,
+                        "validation_rmse": 2.5,
+                        "validation_mae": 1.7,
+                        "selection_validation": {
+                            "stage": "selection_validation",
+                            "partition": "validation",
+                            "aggregate": {"r2": 0.40, "rmse": 2.5, "mae": 1.7, "composite_score": 0.20},
+                        },
                         "composite_score": 0.50,
                         "validation_verdict": "PASS",
                         "validation_report": {
@@ -95,6 +160,52 @@ class SearchTests(unittest.TestCase):
         save_pickle_mock.assert_called_once()
         sync_writer.record_new_best.assert_called_once()
         recalibrate_mock.assert_called_once()
+
+    def test_build_trial_record_uses_validation_columns_not_test_columns(self) -> None:
+        result = {
+            "rmse": 1.4,
+            "mae": 1.1,
+            "r2": 0.73,
+            "composite_score": 0.62,
+            "validation_verdict": "PASS",
+            "selection_validation": {
+                "stage": "selection_validation",
+                "partition": "validation",
+                "aggregate": {
+                    "rmse": 2.5,
+                    "mae": 1.7,
+                    "r2": 0.40,
+                    "composite_score": 0.20,
+                },
+            },
+            "validation_report": {
+                "pass_rate": 1.0,
+                "failed_count": 0,
+                "hard_failed_count": 0,
+                "warning_count": 0,
+                "suspicious_count": 0,
+                "durability_caution_count": 0,
+                "dataset_anomaly_count": 0,
+            },
+        }
+
+        record = build_trial_record(
+            trial_number=7,
+            model_name="Ridge",
+            display_name="Ridge",
+            params={"alpha": 1.0},
+            result=result,
+            selection_status="new_best",
+        )
+
+        self.assertEqual(record["validation_rmse"], 2.5)
+        self.assertEqual(record["validation_mae"], 1.7)
+        self.assertEqual(record["validation_r2"], 0.40)
+        self.assertEqual(record["validation_composite_score"], 0.20)
+        self.assertNotIn("test_rmse", record)
+        self.assertNotIn("test_mae", record)
+        self.assertNotIn("test_r2", record)
+        self.assertNotIn("test_composite_score", record)
 
     def test_finalize_search_artifacts_rewrites_current_ensemble_metrics_for_ensemble_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -182,10 +293,18 @@ class SearchTests(unittest.TestCase):
                 "model_name": "StackingRegressor",
                 "composite_score": 0.91,
                 "source": "post_search_ensemble",
+                "cv_metrics": {"rmse": 5.0, "mae": 4.0, "r2": 0.61, "composite_score": 0.82},
+                "selection_metrics": {"rmse": 2.0, "mae": 1.0, "r2": 0.7, "composite_score": 0.8},
                 "validation_verdict": "PASS",
             }
             (outputs_dir / "final_metrics.json").write_text(
-                json.dumps({"best_search_metrics": final_best}),
+                json.dumps(
+                    {
+                        "best_search_metrics": final_best,
+                        "holdout_metrics": {"rmse": 4.5, "mae": 3.5, "r2": 0.8, "composite_score": 0.85},
+                        "holdout_validation_verdict": "PASS",
+                    }
+                ),
                 encoding="utf-8",
             )
 

@@ -2,6 +2,29 @@
 
 AutoCivil-Lab now runs as an autoresearch-style engineering ML system for concrete compressive-strength regression. The repo uses a governed scout -> confirm -> keep/revert loop, with `research_lab.py` as the controlled research surface, `research_brief.md` as the human strategy input, and an internal LLM proposal stack that can run through Ollama/Qwen, OpenAI, or a hybrid fallback path.
 
+## AutoCivil MVP
+
+- Product: inverse concrete mix design assistant
+- User: civil/materials engineers and small labs
+- Workflow: target strength + constraints -> ranked mix candidates -> predicted strength + warnings -> JSON report
+- Run the dashboard locally with `python dashboard.py`
+- Normal mode URL: `http://localhost:5050/?mode=normal`
+- Experimental mode is internal/admin only: `http://localhost:5050/?mode=experimental`
+- Lab validation disclaimer: outputs are for lab validation and review, not production or field signoff
+- Required trained model artifact: keep the expected trained model file available, such as `outputs/best_search_model.pkl`, if your local workflow depends on it
+
+## Official runtime
+
+The official runtime for core research is `research_loop.py`.
+
+```bash
+python research_loop.py --with-report
+```
+
+- Use `search.py` only as a deprecated compatibility wrapper.
+- Use `run_qwen_only.py` only when you specifically want the Qwen-only local backend wrapper.
+- Use `benchmark.py` only for post-run evaluation, not for core research execution.
+
 ## What this system actually does
 
 This system preserves the existing concrete-specific ML pipeline, feature engineering, validator, uncertainty estimation, and reporting stack. The infrastructure owns orchestration and artifact governance; the research surface owns what gets explored.
@@ -27,7 +50,7 @@ Additional autoresearch-style controls now included:
 - Proposal diversity tracking in `outputs/proposal_diversity.json`
 - Optional per-trial runtime budget via `research.max_trial_seconds`
 - Final artifact consistency validation in `outputs/final_artifact_validation.json`
-- Final acceptance decision in `outputs/final_acceptance.json` based on `outputs/final_metrics.json`
+- Final acceptance decision in `outputs/final_acceptance.json` based on `outputs/best_search_result.json`
 
 ## Project structure
 
@@ -62,7 +85,40 @@ Use Python 3.10+ and install the dependencies:
 pip install -r requirements.txt
 ```
 
-## Execution order
+For contributor checks and CI parity, install the dev tools as well:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+```
+
+## CI checks
+
+Run the same slices locally that CI runs on every push and pull request:
+
+```bash
+python scripts/run_ci_checks.py
+```
+
+If you only need one slice, run it directly:
+
+```bash
+python scripts/run_ci_checks.py --only lint
+python scripts/run_ci_checks.py --only types
+python scripts/run_ci_checks.py --only unit
+python scripts/run_ci_checks.py --only contract
+python scripts/run_ci_checks.py --only golden
+```
+
+The golden fixture lives under `tests/fixtures/golden_run/` and executes one deterministic `research_loop.py` cycle with:
+
+- a tiny concrete dataset fixture
+- LLM proposals disabled
+- a fixed random seed
+- reports disabled for speed
+
+Lint and type checks are intentionally scoped to the regression harness files for now, because the broader repository does not yet have a clean repo-wide baseline.
+
+## Contributor path
 
 ```bash
 python generate_data.py
@@ -71,6 +127,8 @@ python research_loop.py --with-report
 python benchmark.py
 python design_tool.py --target 35
 ```
+
+If you are looking for the old `search.py` path, treat it as legacy compatibility only. New runtime work belongs in `research_loop.py`.
 
 ## Engineering Upgrades
 
@@ -143,17 +201,17 @@ python uncertainty.py
 ## Output files
 
 - `outputs/baseline_model.pkl`: saved baseline `RandomForestRegressor`.
-- `outputs/baseline_metrics.json`: baseline CV metrics, test metrics, and engineering validation report.
+- `outputs/baseline_metrics.json`: baseline CV metrics and engineering validation report.
 - `outputs/best_search_model.pkl`: current best model after the search loop.
-- `outputs/best_search_result.json`: full metadata for the best retained result.
-- `outputs/research_results.csv`: one row per scout or confirm experiment with metrics and selection status.
+- `outputs/best_search_result.json`: canonical search-selection artifact with cross-validation and selection-validation metrics.
+- `outputs/research_results.csv`: canonical per-experiment ledger for scout and confirm execution.
 - `outputs/optuna_results.csv`: backward-compatible mirror for existing reports and dashboards.
 - `outputs/research_log.txt`: timestamped scout/confirm research timeline.
-- `outputs/final_metrics.json`: consolidated baseline, best-search, holdout, and improvement metrics.
-- `outputs/final_acceptance.json`: acceptance gate computed from `final_metrics.json` and `research_brief.md` thresholds.
+- `outputs/final_holdout_evaluation.json`: canonical terminal holdout artifact written only by the final report step.
+- `outputs/final_acceptance.json`: acceptance gate computed from `best_search_result.json` and `research_brief.md` thresholds.
 - `outputs/experiment_memory.json`: cross-run memory of trial signatures, stages, and keep decisions.
 - `outputs/proposal_diversity.json`: diversity summary for the governed research loop.
-- `outputs/final_artifact_validation.json`: final artifact consistency report anchored to `final_metrics.json`.
+- `outputs/final_artifact_validation.json`: final artifact consistency report anchored to `best_search_result.json`.
 - `outputs/search_progress.png`: trial composite scores versus baseline.
 - `outputs/actual_vs_predicted.png`: holdout actual-vs-predicted scatter plot.
 - `outputs/residuals_plot.png`: residual structure plot for the best model.
@@ -214,9 +272,10 @@ confirm_top_k: 2
 - `required_model_families`: constrains the active proposal surface to those enabled families.
 - `min_improvement_pct`: required measured gain for final acceptance.
 - `research_lab.py`: the controlled research-editable file that defines scout and confirm behavior.
-- final acceptance is written to `outputs/final_acceptance.json`, computed from `outputs/final_metrics.json`.
+- final acceptance is written to `outputs/final_acceptance.json`, computed from `outputs/best_search_result.json`.
 
 See [`docs/autoresearch_workflow.md`](docs/autoresearch_workflow.md) for the end-to-end governed loop.
+See [`ARCHITECTURE_V2.md`](ARCHITECTURE_V2.md) for the canonical runtime contract and compatibility policy.
 
 ## LLM proposal modes
 
@@ -265,7 +324,7 @@ What it is not allowed to do:
 - override keep/revert decisions
 - redefine the final artifact source of truth
 
-`outputs/final_metrics.json` remains canonical even when LLM proposals are enabled.
+`outputs/best_search_result.json` remains the selection-time source of truth even when LLM proposals are enabled, and `outputs/final_holdout_evaluation.json` remains terminal-only.
 
 `outputs/llm_interactions.jsonl` now records the prompt variant, raw response/thinking channels, the final extracted text, `extracted_from_channel`, JSON repair usage, duplicate rejection metadata, regeneration attempts, fallback usage, and the final parsed candidate. This makes empty-response / thinking-text recoveries explicit instead of silent.
 

@@ -1,4 +1,4 @@
-"""Run an AutoCivil-Lab search session with periodic status snapshots."""
+"""Session wrapper around the canonical research_loop with periodic status snapshots."""
 
 from __future__ import annotations
 
@@ -138,21 +138,21 @@ def _count_trials(csv_path: Path) -> int:
 
 
 def _read_best_summary(outputs_dir: Path) -> dict[str, Any]:
-    final_metrics_path = outputs_dir / "final_metrics.json"
-    if final_metrics_path.exists():
-        with final_metrics_path.open("r", encoding="utf-8") as handle:
-            final_metrics = json.load(handle)
-        best_search_metrics = final_metrics.get("best_search_metrics")
-        if isinstance(best_search_metrics, dict):
-            data = best_search_metrics
-        else:
-            data = {}
+    for candidate_path in (
+        outputs_dir / "best_search_result.json",
+        outputs_dir / "search_state_best_result.json",
+    ):
+        if candidate_path.exists():
+            with candidate_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            break
     else:
-        best_path = outputs_dir / "search_state_best_result.json"
-        if not best_path.exists():
+        final_holdout_path = outputs_dir / "final_holdout_evaluation.json"
+        if not final_holdout_path.exists():
             return {}
-        with best_path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        with final_holdout_path.open("r", encoding="utf-8") as handle:
+            final_holdout = json.load(handle)
+        data = final_holdout.get("selected_model", {}) if isinstance(final_holdout, dict) else {}
     return {
         "model_name": data.get("model_name"),
         "composite_score": data.get("composite_score"),
@@ -207,20 +207,19 @@ def _finalize_partial_search(overrides_path: Path, outputs_dir: Path) -> dict[st
     if not baseline_metrics_path.exists():
         return None
 
-    final_metrics_path = outputs_dir / "final_metrics.json"
-    if not final_metrics_path.exists():
+    best_result_path = outputs_dir / "best_search_result.json"
+    if not best_result_path.exists():
         return None
-    final_metrics = json.loads(final_metrics_path.read_text(encoding="utf-8"))
-    best_search_metrics = final_metrics.get("best_search_metrics")
-    if not isinstance(best_search_metrics, dict):
+    best_search_result = json.loads(best_result_path.read_text(encoding="utf-8"))
+    if not isinstance(best_search_result, dict):
         return None
-    FINAL_SUMMARY_PATH.write_text(json.dumps(best_search_metrics, indent=2, default=str), encoding="utf-8")
-    return best_search_metrics
+    FINAL_SUMMARY_PATH.write_text(json.dumps(best_search_result, indent=2, default=str), encoding="utf-8")
+    return best_search_result
 
 
 def _final_metrics_exists(outputs_dir: Path) -> bool:
     """Return whether the canonical final artifact already exists."""
-    return (outputs_dir / "final_metrics.json").exists()
+    return (outputs_dir / "final_holdout_evaluation.json").exists()
 
 
 def _run_search_child(overrides_path: Path) -> int:

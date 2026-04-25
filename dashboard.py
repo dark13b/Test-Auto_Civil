@@ -2,11 +2,17 @@ import os
 import json
 import csv
 import re
+import math
 import secrets
 import html
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory, url_for
+from artifact_contracts import (
+    coalesce_artifact_lineage,
+    evaluate_uncertainty_lineage,
+    map_deprecated_artifact_payload,
+)
 
 app = Flask(__name__)
 
@@ -107,13 +113,8 @@ def log_share_event(event_name, *, token="", metadata=None):
 
 def build_share_snapshot_payload():
     baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
-    final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-    final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
-    best_source = first_fresh_payload(
-        final_raw.get("best_search_metrics"),
-        safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
-        safe_read_json(OUTPUTS_DIR / "best_search_result.json"),
-    )
+    final_raw = load_final_holdout_payload(OUTPUTS_DIR)
+    best_source = load_search_selection_payload(OUTPUTS_DIR, final_raw)
     best = normalize_result_payload(best_source)
     final = normalize_final_payload(final_raw)
 
@@ -126,6 +127,9 @@ def build_share_snapshot_payload():
         "best_composite": best.get("holdout_composite") or best.get("cv_composite") or best.get("composite"),
         "composite_improvement_pct": final.get("composite_improvement_pct"),
         "validation_verdict": best.get("validation_verdict") or best.get("validation"),
+        "validation_source_label": "Validation metrics",
+        "holdout_source_label": final.get("holdout_source_label") or "Final holdout metrics",
+        "uncertainty_source_label": final.get("uncertainty_source_label") or "Uncertainty audit",
     }
 
 def load_required_output_json(filename):
@@ -145,6 +149,12 @@ def coerce_number(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+def coerce_finite_number(value):
+    number = coerce_number(value)
+    if number is None:
+        return None
+    return number if math.isfinite(number) else None
 
 def sanitize_dashboard_payload(value):
     if isinstance(value, dict):
@@ -169,14 +179,56 @@ def first_fresh_payload(*payloads):
             return payload
     return {}
 
+def load_final_holdout_payload(run_dir):
+    final_holdout = safe_read_json(run_dir / "final_holdout_evaluation.json") or {}
+    if isinstance(final_holdout, dict) and final_holdout and not artifact_payload_is_stale(final_holdout):
+        return final_holdout
+    legacy_payload = safe_read_json(run_dir / "final_metrics.json") or {}
+    if not isinstance(legacy_payload, dict) or not legacy_payload:
+        return {}
+    try:
+        mapped = map_deprecated_artifact_payload("final_metrics.json", legacy_payload)
+    except Exception:
+        return {}
+    return {} if artifact_payload_is_stale(mapped) else mapped
+
+def load_search_selection_payload(run_dir, final_payload=None):
+    if not isinstance(final_payload, dict):
+        final_payload = {}
+    return first_fresh_payload(
+        safe_read_json(run_dir / "best_search_result.json"),
+        safe_read_json(run_dir / "search_state_best_result.json"),
+        final_payload.get("selected_model"),
+        final_payload.get("best_search_metrics"),
+    )
+
 def normalize_result_payload(payload):
     if not isinstance(payload, dict):
         return {}
 
     normalized = dict(payload)
-    cv_metrics = normalized.get("cv_metrics") or {}
-    test_metrics = normalized.get("test_metrics") or {}
-    validation_report = normalized.get("validation_report") or {}
+    cv_metrics = normalized.get("cv_metrics") or normalized.get("cross_validation") or {}
+    if isinstance(cv_metrics, dict) and isinstance(cv_metrics.get("aggregate"), dict):
+        cv_metrics = cv_metrics.get("aggregate") or {}
+    selection_metrics = normalized.get("selection_validation") or {}
+    if isinstance(selection_metrics, dict) and isinstance(selection_metrics.get("aggregate"), dict):
+        selection_metrics = selection_metrics.get("aggregate") or {}
+    if not selection_metrics:
+        selection_metrics = (
+            normalized.get("validation_metrics")
+            or normalized.get("selection_metrics")
+            or normalized.get("val_metrics")
+            or normalized.get("test_metrics")
+            or {}
+        )
+    holdout_metrics = normalized.get("holdout_metrics") or {}
+    if isinstance(holdout_metrics, dict) and isinstance(holdout_metrics.get("aggregate"), dict):
+        holdout_metrics = holdout_metrics.get("aggregate") or {}
+    validation_report = (
+        normalized.get("selection_validation_report")
+        or normalized.get("validation_report")
+        or {}
+    )
 
     normalized["validation"] = normalized.get("validation_verdict") or normalized.get("validation")
     normalized["cv_rmse"] = coerce_number(normalized.get("cv_rmse") or cv_metrics.get("rmse") or normalized.get("rmse"))
@@ -185,17 +237,29 @@ def normalize_result_payload(payload):
     normalized["cv_composite"] = coerce_number(
         normalized.get("cv_composite") or cv_metrics.get("composite_score") or normalized.get("composite_score")
     )
+    normalized["validation_rmse"] = coerce_number(
+        normalized.get("validation_rmse") or selection_metrics.get("rmse")
+    )
+    normalized["validation_mae"] = coerce_number(
+        normalized.get("validation_mae") or selection_metrics.get("mae")
+    )
+    normalized["validation_r2"] = coerce_number(
+        normalized.get("validation_r2") or selection_metrics.get("r2")
+    )
+    normalized["validation_composite"] = coerce_number(
+        normalized.get("validation_composite") or selection_metrics.get("composite_score")
+    )
     normalized["holdout_rmse"] = coerce_number(
-        normalized.get("holdout_rmse") or test_metrics.get("rmse")
+        normalized.get("holdout_rmse") or holdout_metrics.get("rmse")
     )
     normalized["holdout_mae"] = coerce_number(
-        normalized.get("holdout_mae") or test_metrics.get("mae")
+        normalized.get("holdout_mae") or holdout_metrics.get("mae")
     )
     normalized["holdout_r2"] = coerce_number(
-        normalized.get("holdout_r2") or test_metrics.get("r2")
+        normalized.get("holdout_r2") or holdout_metrics.get("r2")
     )
     normalized["holdout_composite"] = coerce_number(
-        normalized.get("holdout_composite") or test_metrics.get("composite_score")
+        normalized.get("holdout_composite") or holdout_metrics.get("composite_score")
     )
     normalized["best_trial"] = normalized.get("best_trial", normalized.get("trial_number"))
 
@@ -317,7 +381,352 @@ def normalize_final_payload(payload):
     normalized["composite_improvement_pct"] = coerce_number(
         normalized.get("composite_improvement_pct") or normalized.get("improvement_percentage")
     )
+    holdout_metrics = normalized.get("holdout_metrics") or {}
+    if isinstance(holdout_metrics, dict) and isinstance(holdout_metrics.get("aggregate"), dict):
+        holdout_metrics = holdout_metrics.get("aggregate") or {}
+    normalized["holdout_source_type"] = "holdout_metrics" if holdout_metrics else None
+    normalized["holdout_source_label"] = "Final holdout metrics" if holdout_metrics else None
+    normalized["holdout_rmse"] = coerce_number(holdout_metrics.get("rmse"))
+    normalized["holdout_mae"] = coerce_number(holdout_metrics.get("mae"))
+    normalized["holdout_r2"] = coerce_number(holdout_metrics.get("r2"))
+    normalized["holdout_composite"] = coerce_number(
+        normalized.get("holdout_composite") or holdout_metrics.get("composite_score")
+    )
+    uncertainty_audit = normalized.get("uncertainty_audit") or {}
+    if not isinstance(uncertainty_audit, dict):
+        uncertainty_audit = {}
+    expected_uncertainty_lineage = coalesce_artifact_lineage(
+        payload.get("selected_model"),
+        payload,
+        fallback_model_id=str((payload.get("selected_model") or {}).get("model_name", "")).strip() or None,
+    )
+    uncertainty_summary = summarize_uncertainty_audit(
+        uncertainty_audit,
+        expected_lineage=expected_uncertainty_lineage,
+    )
+    normalized["uncertainty_audit"] = uncertainty_summary
+    normalized["uncertainty_source_type"] = uncertainty_summary.get("source_type")
+    normalized["uncertainty_source_label"] = uncertainty_summary.get("source_label")
+    normalized["uncertainty_coverage"] = uncertainty_summary.get("coverage")
+    normalized["uncertainty_coverage_target"] = uncertainty_summary.get("coverage_target")
+    normalized["uncertainty_lineage"] = uncertainty_summary.get("lineage")
+    normalized["uncertainty_lineage_status"] = uncertainty_summary.get("lineage_status")
     return normalized
+
+def summarize_metric_source(source_payload, *, source_type, source_label):
+    source = source_payload if isinstance(source_payload, dict) else {}
+    aggregate = source.get("aggregate") if isinstance(source.get("aggregate"), dict) else {}
+    aggregate_summary = {
+        "rmse": coerce_finite_number(aggregate.get("rmse")),
+        "mae": coerce_finite_number(aggregate.get("mae")),
+        "r2": coerce_finite_number(aggregate.get("r2")),
+        "composite_score": coerce_finite_number(aggregate.get("composite_score")),
+    }
+    return {
+        "source_type": source_type,
+        "source_label": source_label,
+        "stage": source.get("stage") or source_type,
+        "partition": source.get("partition"),
+        "available": any(value is not None for value in aggregate_summary.values()),
+        "aggregate": aggregate_summary,
+    }
+
+def has_uncertainty_audit_evidence(source_payload):
+    source = source_payload if isinstance(source_payload, dict) else {}
+    if not source:
+        return False
+    return any(
+        [
+            coerce_finite_number(source.get("coverage")) is not None,
+            coerce_finite_number(source.get("coverage_target")) is not None,
+            bool(source.get("coverage_audit")),
+            bool(source.get("strength_bin_audit")),
+            bool(source.get("audit_partition")),
+            bool(source.get("calibration_partition")),
+        ]
+    )
+
+
+def summarize_uncertainty_audit(source_payload, *, expected_lineage=None):
+    source = source_payload if isinstance(source_payload, dict) else {}
+    lineage_report = evaluate_uncertainty_lineage(
+        source,
+        expected_lineage=expected_lineage,
+        fallback_model_id=str(source.get("model_id") or source.get("model_name") or "").strip() or None,
+    )
+    lineage = dict(lineage_report["lineage"])
+    lineage["status"] = lineage_report["status"]
+    if lineage_report["missing_fields"]:
+        lineage["missing_fields"] = list(lineage_report["missing_fields"])
+    if lineage_report["mismatches"]:
+        lineage["mismatches"] = list(lineage_report["mismatches"])
+    return {
+        "source_type": "uncertainty_audit" if source else None,
+        "source_label": source.get("source_label") or lineage_report["label"] if source else None,
+        "available": has_uncertainty_audit_evidence(source),
+        "coverage": coerce_number(source.get("coverage")),
+        "coverage_target": coerce_number(source.get("coverage_target")),
+        "coverage_audit": source.get("coverage_audit") or {},
+        "audit_partition": source.get("audit_partition"),
+        "calibration_partition": source.get("calibration_partition"),
+        "strength_bin_audit": source.get("strength_bin_audit") or {},
+        "lineage": lineage,
+        "lineage_status": lineage_report["status"],
+        "lineage_mismatches": list(lineage_report["mismatches"]),
+    }
+
+def summarize_validation_report_source(report_payload, *, source_type, source_label):
+    report = report_payload if isinstance(report_payload, dict) else {}
+    return {
+        "source_type": source_type,
+        "source_label": source_label,
+        "verdict": report.get("verdict") or report.get("overall_verdict") or report.get("pass_fail") or "N/A",
+        "pass_rate": coerce_number(report.get("pass_rate")),
+        "hard_constraint_count": int(coerce_number(report.get("hard_constraint_count") or report.get("hard_failed_count") or report.get("failed_count")) or 0),
+        "engineering_caution_count": int(coerce_number(report.get("engineering_caution_count") or report.get("durability_caution_count")) or 0),
+        "data_review_flag_count": int(coerce_number(report.get("data_review_flag_count") or report.get("dataset_anomaly_count") or report.get("suspicious_count")) or 0),
+        "contextual_summary": report.get("contextual_summary") or "",
+        "confidence_of_warning_assessment": report.get("confidence_of_warning_assessment") or "",
+        "source_available": bool(report),
+    }
+
+def build_validation_details_payload(best_source, final_raw):
+    best = best_source if isinstance(best_source, dict) else {}
+    final = final_raw if isinstance(final_raw, dict) else {}
+    cv_metrics = summarize_metric_source(
+        best.get("cross_validation") or best.get("cv_metrics") or best.get("cv"),
+        source_type="cross_validation",
+        source_label="Cross-validation metrics",
+    )
+    validation_metrics = summarize_metric_source(
+        best.get("selection_validation") or best.get("validation_metrics") or best.get("selection_metrics") or best.get("val_metrics"),
+        source_type="selection_validation",
+        source_label="Validation metrics",
+    )
+    holdout_metrics = summarize_metric_source(
+        final.get("holdout_metrics"),
+        source_type="holdout_metrics",
+        source_label="Final holdout metrics",
+    )
+    uncertainty_audit = summarize_uncertainty_audit(
+        final.get("uncertainty_audit"),
+        expected_lineage=coalesce_artifact_lineage(
+            best,
+            final.get("selected_model"),
+            final,
+            fallback_model_id=str(best.get("model_name") or final.get("selected_model", {}).get("model_name") or "").strip() or None,
+        ),
+    )
+    validation_report = summarize_validation_report_source(
+        best.get("selection_validation_report") or best.get("validation_report"),
+        source_type="selection_validation_report",
+        source_label="Validation report",
+    )
+    holdout_validation_report = summarize_validation_report_source(
+        final.get("holdout_validation_report") or final.get("final_artifact_validation"),
+        source_type="holdout_validation_report",
+        source_label="Holdout validation report",
+    )
+    return {
+        "model_name": best.get("model_name") or final.get("selected_model", {}).get("model_name") or "N/A",
+        "cross_validation": cv_metrics,
+        "validation_metrics": validation_metrics,
+        "holdout_metrics": holdout_metrics,
+        "validation_report": validation_report,
+        "holdout_validation_report": holdout_validation_report,
+        "uncertainty_audit": uncertainty_audit,
+        "source_map": {
+            "cross_validation": cv_metrics["source_label"],
+            "validation_metrics": validation_metrics["source_label"],
+            "holdout_metrics": holdout_metrics["source_label"],
+            "uncertainty_audit": uncertainty_audit["source_label"],
+        },
+    }
+
+def _first_numeric(*values):
+    for value in values:
+        coerced = coerce_number(value)
+        if coerced is not None:
+            return coerced
+    return None
+
+def _best_result_from_payload(final_raw, run_dir):
+    if not isinstance(final_raw, dict):
+        final_raw = {}
+    return load_search_selection_payload(run_dir, final_raw)
+
+def summarize_run_manifest(manifest_path):
+    manifest = safe_read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        return None
+
+    artifact_metadata = manifest.get("artifact_metadata") or {}
+    run_scoped_path = artifact_metadata.get("run_scoped_path") or manifest_path
+    try:
+        run_dir = Path(run_scoped_path).parent
+    except Exception:
+        run_dir = manifest_path.parent
+
+    final_raw = load_final_holdout_payload(run_dir)
+    baseline = normalize_result_payload(
+        safe_read_json(run_dir / "baseline_metrics.json")
+        or final_raw.get("baseline_metrics")
+        or {}
+    )
+    best = normalize_result_payload(_best_result_from_payload(final_raw, run_dir))
+    final = normalize_final_payload(final_raw)
+    acceptance = manifest.get("acceptance_decision")
+    if not isinstance(acceptance, dict):
+        acceptance = final.get("acceptance_decision") if isinstance(final.get("acceptance_decision"), dict) else {}
+    validation_report = final_raw.get("final_artifact_validation") or manifest.get("final_artifact_validation") or {}
+    proposal_status_counts = manifest.get("proposal_status_counts") or {}
+    smoke_status = manifest.get("smoke_test_status") or manifest.get("preflight_status") or "unknown"
+    status = manifest.get("final_run_status") or "unknown"
+    selection_partition = manifest.get("selection_partition") or final_raw.get("selection_partition") or "validation"
+
+    baseline_composite = _first_numeric(
+        baseline.get("cv_composite"),
+        baseline.get("composite"),
+        baseline.get("selection_composite"),
+    )
+    best_composite = _first_numeric(
+        best.get("holdout_composite"),
+        best.get("validation_composite"),
+        best.get("cv_composite"),
+        best.get("composite"),
+    )
+    composite_improvement_pct = _first_numeric(
+        final.get("composite_improvement_pct"),
+        final_raw.get("composite_improvement_pct"),
+    )
+    delta_vs_baseline = None
+    if baseline_composite is not None and best_composite is not None:
+        delta_vs_baseline = round(best_composite - baseline_composite, 6)
+
+    timestamps = [
+        parse_utc_iso(manifest.get("timestamp")),
+        parse_utc_iso(manifest.get("updated_at")),
+        parse_utc_iso(artifact_metadata.get("timestamp")),
+    ]
+    run_timestamp = next((item for item in timestamps if item is not None), None)
+    run_timestamp_text = to_utc_iso(run_timestamp) if run_timestamp else str(manifest.get("timestamp") or "")
+
+    return {
+        "run_id": str(manifest.get("run_id") or artifact_metadata.get("run_id") or manifest_path.parent.name),
+        "run_timestamp": run_timestamp_text,
+        "run_timestamp_iso": run_timestamp_text,
+        "run_dir": str(run_dir),
+        "baseline_model": baseline.get("model_name") or "RandomForestRegressor",
+        "best_model": best.get("model_name") or manifest.get("model") or "N/A",
+        "best_trial": best.get("best_trial"),
+        "status": status,
+        "smoke_status": smoke_status,
+        "acceptance": acceptance,
+        "acceptance_decision": acceptance.get("decision_reason") if isinstance(acceptance, dict) else None,
+        "accepted": bool(acceptance.get("accepted")) if isinstance(acceptance, dict) else False,
+        "validation_verdict": best.get("validation_verdict") or best.get("validation") or "N/A",
+        "final_consistent": bool((validation_report or {}).get("consistent", True)),
+        "holdout_touched": bool(manifest.get("holdout_touched_during_search")),
+        "candidates": int(coerce_number(manifest.get("number_of_candidates_evaluated")) or 0),
+        "baseline_composite": baseline_composite,
+        "best_composite": best_composite,
+        "delta_vs_baseline": delta_vs_baseline,
+        "composite_improvement_pct": composite_improvement_pct,
+        "selection_partition": selection_partition,
+        "selection_metric_name": manifest.get("selection_metric_name")
+        or final_raw.get("selection_metric_name")
+        or "composite_score",
+        "backend": manifest.get("backend") or manifest.get("runtime_context", {}).get("backend_mode") or "N/A",
+        "model_hint": manifest.get("model") or "N/A",
+        "proposal_status_counts": proposal_status_counts,
+        "proposal_error_count": int(coerce_number(proposal_status_counts.get("error")) or 0),
+        "proposal_keep_count": int(coerce_number(proposal_status_counts.get("kept")) or 0),
+        "proposal_revert_count": int(coerce_number(proposal_status_counts.get("reverted")) or 0),
+        "proposal_promising_count": int(coerce_number(proposal_status_counts.get("scout_promising")) or 0),
+        "proposal_no_improvement_count": int(coerce_number(proposal_status_counts.get("scout_no_improvement")) or 0),
+        "proposal_smoke_status": smoke_status,
+        "final_run_status": status,
+        "timestamp_raw": manifest.get("timestamp") or artifact_metadata.get("timestamp") or "",
+        "source_mode": manifest.get("source_mode") or artifact_metadata.get("source_mode") or "manifest",
+        "artifact_id": manifest.get("artifact_id") or artifact_metadata.get("artifact_id") or "",
+    }
+
+def load_run_history():
+    run_dir = OUTPUTS_DIR / "runs"
+    if not run_dir.exists():
+        return []
+    run_history = []
+    for manifest_path in sorted(run_dir.glob("*/run_manifest.json")):
+        summary = summarize_run_manifest(manifest_path)
+        if summary:
+            run_history.append(summary)
+
+    def sort_key(row):
+        parsed = parse_utc_iso(row.get("run_timestamp"))
+        return parsed or datetime.min.replace(tzinfo=timezone.utc)
+
+    run_history.sort(key=sort_key)
+    previous_retained = None
+    for row in run_history:
+        if previous_retained is not None:
+            if row.get("best_composite") is not None and previous_retained.get("best_composite") is not None:
+                row["delta_vs_previous_best"] = round(
+                    float(row["best_composite"]) - float(previous_retained["best_composite"]),
+                    6,
+                )
+            else:
+                row["delta_vs_previous_best"] = None
+            if row.get("composite_improvement_pct") is not None and previous_retained.get("composite_improvement_pct") is not None:
+                row["delta_vs_previous_improvement_pct"] = round(
+                    float(row["composite_improvement_pct"]) - float(previous_retained["composite_improvement_pct"]),
+                    6,
+                )
+            else:
+                row["delta_vs_previous_improvement_pct"] = None
+            row["previous_run_id"] = previous_retained.get("run_id")
+        else:
+            row["delta_vs_previous_best"] = None
+            row["delta_vs_previous_improvement_pct"] = None
+            row["previous_run_id"] = None
+
+        if row.get("final_run_status") == "success" and row.get("final_consistent", True):
+            previous_retained = row
+
+    if run_history:
+        best_run = max(
+            run_history,
+            key=lambda row: row.get("best_composite") if row.get("best_composite") is not None else float("-inf"),
+        )
+        retained_runs = [
+            row for row in run_history if row.get("final_run_status") == "success" and row.get("final_consistent", True)
+        ]
+        previous_best = retained_runs[-2] if len(retained_runs) >= 2 else (retained_runs[-1] if retained_runs else {})
+        worst_retained = min(
+            retained_runs,
+            key=lambda row: row.get("best_composite") if row.get("best_composite") is not None else float("inf"),
+        ) if retained_runs else {}
+        for row in run_history:
+            row["is_latest"] = row is run_history[-1]
+            row["is_best"] = row is best_run
+        summary = {
+            "latest": run_history[-1],
+            "best": best_run,
+            "previous_best": previous_best,
+            "worst_retained": worst_retained,
+            "retained_count": len(retained_runs),
+            "run_count": len(run_history),
+        }
+    else:
+        summary = {
+            "latest": {},
+            "best": {},
+            "previous_best": {},
+            "worst_retained": {},
+            "retained_count": 0,
+            "run_count": 0,
+        }
+
+    return {"runs": run_history, "summary": summary}
 
 def normalize_optuna_rows(rows):
     normalized_rows = []
@@ -388,6 +797,159 @@ def parse_research_log(path):
         pass
     return trials
 
+def build_overview_decision_metric(best_source, final_raw):
+    best = best_source if isinstance(best_source, dict) else {}
+    final = final_raw if isinstance(final_raw, dict) else {}
+    candidate_sources = [
+        summarize_metric_source(
+            final.get("holdout_metrics"),
+            source_type="holdout_metrics",
+            source_label="Final holdout metrics",
+        ),
+        summarize_metric_source(
+            best.get("selection_validation")
+            or best.get("validation_metrics")
+            or best.get("selection_metrics")
+            or best.get("val_metrics"),
+            source_type="selection_validation",
+            source_label="Validation metrics",
+        ),
+        summarize_metric_source(
+            best.get("cross_validation") or best.get("cv_metrics") or best.get("cv"),
+            source_type="cross_validation",
+            source_label="Cross-validation metrics",
+        ),
+    ]
+    selected = next((source for source in candidate_sources if source.get("available")), None)
+    if not selected:
+        return {
+            "source_type": None,
+            "source_label": "No decision evidence available",
+            "rmse": None,
+            "mae": None,
+            "r2": None,
+            "composite_score": None,
+        }
+    aggregate = selected.get("aggregate") or {}
+    return {
+        "source_type": selected.get("source_type"),
+        "source_label": selected.get("source_label"),
+        "rmse": coerce_number(aggregate.get("rmse")),
+        "mae": coerce_number(aggregate.get("mae")),
+        "r2": coerce_number(aggregate.get("r2")),
+        "composite_score": coerce_number(aggregate.get("composite_score")),
+    }
+
+def build_overview_warning_state(best_source, final_raw):
+    best = best_source if isinstance(best_source, dict) else {}
+    final = final_raw if isinstance(final_raw, dict) else {}
+
+    holdout_available = summarize_metric_source(
+        final.get("holdout_metrics"),
+        source_type="holdout_metrics",
+        source_label="Final holdout metrics",
+    ).get("available", False)
+    uncertainty_summary = summarize_uncertainty_audit(
+        final.get("uncertainty_audit"),
+        expected_lineage=coalesce_artifact_lineage(
+            best,
+            final.get("selected_model"),
+            final,
+            fallback_model_id=str(best.get("model_name") or final.get("selected_model", {}).get("model_name") or "").strip() or None,
+        ),
+    )
+    uncertainty_available = uncertainty_summary.get("available", False)
+    uncertainty_lineage_status = uncertainty_summary.get("lineage_status")
+    validation_available = summarize_metric_source(
+        best.get("selection_validation")
+        or best.get("validation_metrics")
+        or best.get("selection_metrics")
+        or best.get("val_metrics"),
+        source_type="selection_validation",
+        source_label="Validation metrics",
+    ).get(
+        "available",
+        False,
+    )
+
+    warnings = []
+    if not holdout_available:
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Missing artifact",
+                "message": "Final holdout metrics not available.",
+            }
+        )
+    if not uncertainty_available:
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Missing artifact",
+                "message": "Uncertainty audit not available.",
+            }
+        )
+    elif uncertainty_lineage_status == "mismatch":
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Lineage mismatch",
+                "message": "Uncertainty audit lineage does not match the active model lineage.",
+            }
+        )
+    elif uncertainty_lineage_status == "missing":
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Lineage missing",
+                "message": "Uncertainty audit lineage is incomplete and cannot be proven.",
+            }
+        )
+    if not validation_available:
+        warnings.append(
+            {
+                "level": "warn",
+                "title": "Missing artifact",
+                "message": "Validation metrics not available.",
+            }
+        )
+
+    if not holdout_available:
+        next_action = {
+            "title": "Run final holdout evaluation",
+            "message": "Generate final_holdout_evaluation.json before promoting a model.",
+        }
+    elif not uncertainty_available:
+        next_action = {
+            "title": "Run uncertainty audit",
+            "message": "Add uncertainty_audit evidence to final_holdout_evaluation.json.",
+        }
+    elif uncertainty_lineage_status in {"mismatch", "missing"}:
+        next_action = {
+            "title": "Rebuild uncertainty artifact",
+            "message": "Regenerate uncertainty_audit so its lineage matches the active model and configuration.",
+        }
+    elif not validation_available:
+        next_action = {
+            "title": "Recover selection validation artifact",
+            "message": "Ensure best_search_result.json includes selection_validation metrics.",
+        }
+    else:
+        next_action = {
+            "title": "Evidence complete",
+            "message": "Holdout, uncertainty, and validation artifacts are available.",
+        }
+
+    evidence_status = {
+        "label": "Action required" if warnings else "Ready",
+        "warning_count": len(warnings),
+        "holdout_available": holdout_available,
+        "uncertainty_available": uncertainty_available,
+        "uncertainty_lineage_status": uncertainty_lineage_status,
+        "validation_available": validation_available,
+    }
+    return warnings, next_action, evidence_status
+
 # ─── API endpoints ──────────────────────────────────────────────────────────
 
 @app.before_request
@@ -411,19 +973,34 @@ def health():
 def api_overview():
     try:
         baseline = normalize_result_payload(load_required_output_json("baseline_metrics.json") or {})
-        final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-        final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
-        best_source = first_fresh_payload(
-            final_raw.get("best_search_metrics"),
-            safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
-            safe_read_json(OUTPUTS_DIR / "best_search_result.json"),
-        )
+        final_raw = load_final_holdout_payload(OUTPUTS_DIR)
+        best_source = load_search_selection_payload(OUTPUTS_DIR, final_raw)
         best = normalize_result_payload(best_source)
         final = normalize_final_payload(final_raw)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
     dataset_rows = get_dataset_rows()
-    return jsonify(sanitize_dashboard_payload({"baseline": baseline, "best": best, "final": final, "dataset_rows": dataset_rows}))
+    decision_metric = build_overview_decision_metric(best_source, final_raw)
+    warnings, next_action, evidence_status = build_overview_warning_state(best_source, final_raw)
+    return jsonify(
+        sanitize_dashboard_payload(
+            {
+                "baseline": baseline,
+                "best": best,
+                "final": final,
+                "dataset_rows": dataset_rows,
+                "warnings": warnings,
+                "decision_metric": decision_metric,
+                "next_action": next_action,
+                "evidence_status": evidence_status,
+            }
+        )
+    )
+
+@app.route("/api/run_history")
+def api_run_history():
+    history_payload = load_run_history()
+    return jsonify(sanitize_dashboard_payload(history_payload))
 
 @app.route("/api/research_log")
 def api_research_log():
@@ -438,17 +1015,15 @@ def api_optuna_results():
 @app.route("/api/validation_details")
 def api_validation_details():
     try:
-        final_candidate = safe_read_json(OUTPUTS_DIR / "final_metrics.json") or {}
-        final_raw = {} if artifact_payload_is_stale(final_candidate) else final_candidate
+        final_raw = load_final_holdout_payload(OUTPUTS_DIR)
         best_source = first_fresh_payload(
-            final_raw.get("best_search_metrics"),
-            safe_read_json(OUTPUTS_DIR / "search_state_best_result.json"),
+            load_search_selection_payload(OUTPUTS_DIR, final_raw),
             load_required_output_json("best_search_result.json"),
         )
-        best = normalize_result_payload(best_source)
+        payload = build_validation_details_payload(best_source, final_raw)
     except FileNotFoundError as exc:
         return json_not_found(exc.args[0])
-    return jsonify(sanitize_dashboard_payload(best))
+    return jsonify(sanitize_dashboard_payload(payload))
 
 @app.route("/api/field_validation")
 def api_field_validation():
@@ -467,7 +1042,36 @@ def api_design_results():
         if d:
             d["_filename"] = f.name
             singles.append(d)
-    return jsonify(sanitize_dashboard_payload({"batch": batch or [], "singles": singles}))
+    comparison_rows = []
+    for row in batch or []:
+        row = dict(row)
+        row["source_type"] = row.get("source_type") or "design_batch"
+        row["source_label"] = row.get("source_label") or "batch_design_results.csv"
+        row["interval_width"] = row.get("interval_width")
+        row["confidence_label"] = row.get("confidence_label")
+        comparison_rows.append(row)
+    for single in singles:
+        uncertainty = single.get("uncertainty_interval") or {}
+        cement_saving = single.get("estimated_cement_saving_vs_reference") or {}
+        comparison_rows.append(
+            {
+                "source_type": single.get("source_mode") or "design_single",
+                "source_label": single.get("_filename") or "design result",
+                "target_strength": single.get("target_strength"),
+                "predicted_strength": single.get("predicted_strength"),
+                "validation_verdict": single.get("validation_verdict"),
+                "interval_width": uncertainty.get("interval_width"),
+                "confidence_label": uncertainty.get("confidence_label"),
+                "target_window_overlap": uncertainty.get("target_window_overlap"),
+                "cement_saving_kg_per_m3": cement_saving.get("cement_saving_kg_per_m3"),
+                "cement_saving_percent": cement_saving.get("cement_saving_percent"),
+                "mix_design": single.get("mix_design") or {},
+                "ranking_breakdown": single.get("ranking_breakdown") or {},
+                "success": single.get("success"),
+                "_filename": single.get("_filename"),
+            }
+        )
+    return jsonify(sanitize_dashboard_payload({"batch": batch or [], "singles": singles, "comparison_rows": comparison_rows}))
 
 @app.route("/api/design_generate", methods=["POST"])
 def api_design_generate():
@@ -481,14 +1085,22 @@ def api_design_generate():
         "exposure_class": payload.get("exposure_class"),
         "structural_application": payload.get("structural_application"),
     }
+
+    raw_constraints = payload.get("constraints")
+    constraints = raw_constraints if isinstance(raw_constraints, dict) and raw_constraints else None
+
     try:
         optimizer_cls = MixDesignOptimizer
         if optimizer_cls is None:
             from design_tool import MixDesignOptimizer as optimizer_cls
         optimizer = optimizer_cls()
-        result = optimizer.optimize(target_strength, context=context)
+        result = optimizer.optimize(target_strength, constraints=constraints, context=context)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"[design_generate] predictor file error: {exc}")
+        return jsonify({"error": "design_generation_failed", "message": "Strength predictor is not available. Prepare the predictor before generating mix candidates."}), 500
     except Exception as exc:
-        return jsonify({"error": "design_generation_failed", "message": str(exc)}), 500
+        print(f"[design_generate] error: {exc}")
+        return jsonify({"error": "design_generation_failed", "message": "Mix design generation failed. Check that the strength predictor is ready and try again."}), 500
     return jsonify(sanitize_dashboard_payload(result))
 
 @app.route("/api/plots")
@@ -510,7 +1122,7 @@ def api_plots():
 def api_status():
     required = [
         "baseline_metrics.json", "search_state_best_result.json", "best_search_result.json",
-        "final_metrics.json", "research_log.txt", "optuna_results.csv",
+        "final_holdout_evaluation.json", "research_log.txt", "optuna_results.csv",
     ]
     status = {}
     for name in required:
@@ -655,7 +1267,10 @@ def shared_snapshot(token):
     <section class="meta">
       <div>Baseline model: {_safe_text(snapshot.get("baseline_model"))}</div>
       <div>Baseline composite score: {_safe_text(_safe_metric(snapshot.get("baseline_composite"), 4))}</div>
+      <div>Validation source: {_safe_text(snapshot.get("validation_source_label"))}</div>
       <div>Validation verdict: {_safe_text(snapshot.get("validation_verdict"))}</div>
+      <div>Holdout source: {_safe_text(snapshot.get("holdout_source_label"))}</div>
+      <div>Uncertainty source: {_safe_text(snapshot.get("uncertainty_source_label"))}</div>
       <div>Created at: {_safe_text(created_text)}</div>
       <div>Expires at: {_safe_text(expires_text)}</div>
     </section>
@@ -762,6 +1377,13 @@ nav a .icon{font-size:15px;width:20px;text-align:center}
 }
 .tb-left{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .tb-left span{color:var(--accent);margin-right:16px}
+.mode-switch{display:inline-flex;align-items:center;gap:6px}
+.mode-pill{
+  background:var(--card);border:1px solid var(--border);border-radius:999px;
+  color:var(--muted);padding:4px 10px;text-decoration:none;font-size:10px;
+  text-transform:uppercase;letter-spacing:.06em;
+}
+.mode-pill.active{border-color:var(--accent);color:var(--accent)}
 .tb-right{display:flex;align-items:center;gap:8px}
 .refresh-btn{
   background:var(--card);border:1px solid var(--border);
@@ -816,6 +1438,7 @@ nav a .icon{font-size:15px;width:20px;text-align:center}
 .badge.pass{background:rgba(21,128,61,.1);color:var(--green);border:1px solid rgba(21,128,61,.22)}
 .badge.warn{background:rgba(180,83,9,.1);color:var(--yellow);border:1px solid rgba(180,83,9,.22)}
 .badge.fail{background:rgba(180,35,24,.1);color:var(--red);border:1px solid rgba(180,35,24,.22)}
+.badge.neutral{background:rgba(102,112,133,.1);color:var(--muted);border:1px solid rgba(102,112,133,.22)}
 
 /* timeline */
 .log-controls{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap;align-items:center}
@@ -904,6 +1527,50 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 .chart-box canvas{max-height:280px}
 .chart-full{grid-column:1/-1}
 
+/* run history */
+.run-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:20px}
+.run-history-head{
+  display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;
+  margin-bottom:16px;
+}
+.run-history-meta{
+  font-family:var(--mono);font-size:10px;color:var(--muted);line-height:1.7;
+}
+.run-diagram{
+  display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;
+}
+.run-node{
+  position:relative;min-width:180px;flex:1 1 180px;
+  background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;
+  box-shadow:var(--shadow-sm);
+}
+.run-node.latest{border-color:var(--green);box-shadow:0 0 0 1px rgba(21,128,61,.14), var(--shadow-sm)}
+.run-node.best{border-color:var(--accent);box-shadow:0 0 0 1px rgba(15,118,110,.14), var(--shadow-sm)}
+.run-node .mini{font-family:var(--mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
+.run-node .headline{font-size:13px;font-weight:800;margin:8px 0 10px}
+.run-node .stat{font-family:var(--mono);font-size:11px;line-height:1.7;color:var(--txt)}
+.run-arrow{
+  align-self:center;color:var(--border-strong);font-family:var(--mono);font-size:18px;font-weight:700;
+}
+.delta-up{color:var(--green)}
+.delta-down{color:var(--red)}
+.delta-flat{color:var(--muted)}
+.run-note{
+  font-family:var(--mono);font-size:10px;color:var(--muted);line-height:1.6;margin-top:12px
+}
+.comparison-table thead th{position:sticky;top:0;z-index:1}
+.comparison-table tbody tr.latest-row td{background:rgba(21,128,61,.05)}
+.comparison-table tbody tr.best-row td{background:rgba(15,118,110,.05)}
+.comparison-pill{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:3px 8px;border-radius:999px;border:1px solid var(--border);
+  background:rgba(255,255,255,.6);font-family:var(--mono);font-size:10px;
+}
+.comparison-pill strong{font-size:10px}
+.comparison-pill.good{border-color:rgba(21,128,61,.25);color:var(--green)}
+.comparison-pill.bad{border-color:rgba(180,35,24,.25);color:var(--red)}
+.comparison-pill.neutral{color:var(--muted)}
+
 /* gallery */
 .plot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
 .plot-card{
@@ -984,26 +1651,33 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 }
 </style>
 </head>
-<body>
+<body data-default-mode="{{ dashboard_mode }}">
 
 <!-- Sidebar -->
 <aside id="sidebar">
   <div class="sb-logo">
     <h1>AutoCivil-Lab</h1>
-    <span>AUTOMATED RESEARCH FRAMEWORK</span>
+    {% if dashboard_mode == "normal" %}<span>Concrete Mix Design Assistant</span>{% else %}<span>AUTOMATED RESEARCH FRAMEWORK</span>{% endif %}
     <div class="sb-status" id="sb-status">
       <div class="dot" id="status-dot"></div>
       <span id="status-text">Checking…</span>
     </div>
   </div>
   <nav>
-    <a href="#field-results"     ><span class="icon">#</span> Field Results</a>
-    <a href="#overview"   class="active"><span class="icon">◈</span> Overview</a>
-    <a href="#log"               ><span class="icon">◎</span> Research Log</a>
-    <a href="#models"            ><span class="icon">◫</span> Model Comparison</a>
-    <a href="#validation"        ><span class="icon">◉</span> Engineering Validation</a>
-    <a href="#design"            ><span class="icon">◧</span> Design Tool</a>
-    <a href="#gallery"           ><span class="icon">◰</span> Plots Gallery</a>
+    {% if dashboard_mode == "normal" %}
+    <a href="#project-health" class="active"><span class="icon">H</span> Project Health</a>
+    <a href="#customer-design"><span class="icon">D</span> Mix Design Assistant</a>
+    {% endif %}
+    {% if dashboard_mode == "experimental" %}
+    <a href="#overview" class="active"><span class="icon">O</span> Overview</a>
+    <a href="#log"><span class="icon">R</span> Research Log</a>
+    <a href="#models"><span class="icon">M</span> Model Comparison</a>
+    <a href="#validation"><span class="icon">V</span> Engineering Validation</a>
+    <a href="#design"><span class="icon">D</span> Design Tool</a>
+    <a href="#field-results"><span class="icon">F</span> Field Results</a>
+    <a href="#gallery"><span class="icon">P</span> Plots Gallery</a>
+    <a href="#runs"><span class="icon">R</span> Run History</a>
+    {% endif %}
   </nav>
 </aside>
 
@@ -1012,18 +1686,130 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
   <div class="tb-left">
     <span id="tb-dataset">—</span>
     <span id="tb-time">—</span>
+    <div class="mode-switch" role="group" aria-label="Dashboard mode">
+      <a class="mode-pill {% if dashboard_mode == 'normal' %}active{% endif %}" href="/?mode=normal">Normal Mode</a>
+      <a class="mode-pill {% if dashboard_mode == 'experimental' %}active{% endif %}" href="/?mode=experimental">Experimental Mode</a>
+    </div>
   </div>
   <div class="tb-right">
     <span class="share-status" id="share-status"></span>
-    <button class="refresh-btn share-btn" id="share-btn" onclick="shareLatestRun()">Share Latest Run</button>
+    <button class="refresh-btn share-btn" id="share-btn" onclick="shareLatestRun()">{% if dashboard_mode == "normal" %}Share Report{% else %}Share Latest Run{% endif %}</button>
     <button class="refresh-btn" onclick="loadAll()">⟳ Refresh</button>
   </div>
 </header>
 
 <!-- Main -->
 <main id="main">
+{% if dashboard_mode == "experimental" %}
+<section class="section" id="experimental-workspace">
+  <div class="section-title">Experimental research workspace</div>
+  <div class="section-sub">Full search telemetry, longitudinal run history, and trial-level diagnostics.</div>
+</section>
+{% endif %}
 
 <!-- ══ OVERVIEW ══════════════════════════════════════════════════════════ -->
+{% if dashboard_mode == "normal" %}
+<section class="section" id="project-health">
+  <div class="section-title">Project Health</div>
+  <div class="section-sub">Strength predictor readiness and the next action needed before generating mix candidates.</div>
+  <div class="card-grid" id="normal-summary-cards">
+    <div class="card">
+      <div class="card-label">Readiness status</div>
+      <div class="skeleton" style="height:90px"></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Next action</div>
+      <div class="skeleton" style="height:90px"></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Advanced details</div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Advanced Details</a>
+    </div>
+  </div>
+</section>
+
+<!-- ══ MIX DESIGN ASSISTANT ═════════════════════════════════════════════ -->
+<section class="section" id="customer-design">
+  <div class="section-title">Mix Design Assistant</div>
+  <div class="section-sub">Enter a target compressive strength and optional constraints — get suggested concrete mixes with predicted strength, engineering warnings, and confidence.</div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-label">1 · Target &amp; context</div>
+    <div class="grid cols-3" style="margin-top:12px">
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Target strength (MPa)</span>
+        <input id="cdesign-target" type="number" min="5" max="120" step="0.5" value="35" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Exposure class</span>
+        <select id="cdesign-exposure" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px">
+          <option value="general">General</option>
+          <option value="structural">Structural</option>
+          <option value="exposed">Exposed</option>
+          <option value="severe">Severe</option>
+          <option value="marine">Marine</option>
+          <option value="freeze_thaw">Freeze-Thaw</option>
+          <option value="sulfate">Sulfate</option>
+        </select>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Structural application</span>
+        <select id="cdesign-application" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px">
+          <option value="column">Column</option>
+          <option value="beam">Beam</option>
+          <option value="slab">Slab</option>
+          <option value="footing">Footing</option>
+          <option value="wall">Wall</option>
+          <option value="pavement">Pavement</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-label">2 · Optional material constraints (leave blank to use defaults)</div>
+    <div class="grid cols-3" style="margin-top:12px;gap:12px">
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Cement min (kg/m³)</span>
+        <input id="cdesign-cement-min" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Cement max (kg/m³)</span>
+        <input id="cdesign-cement-max" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Max w/c ratio</span>
+        <input id="cdesign-wc-max" type="number" min="0.2" max="1.5" step="0.01" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Water min (kg/m³)</span>
+        <input id="cdesign-water-min" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Water max (kg/m³)</span>
+        <input id="cdesign-water-max" type="number" min="0" step="5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Strength tolerance (± MPa)</span>
+        <input id="cdesign-tolerance" type="number" min="0" step="0.5" placeholder="auto" style="background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px"/>
+      </label>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+    <button onclick="runCustomerDesign()" style="background:var(--accent);color:#08131d;border:none;border-radius:999px;padding:10px 18px;font-weight:700;cursor:pointer">Generate mix candidates</button>
+    <button id="cdesign-download" onclick="downloadCustomerDesign()" disabled style="background:var(--bg-soft);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:10px 18px;font-weight:600;cursor:pointer;opacity:.5">Download report (JSON)</button>
+    <div id="cdesign-status" style="font-size:12px;color:var(--muted)">Fill in target &amp; press generate.</div>
+  </div>
+
+  <div id="cdesign-disclaimer" style="display:none;margin-bottom:14px;padding:10px 14px;border-left:3px solid var(--accent);background:var(--bg-soft);border-radius:0 8px 8px 0;font-size:12px;color:var(--muted);line-height:1.55">
+    &#9888;&#xFE0E; <strong style="color:var(--text)">Lab validation required:</strong> These mix suggestions are model-based starting points. They must be verified through lab trial batches and standard testing before real construction use.
+  </div>
+  <div id="cdesign-result"></div>
+</section>
+
+{% endif %}
+{% if dashboard_mode == "experimental" %}
 <section class="section" id="overview">
   <div class="section-title">Overview</div>
   <div class="section-sub">Pipeline summary · last run results · dataset info</div>
@@ -1035,6 +1821,73 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 </section>
 
 <!-- ══ RESEARCH LOG ══════════════════════════════════════════════════════ -->
+<!-- ══ RUN HISTORY ═══════════════════════════════════════════════════════════ -->
+{% if dashboard_mode == "experimental" %}
+<section class="section" id="runs">
+  <div class="run-history-head">
+    <div>
+      <div class="section-title">Run History</div>
+      <div class="section-sub">Every retained run compared against the previous retained run, baseline, and best-ever result</div>
+    </div>
+    <div class="run-history-meta" id="run-history-meta">Loading historical run comparisons…</div>
+  </div>
+  <div class="run-summary-grid" id="run-summary-cards">
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+    <div class="card"><div class="skeleton" style="height:130px"></div></div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box chart-full">
+      <h3>Composite Score Across Runs</h3>
+      <p>Latest retained run versus earlier runs, with baseline and best-ever references.</p>
+      <canvas id="chart-run-history"></canvas>
+    </div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box">
+      <h3>Delta vs Previous Retained Run</h3>
+      <p>Positive values mean the newer run improved over the prior retained result.</p>
+      <canvas id="chart-run-delta"></canvas>
+    </div>
+    <div class="chart-box">
+      <h3>Metric Comparison</h3>
+      <p>Baseline vs best composite, plus candidate count per run.</p>
+      <canvas id="chart-run-metrics"></canvas>
+    </div>
+  </div>
+  <div class="chart-row">
+    <div class="chart-box">
+      <h3>Run Outcome Mix</h3>
+      <p>How many runs were accepted, reverted, or rejected.</p>
+      <canvas id="chart-run-status"></canvas>
+    </div>
+    <div class="chart-box">
+      <h3>Run Lineage Diagram</h3>
+      <p>Visual sequence from baseline to current best and previous retained result.</p>
+      <div id="run-lineage" class="run-diagram"></div>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="comparison-table" id="run-table">
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th>Timestamp</th>
+          <th>Status</th>
+          <th>Baseline</th>
+          <th>Best</th>
+          <th>Delta vs Base</th>
+          <th>Delta vs Prev</th>
+          <th>Candidates</th>
+          <th>Best Model</th>
+          <th>Verdict</th>
+        </tr>
+      </thead>
+      <tbody id="run-history-tbody"></tbody>
+    </table>
+  </div>
+</section>
 <section class="section" id="log">
   <div class="section-title">Research Log</div>
   <div class="section-sub">Automated experiment timeline — every trial, every decision</div>
@@ -1099,13 +1952,17 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 </section>
 
 <!-- ══ VALIDATION ═════════════════════════════════════════════════════════ -->
+{% endif %}
 <section class="section" id="validation">
   <div class="section-title">Engineering Validation</div>
-  <div class="section-sub">Physical constraint checks — ACI 318 / BS 8500 inspired rules</div>
-  <div class="panel-grid">
-    <div class="panel" id="val-summary">Loading…</div>
-    <div class="panel" id="val-warnings">Loading…</div>
+  <div class="section-sub">Source-separated CV, validation, holdout, and uncertainty audit panels</div>
+  <div class="card-grid" id="validation-panels">
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
+    <div class="card"><div class="skeleton" style="height:180px"></div></div>
   </div>
+  <div id="validation-comparison" style="margin-top:20px"></div>
   <div class="chart-row">
     <div class="chart-box">
       <h3>RMSE by Strength Range</h3>
@@ -1123,7 +1980,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
 <!-- ══ DESIGN TOOL ════════════════════════════════════════════════════════ -->
 <section class="section" id="design">
   <div class="section-title">Design Tool Results</div>
-  <div class="section-sub">Inverse prediction — find mix design for a target strength</div>
+  <div class="section-sub">Design scenarios / trade-offs with Source-separated batch comparison and source-labeled scenario cards</div>
   <div id="design-content">Loading…</div>
 </section>
 
@@ -1143,6 +2000,7 @@ tbody tr.highlight-base td{background:rgba(15,118,110,.06)}
     <div class="card skeleton" style="height:220px"></div>
   </div>
 </section>
+{% endif %}
 
 </main>
 
@@ -1158,11 +2016,22 @@ let allTrials = [];
 let allOptuna = [];
 let fieldValidationRecords = [];
 let overviewData = {};
+let runHistory = [];
 let chartProgress, chartFamilies, chartRmse, chartRange, chartImprovement;
+let chartRunHistory, chartRunDelta, chartRunMetrics, chartRunStatus;
 let tablePage = 0;
 const PAGE_SIZE = 20;
 let tableSortCol = 0;
 let tableSortAsc = true;
+const dashboardMode = (document.body.dataset.defaultMode || 'normal').toLowerCase();
+
+function isNormalMode() {
+  return dashboardMode === 'normal';
+}
+
+function isExperimentalMode() {
+  return dashboardMode === 'experimental';
+}
 
 // ─── boot ────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -1171,9 +2040,349 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 async function loadAll() {
+  if (isExperimentalMode()) {
+    await loadExperimentalMode();
+    return;
+  }
+  await loadNormalMode();
+}
+
+async function loadNormalMode() {
+  await Promise.all([
+    loadStatus(),
+    loadNormalSummary(),
+  ]);
+}
+
+// ─── customer design tool (MVP) ─────────────────────────────────────────────
+let customerDesignLast = null;
+
+function numOrNull(id){
+  const el = document.getElementById(id);
+  if(!el) return null;
+  const raw = String(el.value || '').trim();
+  if(raw === '') return null;
+  const n = parseFloat(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function buildCustomerConstraints(){
+  const constraints = {};
+  const cementMin = numOrNull('cdesign-cement-min');
+  const cementMax = numOrNull('cdesign-cement-max');
+  if(cementMin != null || cementMax != null){
+    constraints.cement = {};
+    if(cementMin != null) constraints.cement.min = cementMin;
+    if(cementMax != null) constraints.cement.max = cementMax;
+  }
+  const waterMin = numOrNull('cdesign-water-min');
+  const waterMax = numOrNull('cdesign-water-max');
+  if(waterMin != null || waterMax != null){
+    constraints.water = {};
+    if(waterMin != null) constraints.water.min = waterMin;
+    if(waterMax != null) constraints.water.max = waterMax;
+  }
+  const wcMax = numOrNull('cdesign-wc-max');
+  if(wcMax != null){
+    constraints.water_cement_ratio = { max: wcMax };
+  }
+  const tol = numOrNull('cdesign-tolerance');
+  if(tol != null){
+    constraints.tolerance_mpa = tol;
+  }
+  return Object.keys(constraints).length ? constraints : null;
+}
+
+function formatCandidateNumber(value, decimals = 2, suffix = ''){
+  const n = Number(value);
+  return Number.isFinite(n) ? `${n.toFixed(decimals)}${suffix}` : 'N/A';
+}
+
+function candidateVerdict(value){
+  const verdict = String(value || 'UNKNOWN').toUpperCase();
+  return ['OK', 'WARN', 'FAIL', 'UNKNOWN'].includes(verdict) ? verdict : verdict;
+}
+
+function candidateVerdictClass(value){
+  const verdict = candidateVerdict(value).toLowerCase();
+  if(verdict === 'unknown') return 'warn';
+  return badgeClass(verdict);
+}
+
+function candidateWarnings(cand){
+  const warnings = []
+    .concat(Array.isArray(cand.warn_reasons) ? cand.warn_reasons : [])
+    .concat(Array.isArray(cand.hard_constraint_reasons) ? cand.hard_constraint_reasons : [])
+    .concat(Array.isArray(cand.hard_constraints) ? cand.hard_constraints : [])
+    .concat(Array.isArray(cand.validation_failure_reasons) ? cand.validation_failure_reasons : [])
+    .concat(Array.isArray(cand.validation_warning_reasons) ? cand.validation_warning_reasons : [])
+    .concat(Array.isArray(cand.engineering_cautions) ? cand.engineering_cautions : []);
+  return Array.from(new Set(warnings.filter(Boolean).map(w => String(w))));
+}
+
+function renderCustomerConstraintList(appliedConstraints){
+  if(!appliedConstraints || !Object.keys(appliedConstraints).length){
+    return '<div style="font-size:12px;color:var(--muted)">N/A</div>';
+  }
+  return `<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">${
+    Object.entries(appliedConstraints).map(([key, value]) => {
+      const text = value && typeof value === 'object'
+        ? Object.entries(value).map(([innerKey, innerValue]) => `${innerKey}: ${innerValue}`).join(', ')
+        : String(value);
+      return `<li>${escapeHtml(key)}: ${escapeHtml(text || 'N/A')}</li>`;
+    }).join('')
+  }</ul>`;
+}
+
+function renderCustomerWarningList(warnings){
+  if(!warnings.length){
+    return '<div style="font-size:12px;color:var(--muted)">N/A</div>';
+  }
+  return `<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">${
+    warnings.slice(0, 8).map(w => `<li>${escapeHtml(w)}</li>`).join('')
+  }</ul>`;
+}
+
+function candidateSummaryMetric(label, value){
+  return `<div class="card"><div class="card-label">${escapeHtml(label)}</div><div class="metric-value sm">${value}</div></div>`;
+}
+
+function renderPolishedCandidateCard(cand, idx, isBest, appliedConstraints, targetStrength){
+  const mix = cand.mix_design || {};
+  const unc = cand.uncertainty_interval || {};
+  const verdict = candidateVerdict(cand.validation_verdict || cand.sample_validation?.overall_verdict);
+  const uniqueWarnings = candidateWarnings(cand);
+  const predictedNumber = Number(cand.predicted_strength);
+  const targetNumber = Number(cand.target_strength ?? targetStrength);
+  const difference = Number.isFinite(predictedNumber) && Number.isFinite(targetNumber)
+    ? predictedNumber - targetNumber
+    : null;
+  const wc = (cand.engineered_ratios && cand.engineered_ratios.water_cement_ratio != null)
+    ? Number(cand.engineered_ratios.water_cement_ratio).toFixed(3)
+    : 'N/A';
+  const lower = unc.lower_90 ?? unc.lower;
+  const upper = unc.upper_90 ?? unc.upper;
+  const intervalText = (lower != null && upper != null)
+    ? `${formatCandidateNumber(lower, 1)} - ${formatCandidateNumber(upper, 1)} MPa${unc.confidence_level != null ? ` (${formatCandidateNumber(Number(unc.confidence_level) * 100, 0, '%')})` : ' (90%)'}`
+    : (unc.interval_width != null ? `Width ${formatCandidateNumber(unc.interval_width, 2, ' MPa')}` : 'N/A');
+  const confidence = unc.confidence_label || cand.confidence_label || 'N/A';
+  const border = isBest ? '2px solid var(--accent)' : '1px solid var(--border)';
+  const bestBadge = isBest ? `<span style="background:var(--accent);color:#08131d;border-radius:999px;padding:2px 10px;font-size:10px;font-weight:700;margin-left:8px">BEST</span>` : '';
+  return `
+    <div class="card" style="border:${border};display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <div class="card-label">Rank #${idx + 1}${bestBadge}</div>
+        <span class="badge ${candidateVerdictClass(verdict)}">${escapeHtml(verdict)}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Predicted strength</div>
+          <div class="metric-value sm">${formatCandidateNumber(cand.predicted_strength, 2, ' MPa')}</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Diff from target</div>
+          <div class="metric-value sm">${difference == null ? 'N/A' : `${difference >= 0 ? '+' : ''}${difference.toFixed(2)} MPa`}</div>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Confidence / interval</div>
+        <div style="font-size:13px">${escapeHtml(confidence)} <span style="color:var(--muted)">| ${escapeHtml(intervalText)}</span></div>
+      </div>
+      <div style="font-size:12px;line-height:1.6">
+        <div style="color:var(--muted);margin-bottom:4px">Key mix values</div>
+        <div>Cement: <b>${formatCandidateNumber(mix.cement, 1)}</b> kg/m3 | Slag: ${formatCandidateNumber(mix.slag, 1)} | Fly ash: ${formatCandidateNumber(mix.fly_ash, 1)}</div>
+        <div>Water: <b>${formatCandidateNumber(mix.water, 1)}</b> kg/m3 | Superplast.: ${formatCandidateNumber(mix.superplasticizer, 2)}</div>
+        <div>Coarse agg.: ${formatCandidateNumber(mix.coarse_aggregate, 0)} | Fine agg.: ${formatCandidateNumber(mix.fine_aggregate, 0)}</div>
+        <div>w/c: <b>${wc}</b> | Age: ${mix.age != null ? `${formatCandidateNumber(mix.age, 0)} d` : 'N/A'}</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Applied constraints</div>
+        ${renderCustomerConstraintList(appliedConstraints)}
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Warning list</div>
+        ${renderCustomerWarningList(uniqueWarnings)}
+      </div>
+    </div>`;
+}
+
+function renderCandidateCard(cand, idx, isBest, appliedConstraints){
+  const mix = cand.mix_design || {};
+  const unc = cand.uncertainty_interval || {};
+  const verdict = String(cand.validation_verdict || 'UNKNOWN');
+  const warnings = []
+    .concat(Array.isArray(cand.warn_reasons) ? cand.warn_reasons : [])
+    .concat(Array.isArray(cand.hard_constraint_reasons) ? cand.hard_constraint_reasons : [])
+    .concat(Array.isArray(cand.hard_constraints) ? cand.hard_constraints : [])
+    .concat(Array.isArray(cand.validation_failure_reasons) ? cand.validation_failure_reasons : [])
+    .concat(Array.isArray(cand.validation_warning_reasons) ? cand.validation_warning_reasons : [])
+    .concat(Array.isArray(cand.engineering_cautions) ? cand.engineering_cautions : []);
+  const uniqueWarnings = Array.from(new Set(warnings.filter(Boolean).map(w => String(w))));
+  const wc = (cand.engineered_ratios && cand.engineered_ratios.water_cement_ratio != null)
+    ? parseFloat(cand.engineered_ratios.water_cement_ratio).toFixed(3)
+    : '—';
+  const predicted = cand.predicted_strength != null ? parseFloat(cand.predicted_strength).toFixed(2) : '—';
+  const lower = unc.lower_90 != null ? parseFloat(unc.lower_90).toFixed(1) : null;
+  const upper = unc.upper_90 != null ? parseFloat(unc.upper_90).toFixed(1) : null;
+  const intervalText = (lower != null && upper != null) ? `${lower} – ${upper} MPa (90%)` : '—';
+  const confidence = unc.confidence_label ? String(unc.confidence_label) : '—';
+  const border = isBest ? '2px solid var(--accent)' : '1px solid var(--border)';
+  const badge = isBest ? `<span style="background:var(--accent);color:#08131d;border-radius:999px;padding:2px 10px;font-size:10px;font-weight:700;margin-left:8px">BEST</span>` : '';
+  return `
+    <div class="card" style="border:${border};display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div class="card-label">Candidate #${idx + 1}${badge}</div>
+        <span class="badge ${verdict.toLowerCase()}">${escapeHtml(verdict)}</span>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Predicted strength</div>
+        <div class="metric-value sm">${predicted} MPa</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em">Confidence</div>
+        <div style="font-size:13px">${escapeHtml(confidence)} <span style="color:var(--muted)">· ${intervalText}</span></div>
+      </div>
+      <div style="font-size:12px;line-height:1.6">
+        <div style="color:var(--muted);margin-bottom:4px">Mix composition (kg/m³)</div>
+        <div>Cement: <b>${mix.cement != null ? parseFloat(mix.cement).toFixed(1) : '—'}</b> · Slag: ${mix.slag != null ? parseFloat(mix.slag).toFixed(1) : '—'} · Fly ash: ${mix.fly_ash != null ? parseFloat(mix.fly_ash).toFixed(1) : '—'}</div>
+        <div>Water: <b>${mix.water != null ? parseFloat(mix.water).toFixed(1) : '—'}</b> · Superplast.: ${mix.superplasticizer != null ? parseFloat(mix.superplasticizer).toFixed(2) : '—'}</div>
+        <div>Coarse agg.: ${mix.coarse_aggregate != null ? parseFloat(mix.coarse_aggregate).toFixed(0) : '—'} · Fine agg.: ${mix.fine_aggregate != null ? parseFloat(mix.fine_aggregate).toFixed(0) : '—'}</div>
+        <div>w/c: <b>${wc}</b> · Age: ${mix.age != null ? parseFloat(mix.age).toFixed(0) : '—'} d</div>
+      </div>
+      ${uniqueWarnings.length ? `
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Warnings</div>
+          <ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">
+            ${uniqueWarnings.slice(0, 6).map(w => `<li>${escapeHtml(w)}</li>`).join('')}
+          </ul>
+        </div>` : `<div style="font-size:12px;color:var(--muted)">No major warnings.</div>`}
+      <div style="margin-top:8px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px">Applied constraints</div>
+        ${(appliedConstraints && Object.keys(appliedConstraints).length) ? `<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text);line-height:1.5">${Object.entries(appliedConstraints).map(([k,v]) => `<li>${escapeHtml(String(k))}: ${escapeHtml(String(v))}</li>`).join('')}</ul>` : `<div style="font-size:12px;color:var(--muted)">No extra constraints applied.</div>`}
+      </div>
+    </div>`;
+}
+
+function _showCdesignError(resultEl, message){
+  const errorEl = document.createElement('div');
+  errorEl.id = 'cdesign-error-banner';
+  errorEl.style.cssText = 'margin-bottom:12px;padding:10px 14px;background:rgba(220,53,69,.10);border:1px solid rgba(220,53,69,.35);border-radius:8px;font-size:13px;color:#f87171';
+  errorEl.textContent = message;
+  resultEl.insertAdjacentElement('beforebegin', errorEl);
+}
+
+async function runCustomerDesign(){
+  const statusEl = document.getElementById('cdesign-status');
+  const resultEl = document.getElementById('cdesign-result');
+  const downloadBtn = document.getElementById('cdesign-download');
+  const target = numOrNull('cdesign-target');
+  if(target == null){
+    statusEl.textContent = 'Please enter a target strength.';
+    return;
+  }
+
+  // Clear previous error banner
+  const existingError = document.getElementById('cdesign-error-banner');
+  if(existingError) existingError.remove();
+
+  // Show loading indicator above result without erasing previous result
+  let loadingEl = document.getElementById('cdesign-loading');
+  if(!loadingEl){
+    loadingEl = document.createElement('div');
+    loadingEl.id = 'cdesign-loading';
+    resultEl.insertAdjacentElement('beforebegin', loadingEl);
+  }
+  loadingEl.style.cssText = 'padding:8px 0 4px;font-size:13px;color:var(--muted)';
+  loadingEl.textContent = 'Generating mix candidates…';
+  statusEl.textContent = 'Generating mix candidates…';
+
+  const payload = {
+    target_strength: target,
+    exposure_class: document.getElementById('cdesign-exposure').value,
+    structural_application: document.getElementById('cdesign-application').value,
+  };
+  const constraints = buildCustomerConstraints();
+  if(constraints) payload.constraints = constraints;
+
+  let response;
+  try {
+    response = await fetch('/api/design_generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch(err){
+    loadingEl.remove();
+    _showCdesignError(resultEl, 'Request failed. Check the assistant connection and try again.');
+    statusEl.textContent = customerDesignLast ? 'Previous result shown. Generation failed.' : 'Generation failed.';
+    return;
+  }
+  const result = await response.json().catch(() => ({}));
+  if(!response.ok){
+    loadingEl.remove();
+    _showCdesignError(resultEl, result.message || 'Mix design generation failed. Check that the strength predictor is ready and try again.');
+    statusEl.textContent = customerDesignLast ? 'Previous result shown. Generation failed.' : 'Generation failed.';
+    return;
+  }
+
+  // Success: replace old result with new one
+  loadingEl.remove();
+  customerDesignLast = result;
+  const ranked = Array.isArray(result.ranked_candidates) && result.ranked_candidates.length
+    ? result.ranked_candidates
+    : [result];
+  const shown = ranked.slice(0, 5);
+  const bestCandidate = shown[0] || {};
+  const verdict = candidateVerdict(bestCandidate.validation_verdict || result.validation_verdict || bestCandidate.sample_validation?.overall_verdict);
+  const verdictsAvailable = ranked.some(c => c.validation_verdict || c.sample_validation?.overall_verdict);
+  const failCount = verdictsAvailable ? ranked.filter(c => candidateVerdict(c.validation_verdict || c.sample_validation?.overall_verdict) === 'FAIL').length : null;
+  const warningCount = ranked.filter(c => candidateWarnings(c).length > 0).length;
+  const bestUncertainty = bestCandidate.uncertainty_interval || {};
+  const bestConfidence = bestUncertainty.confidence_label || bestCandidate.confidence_label;
+
+  statusEl.textContent = `Generated ${shown.length} candidate${shown.length === 1 ? '' : 's'} · best verdict: ${verdict}.`;
+  downloadBtn.disabled = false;
+  downloadBtn.style.opacity = '1';
+
+  const summary = `
+    <div class="card-grid" style="margin-bottom:16px">
+      ${candidateSummaryMetric('Target strength', formatCandidateNumber(result.target_strength ?? target, 2, ' MPa'))}
+      ${candidateSummaryMetric('Candidates', String(ranked.length || 'N/A'))}
+      ${candidateSummaryMetric('Best predicted', formatCandidateNumber(bestCandidate.predicted_strength ?? result.predicted_strength, 2, ' MPa'))}
+      ${candidateSummaryMetric('Best confidence', escapeHtml(bestConfidence || 'N/A'))}
+      ${candidateSummaryMetric('Best verdict', `<span class="badge ${candidateVerdictClass(verdict)}">${escapeHtml(verdict)}</span>`)}
+      ${candidateSummaryMetric('Candidates with warnings', String(warningCount))}
+      ${candidateSummaryMetric('FAIL verdicts', failCount == null ? 'N/A' : String(failCount))}
+    </div>`;
+  const cards = `<div class="card-grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">${shown.map((c, i) => renderPolishedCandidateCard(c, i, i === 0, constraints, result.target_strength ?? target)).join('')}</div>`;
+  const disclaimer = `<div style="margin-top:16px;padding:12px 16px;border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.6"><strong style="color:var(--text)">Lab validation required.</strong> These mix candidates are model predictions, not certified mix designs. All mixes must be confirmed by laboratory trial batches and reviewed by a qualified structural or materials engineer before use in construction.</div>`;
+  document.getElementById('cdesign-disclaimer').style.display = 'block';
+  resultEl.innerHTML = summary + cards + disclaimer;
+}
+
+function downloadCustomerDesign(){
+  if(!customerDesignLast) return;
+  const target = customerDesignLast.target_strength != null ? parseFloat(customerDesignLast.target_strength).toFixed(0) : 'custom';
+  const fname = `autocivil_mix_design_${target}MPa.json`;
+  const blob = new Blob([JSON.stringify(customerDesignLast, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fname;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+window.runCustomerDesign = runCustomerDesign;
+window.downloadCustomerDesign = downloadCustomerDesign;
+
+async function loadExperimentalMode() {
   await Promise.all([
     loadStatus(),
     loadOverview(),
+    loadRunHistory(),
     loadLog(),
     loadOptuna(),
     loadValidation(),
@@ -1254,84 +2463,447 @@ function badgeClass(value){
   return ['pass','warn','fail','ok','low','moderate','high'].includes(cleaned) ? cleaned : 'warn';
 }
 
+function normalModeCopy(value){
+  return String(value ?? '')
+    .replace(/overview artifacts?/gi, 'mix design readiness details')
+    .replace(/dashboard summary artifacts?/gi, 'mix design readiness details')
+    .replace(/evidence artifacts?/gi, 'readiness details')
+    .replace(/artifacts?/gi, 'readiness files')
+    .replace(/model promotion/gi, 'mix candidate use')
+    .replace(/trained model/gi, 'strength predictor')
+    .replace(/pipeline/gi, 'assistant');
+}
+
+function hasValue(value){
+  return value !== null && value !== undefined && value !== '';
+}
+
+function formatMetric(value, decimals = 4){
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(decimals) : '—';
+}
+
+function formatPercent(value, decimals = 2){
+  const n = Number(value);
+  return Number.isFinite(n) ? `${(n * 100).toFixed(decimals)}%` : '—';
+}
+
+function sourceLine(label, type){
+  return `<div class="card-label">Source: ${escapeHtml(label)}${type ? ` <span style="color:var(--muted)">(${escapeHtml(type)})</span>` : ''}</div>`;
+}
+
 async function loadStatus() {
   const r = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
   const all = Object.values(r).every(v=>v.exists);
   document.getElementById('status-dot').className = 'dot' + (all?'':' red');
-  document.getElementById('status-text').textContent = all ? 'Pipeline Ready' : 'Incomplete';
+  document.getElementById('status-text').textContent = all
+    ? (isNormalMode() ? 'Ready' : 'Pipeline Ready')
+    : (isNormalMode() ? 'Setup needed' : 'Incomplete');
   // topbar time
   const times = Object.values(r).filter(v=>v.modified).map(v=>new Date(v.modified));
   if(times.length){
     const latest = new Date(Math.max(...times));
-    document.getElementById('tb-time').textContent = 'Last run: ' + latest.toLocaleString();
+    document.getElementById('tb-time').textContent = (isNormalMode() ? 'Last update: ' : 'Last run: ') + latest.toLocaleString();
   }
 }
 
 // ─── overview ────────────────────────────────────────────────────────────────
+async function loadNormalSummary() {
+  const mount = document.getElementById('normal-summary-cards');
+  if(!mount){
+    return;
+  }
+  const d = await fetch('/api/overview').then(r=>r.json()).catch(()=>({}));
+  overviewData = d;
+  document.getElementById('tb-dataset').textContent = `Dataset: ${d.dataset_rows || '—'} rows`;
+  const decision = d.decision_metric || {};
+  const fallbackWarnings = (!Array.isArray(d.warnings) || !d.warnings.length) && !decision.source_type
+    ? [{ title: 'Strength predictor unavailable', message: 'Mix design readiness details are not available.' }]
+    : [];
+  const warnings = Array.isArray(d.warnings) && d.warnings.length ? d.warnings : fallbackWarnings;
+  const nextAction = Object.keys(d.next_action || {}).length ? d.next_action : {
+    title: 'Prepare mix design inputs',
+    message: 'Prepare the strength predictor and input summary before relying on generated mix candidates.',
+  };
+  const evidence = Object.keys(d.evidence_status || {}).length ? d.evidence_status : {
+    label: 'Action required',
+    warning_count: warnings.length,
+  };
+
+  const warningHtml = warnings.length
+    ? `<ul style="margin:10px 0 0 18px;padding:0;font-family:var(--mono);font-size:11px;color:var(--yellow)">${warnings.map(w => `<li>${escapeHtml(normalModeCopy(w.message || 'Readiness warning.'))}</li>`).join('')}</ul>`
+    : `<div class="metric" style="margin-top:8px"><div class="metric-value sm" style="color:var(--green)">Ready to generate mix candidates.</div></div>`;
+  mount.innerHTML = `
+    <div class="card">
+      <div class="card-label">Project Health</div>
+      <div class="card-title">${escapeHtml(normalModeCopy(evidence.label || 'Action required'))}</div>
+      <div class="metric"><div class="metric-label">Strength predictor</div><div class="metric-value sm">${escapeHtml((decision.model_name || decision.source_label) ? 'Ready' : 'Not ready')}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Readiness status</div>
+      <div class="metric"><div class="metric-label">Warnings</div><div class="metric-value">${evidence.warning_count != null ? evidence.warning_count : warnings.length}</div></div>
+      ${warningHtml}
+    </div>
+    <div class="card">
+      <div class="card-label">Next action</div>
+      <div class="card-title">${escapeHtml(normalModeCopy(nextAction.title || 'Review mix design readiness'))}</div>
+      <div class="metric"><div class="metric-label">Instruction</div><div class="metric-value sm">${escapeHtml(normalModeCopy(nextAction.message || 'Review readiness before generating mix candidates.'))}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Advanced details</div>
+      <div class="metric"><div class="metric-label">Detailed validation</div><div class="metric-value sm">Validation panels, design trade-offs, field records, and charts.</div></div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="/?mode=experimental">Open Advanced Details</a>
+    </div>
+    <div class="card">
+      <div class="card-label">Mix Design Assistant</div>
+      <div class="metric"><div class="metric-label">Generate concrete mix candidates</div><div class="metric-value sm">Enter a target strength and get suggested mixes with confidence and engineering warnings.</div></div>
+      <a class="refresh-btn" style="display:inline-flex;margin-top:12px" href="#customer-design">Go to Mix Design Assistant</a>
+    </div>
+  `;
+}
+
 async function loadOverview() {
   const d = await fetch('/api/overview').then(r=>r.json()).catch(()=>({}));
   overviewData = d;
   const b = d.baseline || {};
   const best = d.best || {};
   const fin = d.final || {};
-  const bestMetricSource = best.holdout_composite != null ? 'Holdout' : ((best.cv_composite != null || best.composite != null) ? 'CV' : 'N/A');
   document.getElementById('tb-dataset').textContent =
     `Dataset: ${d.dataset_rows || '—'} rows`;
 
   const verdictBadge = v => `<span class="badge ${(v||'').toLowerCase()}">${v||'—'}</span>`;
-  const pct = n => n ? (n*100).toFixed(2)+'%' : '—';
-  const num = (n,dec=4) => n!=null ? (+n).toFixed(dec) : '—';
+  const pct = n => formatPercent(n);
+  const num = (n,dec=4) => formatMetric(n,dec);
 
   document.getElementById('overview-cards').innerHTML = `
     <div class="card">
-      <div class="card-label">01 · Baseline</div>
+      ${sourceLine('Cross-validation metrics', 'cross_validation')}
       <div class="card-title">${escapeHtml(b.model_name||'RandomForestRegressor')}</div>
-      <div class="metric"><div class="metric-label">RMSE ?? CV</div><div class="metric-value">${num(b.cv_rmse||b.rmse,4)}</div></div>
-      <div class="metric"><div class="metric-label">CV R²</div><div class="metric-value sm">${num(b.cv_r2||b.r2,4)}</div></div>
-      <div class="metric"><div class="metric-label">Composite ?? CV</div><div class="metric-value sm">${num(b.cv_composite||b.composite,4)}</div></div>
+      <div class="metric"><div class="metric-label">CV RMSE</div><div class="metric-value">${num(b.cv_rmse ?? b.rmse,4)}</div></div>
+      <div class="metric"><div class="metric-label">CV R²</div><div class="metric-value sm">${num(b.cv_r2 ?? b.r2,4)}</div></div>
+      <div class="metric"><div class="metric-label">CV composite</div><div class="metric-value sm">${num(b.cv_composite ?? b.composite,4)}</div></div>
       <div style="margin-top:8px">${verdictBadge(b.validation_verdict||b.validation)}</div>
     </div>
     <div class="card">
-      <div class="card-label">02 · Best Model</div>
-      <div class="card-title">${best.model_name||'—'}</div>
-      <div class="metric"><div class="metric-label">RMSE ?? CV</div><div class="metric-value">${num(best.cv_rmse||best.rmse,4)}</div></div>
-      <div class="metric"><div class="metric-label">Holdout R²</div><div class="metric-value sm">${num(best.holdout_r2||best.r2,4)}</div></div>
-      <div class="metric"><div class="metric-label">Composite ?? ${bestMetricSource}</div><div class="metric-value sm">${num(best.holdout_composite||best.val_composite||best.composite,4)}</div></div>
+      ${sourceLine('Validation metrics', 'selection_validation')}
+      <div class="card-title">${escapeHtml(best.model_name||'—')}</div>
+      <div class="metric"><div class="metric-label">Validation RMSE</div><div class="metric-value">${num(best.validation_rmse,4)}</div></div>
+      <div class="metric"><div class="metric-label">Validation R²</div><div class="metric-value sm">${num(best.validation_r2,4)}</div></div>
+      <div class="metric"><div class="metric-label">Validation composite</div><div class="metric-value sm">${num(best.validation_composite,4)}</div></div>
       <div style="margin-top:8px">${verdictBadge(best.validation_verdict||best.validation)}</div>
     </div>
     <div class="card">
-      <div class="card-label">03 · Improvement</div>
-      <div class="card-title">vs Baseline</div>
-      <div class="metric"><div class="metric-label">Composite Δ</div><div class="metric-value" style="color:var(--green)">${fin.composite_improvement_pct ? '+'+num(fin.composite_improvement_pct,2)+'%' : '—'}</div></div>
-      <div class="metric"><div class="metric-label">Best found at Trial</div><div class="metric-value sm">#${best.best_trial||'—'}</div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">04 · Dataset</div>
-      <div class="card-title">concrete_data.csv</div>
-      <div class="metric"><div class="metric-label">Rows</div><div class="metric-value">${d.dataset_rows||'—'}</div></div>
-      <div class="metric"><div class="metric-label">Target</div><div class="metric-value sm">compressive_strength</div></div>
-    </div>
-    <div class="card">
-      <div class="card-label">05 · RMSE by Range</div>
-      <div class="card-title">Low / Mid / High MPa</div>
+      ${sourceLine('Final holdout metrics', 'holdout_metrics')}
+      <div class="card-title">${escapeHtml(fin.holdout_source_label || 'Final holdout metrics')}</div>
+      <div class="metric"><div class="metric-label">Holdout RMSE</div><div class="metric-value">${num(fin.holdout_rmse,4)}</div></div>
+      <div class="metric"><div class="metric-label">Holdout R²</div><div class="metric-value sm">${num(fin.holdout_r2,4)}</div></div>
+      <div class="metric"><div class="metric-label">Holdout composite</div><div class="metric-value sm">${num(fin.holdout_composite,4)}</div></div>
+      <div style="margin-top:8px">${verdictBadge((fin.holdout_validation_report && fin.holdout_validation_report.verdict) || '—')}</div>
       ${fin.rmse_by_range ? `
+        <div class="metric" style="margin-top:14px"><div class="metric-label">Holdout RMSE by strength range</div></div>
         <div class="metric"><div class="metric-label">Low</div><div class="metric-value sm">${num(fin.rmse_by_range.low,4)}</div></div>
         <div class="metric"><div class="metric-label">Mid</div><div class="metric-value sm">${num(fin.rmse_by_range.mid,4)}</div></div>
         <div class="metric"><div class="metric-label">High</div><div class="metric-value sm">${num(fin.rmse_by_range.high,4)}</div></div>
-      ` : '<div style="color:var(--muted);font-size:12px">Not available</div>'}
+      ` : ''}
     </div>
     <div class="card">
-      <div class="card-label">06 · Validation Status</div>
-      <div class="card-title">Engineering Checks</div>
-      <div class="metric"><div class="metric-label">Hard Constraints</div><div class="metric-value" style="color:${(best.hard_failed_count||0)>0?'var(--red)':'var(--green)'}">${best.hard_failed_count??'—'}</div></div>
-      <div class="metric"><div class="metric-label">Engineering Cautions</div><div class="metric-value sm" style="color:${(best.engineering_caution_count||best.durability_caution_count||0)>0?'var(--yellow)':'var(--green)'}">${best.engineering_caution_count??best.durability_caution_count??'—'}</div></div>
-      <div class="metric"><div class="metric-label">Data Review Flags</div><div class="metric-value sm">${best.data_review_flag_count??best.dataset_anomaly_count??'—'}</div></div>
-      <div style="margin-top:8px">${verdictBadge(best.validation_verdict||best.validation)}</div>
+      ${sourceLine('Uncertainty audit', 'uncertainty_audit')}
+      <div class="card-title">${escapeHtml(fin.uncertainty_source_label || 'Uncertainty audit')}</div>
+      <div class="metric"><div class="metric-label">Coverage</div><div class="metric-value">${pct(fin.uncertainty_coverage)}</div></div>
+      <div class="metric"><div class="metric-label">Coverage target</div><div class="metric-value sm">${pct(fin.uncertainty_coverage_target)}</div></div>
+      <div class="metric"><div class="metric-label">Audit partition</div><div class="metric-value sm">${escapeHtml((fin.uncertainty_audit && fin.uncertainty_audit.audit_partition) || '—')}</div></div>
+      <div class="metric"><div class="metric-label">Calibration partition</div><div class="metric-value sm">${escapeHtml((fin.uncertainty_audit && fin.uncertainty_audit.calibration_partition) || '—')}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Improvement vs Baseline</div>
+      <div class="card-title">Outcome delta</div>
+      <div class="metric"><div class="metric-label">Composite Δ</div><div class="metric-value" style="color:var(--green)">${hasValue(fin.composite_improvement_pct) ? '+'+num(fin.composite_improvement_pct,2)+'%' : '—'}</div></div>
+      <div class="metric"><div class="metric-label">Best found at Trial</div><div class="metric-value sm">#${best.best_trial||'—'}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Dataset</div>
+      <div class="card-title">concrete_data.csv</div>
+      <div class="metric"><div class="metric-label">Rows</div><div class="metric-value">${d.dataset_rows||'—'}</div></div>
+      <div class="metric"><div class="metric-label">Target</div><div class="metric-value sm">compressive_strength</div></div>
     </div>
   `;
 }
 
 // ─── research log ────────────────────────────────────────────────────────────
+function numOrNull(value){
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtSigned(value, digits = 4){
+  const n = numOrNull(value);
+  if(n == null) return 'â€”';
+  const sign = n > 0 ? '+' : '';
+  return `${sign}${n.toFixed(digits)}`;
+}
+
+function runTrendColor(value){
+  if(value == null) return theme('--muted');
+  if(value > 0) return theme('--green');
+  if(value < 0) return theme('--red');
+  return theme('--muted');
+}
+
+function statusBadgeClass(status){
+  const value = String(status || 'unknown').toLowerCase();
+  if(value.includes('accept') || value.includes('keep') || value.includes('success')) return 'pass';
+  if(value.includes('revert') || value.includes('rejected') || value.includes('fail') || value.includes('error')) return 'fail';
+  if(value.includes('warn') || value.includes('pending') || value.includes('running')) return 'warn';
+  return 'neutral';
+}
+
+function compactRunLabel(run){
+  if(!run) return 'â€”';
+  return String(run.run_id || '').slice(-6) || 'â€”';
+}
+
+function latestAndPreviousRetained(runs){
+  const retained = runs.filter(r => r.final_run_status === 'success' && r.final_consistent);
+  return {
+    latest: runs.length ? runs[runs.length - 1] : null,
+    previous: retained.length >= 2 ? retained[retained.length - 2] : retained[retained.length - 1] || null,
+    best: retained.length ? [...retained].sort((a, b) => (numOrNull(b.best_composite) ?? -Infinity) - (numOrNull(a.best_composite) ?? -Infinity))[0] : null,
+    worst: retained.length ? [...retained].sort((a, b) => (numOrNull(a.best_composite) ?? Infinity) - (numOrNull(b.best_composite) ?? Infinity))[0] : null,
+    retained,
+  };
+}
+
+async function loadRunHistory() {
+  const payload = await fetch('/api/run_history').then(r=>r.json()).catch(()=>[]);
+  runHistory = Array.isArray(payload) ? payload : (payload.runs || []);
+  renderRunHistory(Array.isArray(payload) ? null : (payload.summary || null));
+}
+
+function renderRunHistory(summary){
+  const el = document.getElementById('run-history-meta');
+  const cardsEl = document.getElementById('run-summary-cards');
+  const tbody = document.getElementById('run-history-tbody');
+  const lineage = document.getElementById('run-lineage');
+  if(!runHistory.length){
+    if(el) el.textContent = 'No historical runs found in outputs/runs/.';
+    if(cardsEl) cardsEl.innerHTML = `
+      <div class="design-placeholder" style="grid-column:1/-1">
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px">No historical runs yet</div>
+        <div style="color:var(--muted);font-size:12px">This dashboard will populate once run manifests are archived under outputs/runs/.</div>
+      </div>`;
+    if(tbody) tbody.innerHTML = '';
+    if(lineage) lineage.innerHTML = '';
+    renderRunCharts();
+    return;
+  }
+
+  const computed = summary || latestAndPreviousRetained(runHistory);
+  const latest = computed.latest || runHistory[runHistory.length - 1];
+  const previous = computed.previous || null;
+  const best = computed.best || latest;
+  const worst = computed.worst || latest;
+  const retained = computed.retained || [];
+  const latestDelta = numOrNull(latest?.delta_vs_previous_best);
+  const latestImprovement = numOrNull(latest?.composite_improvement_pct);
+  if(el){
+    el.textContent = `${runHistory.length} run(s) found | ${retained.length} retained | latest ${latest?.run_id || 'â€”'} | best ${best?.run_id || 'â€”'}`;
+  }
+
+  if(cardsEl){
+    cardsEl.innerHTML = `
+      <div class="card">
+        <div class="card-label">Latest Retained</div>
+        <div class="card-title">${escapeHtml(latest?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${latest?.best_composite != null ? latest.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Delta vs Previous</div><div class="metric-value sm" style="color:${runTrendColor(latestDelta)}">${fmtSigned(latestDelta, 4)}</div></div>
+        <div class="metric"><div class="metric-label">Improvement %</div><div class="metric-value sm" style="color:${runTrendColor(latestImprovement)}">${fmtSigned(latestImprovement, 2)}%</div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Previous Retained</div>
+        <div class="card-title">${escapeHtml(previous?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${previous?.best_composite != null ? previous.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Validation</div><div class="metric-value sm">${escapeHtml(previous?.validation_verdict || 'â€”')}</div></div>
+        <div class="metric"><div class="metric-label">Candidates</div><div class="metric-value sm">${previous?.candidates ?? 'â€”'}</div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Best Ever</div>
+        <div class="card-title">${escapeHtml(best?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${best?.best_composite != null ? best.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Model</div><div class="metric-value sm">${escapeHtml(best?.best_model || 'â€”')}</div></div>
+        <div class="metric"><div class="metric-label">Status</div><div class="metric-value sm">${escapeHtml(best?.final_run_status || 'â€”')}</div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Worst Retained</div>
+        <div class="card-title">${escapeHtml(worst?.run_id || 'â€”')}</div>
+        <div class="metric"><div class="metric-label">Best Composite</div><div class="metric-value">${worst?.best_composite != null ? worst.best_composite.toFixed(4) : 'â€”'}</div></div>
+        <div class="metric"><div class="metric-label">Delta vs Baseline</div><div class="metric-value sm" style="color:${runTrendColor(worst?.delta_vs_baseline)}">${fmtSigned(worst?.delta_vs_baseline, 4)}</div></div>
+        <div class="metric"><div class="metric-label">Accepted</div><div class="metric-value sm">${worst?.accepted ? 'YES' : 'NO'}</div></div>
+      </div>
+    `;
+  }
+
+  if(lineage){
+    const nodes = [
+      { label: 'Baseline', value: latest?.baseline_composite, note: latest?.baseline_model || 'baseline model', cls: '' },
+      { label: 'Previous Retained', value: previous?.best_composite, note: previous?.run_id || 'previous result', cls: 'best' },
+      { label: 'Latest Retained', value: latest?.best_composite, note: latest?.run_id || 'current result', cls: 'latest' },
+      { label: 'Best Ever', value: best?.best_composite, note: best?.best_model || 'top model', cls: 'best' },
+    ];
+    lineage.innerHTML = nodes.map((node, index) => `
+      <div class="run-node ${node.cls}">
+        <div class="mini">${escapeHtml(node.label)}</div>
+        <div class="headline">${node.value != null ? Number(node.value).toFixed(4) : 'â€”'}</div>
+        <div class="stat">${escapeHtml(node.note)}</div>
+        ${index === 0 || !Number.isFinite(Number(node.value)) || !Number.isFinite(Number(nodes[index-1].value))
+          ? ''
+          : `<div class="run-note">${fmtSigned((Number(node.value) - Number(nodes[index-1].value)), 4)} vs prior node</div>`}
+      </div>
+      ${index < nodes.length - 1 ? '<div class="run-arrow">→</div>' : ''}
+    `).join('');
+  }
+
+  if(tbody){
+    tbody.innerHTML = [...runHistory].reverse().map(run => {
+      const baseline = run.baseline_composite;
+      const bestScore = run.best_composite;
+      const deltaBase = run.delta_vs_baseline;
+      const deltaPrev = run.delta_vs_previous_best;
+      const rowClass = `${run.is_latest ? 'latest-row' : ''} ${run.is_best ? 'best-row' : ''}`.trim();
+      return `
+        <tr class="${rowClass}">
+          <td>${escapeHtml(compactRunLabel(run))}</td>
+          <td>${escapeHtml(String(run.run_timestamp || '').replace('Z',''))}</td>
+          <td><span class="badge ${statusBadgeClass(run.final_run_status)}">${escapeHtml(run.final_run_status || 'â€”')}</span></td>
+          <td>${baseline != null ? Number(baseline).toFixed(4) : 'â€”'}</td>
+          <td>${bestScore != null ? Number(bestScore).toFixed(4) : 'â€”'}</td>
+          <td style="color:${runTrendColor(deltaBase)}">${fmtSigned(deltaBase, 4)}</td>
+          <td style="color:${runTrendColor(deltaPrev)}">${fmtSigned(deltaPrev, 4)}</td>
+          <td>${run.candidates ?? 'â€”'}</td>
+          <td>${escapeHtml(run.best_model || 'â€”')}</td>
+          <td><span class="comparison-pill ${run.accepted ? 'good' : (run.final_run_status === 'success' ? 'neutral' : 'bad')}">${escapeHtml(run.validation_verdict || 'â€”')}</span></td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  renderRunCharts();
+}
+
+function renderRunCharts(){
+  const defaults = chartDefaults();
+  const labels = runHistory.map(run => compactRunLabel(run));
+  const bestScores = runHistory.map(run => numOrNull(run.best_composite));
+  const baselineScores = runHistory.map(run => numOrNull(run.baseline_composite));
+  const runningBest = [];
+  let bestSeen = null;
+  for(const value of bestScores){
+    if(value == null){
+      runningBest.push(null);
+      continue;
+    }
+    bestSeen = bestSeen == null ? value : Math.max(bestSeen, value);
+    runningBest.push(bestSeen);
+  }
+  const deltas = runHistory.map(run => numOrNull(run.delta_vs_previous_best));
+  const candidates = runHistory.map(run => numOrNull(run.candidates));
+  const statuses = runHistory.reduce((acc, run) => {
+    const key = String(run.final_run_status || 'unknown');
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const statusLabels = Object.keys(statuses);
+  const statusValues = statusLabels.map(key => statuses[key]);
+  const statusColors = statusLabels.map(key => {
+    const lower = key.toLowerCase();
+    if(lower.includes('success') || lower.includes('keep')) return theme('--green');
+    if(lower.includes('fail') || lower.includes('error') || lower.includes('revert')) return theme('--red');
+    if(lower.includes('warn') || lower.includes('running') || lower.includes('pending')) return theme('--yellow');
+    return theme('--accent');
+  });
+  const accent = theme('--accent');
+  const green = theme('--green');
+  const yellow = theme('--yellow');
+
+  if(chartRunHistory) chartRunHistory.destroy();
+  chartRunHistory = new Chart(document.getElementById('chart-run-history'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Baseline Composite', data: baselineScores, borderColor: yellow, backgroundColor: withAlpha(yellow, .14), borderWidth: 1.5, pointRadius: 2, tension: .25, fill: false },
+        { label: 'Best Composite', data: bestScores, borderColor: accent, backgroundColor: withAlpha(accent, .14), borderWidth: 2, pointRadius: 3, tension: .25, fill: false },
+        { label: 'Running Best', data: runningBest, borderColor: green, backgroundColor: withAlpha(green, .12), borderWidth: 2, pointRadius: 2, tension: .15, fill: true },
+      ]
+    },
+    options: { ...defaults, plugins: { ...defaults.plugins, legend: chartLegendOptions() } }
+  });
+
+  if(chartRunDelta) chartRunDelta.destroy();
+  chartRunDelta = new Chart(document.getElementById('chart-run-delta'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Delta vs Previous Retained', data: deltas, backgroundColor: deltas.map(v => withAlpha(runTrendColor(v), .24)), borderColor: deltas.map(v => runTrendColor(v)), borderWidth: 1.5, borderRadius: 4 }
+      ]
+    },
+    options: {
+      ...defaults,
+      plugins: { ...defaults.plugins, legend: { display: false } },
+      scales: {
+        ...defaults.scales,
+        y: { ...defaults.scales.y, title: { display: true, text: 'Composite delta' } }
+      }
+    }
+  });
+
+  if(chartRunMetrics) chartRunMetrics.destroy();
+  chartRunMetrics = new Chart(document.getElementById('chart-run-metrics'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { type: 'bar', label: 'Baseline', data: baselineScores, backgroundColor: withAlpha(yellow, .22), borderColor: yellow, borderWidth: 1.2, borderRadius: 4 },
+        { type: 'bar', label: 'Best', data: bestScores, backgroundColor: withAlpha(green, .22), borderColor: green, borderWidth: 1.2, borderRadius: 4 },
+        { type: 'line', label: 'Candidates', data: candidates, yAxisID: 'y1', borderColor: accent, backgroundColor: withAlpha(accent, .16), borderWidth: 2, pointRadius: 3, tension: .2 }
+      ]
+    },
+    options: {
+      ...defaults,
+      plugins: { ...defaults.plugins, legend: chartLegendOptions() },
+      scales: {
+        x: { grid: { color: withAlpha(theme('--border'), .7) }, ticks: { color: theme('--muted'), font: { family: 'Space Mono', size: 10 } } },
+        y: { grid: { color: withAlpha(theme('--border'), .7) }, ticks: { color: theme('--muted'), font: { family: 'Space Mono', size: 10 } }, title: { display: true, text: 'Composite score' } },
+        y1: {
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          ticks: { color: theme('--muted'), font: { family: 'Space Mono', size: 10 } },
+          title: { display: true, text: 'Candidates' }
+        }
+      }
+    }
+  });
+
+  if(chartRunStatus) chartRunStatus.destroy();
+  chartRunStatus = new Chart(document.getElementById('chart-run-status'), {
+    type: 'doughnut',
+    data: {
+      labels: statusLabels.length ? statusLabels : ['none'],
+      datasets: [{
+        data: statusLabels.length ? statusValues : [1],
+        backgroundColor: statusLabels.length ? statusColors.map(c => withAlpha(c, .24)) : [withAlpha(theme('--muted'), .24)],
+        borderColor: statusLabels.length ? statusColors : [theme('--muted')],
+        borderWidth: 1.5
+      }]
+    },
+    options: {
+      ...defaults,
+      cutout: '68%',
+      plugins: { ...defaults.plugins, legend: chartLegendOptions() }
+    }
+  });
+}
+
 async function loadLog() {
   allTrials = await fetch('/api/research_log').then(r=>r.json()).catch(()=>[]);
   renderLog();
@@ -1571,7 +3143,7 @@ function renderCharts(){
 
   // Improvement gauge
   const bComp = +(baseline.cv_composite||baseline.composite||0);
-  const bestComp = +(best.holdout_composite||best.composite||0);
+  const bestComp = +(best.validation_composite||best.cv_composite||best.composite||0);
   if(chartImprovement) chartImprovement.destroy();
   chartImprovement = new Chart(document.getElementById('chart-improvement'),{
     type:'doughnut',
@@ -1621,74 +3193,110 @@ function chartDefaults(){
 
 async function loadValidation() {
   const d = await fetch('/api/validation_details').then(r=>r.json()).catch(()=>({}));
-  const v = d.validation_verdict || d.validation || '—';
-  const fail = d.hard_failed_count ?? d.failed_samples ?? 0;
-  const warn = d.warning_count ?? 0;
-  const cautions = d.engineering_caution_count ?? d.durability_caution_count ?? 0;
-  const reviewFlags = d.data_review_flag_count ?? d.dataset_anomaly_count ?? d.suspicious_samples ?? 0;
-  const passRate = d.validation_pass_rate;
-  const hardFailReasons = d.hard_fail_reasons || [];
-  const warns = d.warn_reasons || [];
-  const cautionReasons = d.engineering_caution_reasons || d.durability_caution_reasons || [];
-  const reviewFlagReasons = d.data_review_flag_reasons || d.dataset_anomaly_reasons || [];
-  const contextualSummary = d.contextual_summary || '—';
-  const assessmentConfidence = d.confidence_of_warning_assessment || '—';
+  const cv = d.cross_validation || {};
+  const validation = d.validation_metrics || {};
+  const holdout = d.holdout_metrics || {};
+  const validationReport = d.validation_report || {};
+  const holdoutReport = d.holdout_validation_report || {};
+  const uncertainty = d.uncertainty_audit || {};
+  const verdictBadge = v => `<span class="badge ${(v||'').toLowerCase()}">${v||'—'}</span>`;
+
+  const metricRow = (label, value, suffix = '') => `
+    <div class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value sm">${formatMetric(value)}${suffix}</div></div>
+  `;
+
+  const countColor = value => (Number(value) > 0 ? 'var(--yellow)' : 'var(--green)');
   const red = theme('--red');
   const yellow = theme('--yellow');
   const accent = theme('--accent');
-  const renderReasonGroup = (title, items, emptyText, styles) => `
-    <div style="margin-bottom:16px">
-      <div class="metric-label" style="margin-bottom:8px">${title}</div>
-      ${items.length
-        ? `<ul class="warn-list">${items.map(w=>`<li style="background:${styles.bg};border-left-color:${styles.border};color:${styles.text}">${escapeHtml(w)}</li>`).join('')}</ul>`
-        : `<div style="color:var(--muted);font-family:var(--mono);font-size:11px">${emptyText}</div>`
-      }
+
+  document.getElementById('validation-panels').innerHTML = `
+    <div class="card">
+      ${sourceLine(cv.source_label || 'Cross-validation metrics', cv.source_type || 'cross_validation')}
+      <div class="card-title">${escapeHtml(d.model_name || 'Model selection')}</div>
+      ${metricRow('Cross-validation RMSE', cv.aggregate && cv.aggregate.rmse)}
+      ${metricRow('Cross-validation MAE', cv.aggregate && cv.aggregate.mae)}
+      ${metricRow('Cross-validation R²', cv.aggregate && cv.aggregate.r2)}
+      ${metricRow('Cross-validation composite', cv.aggregate && cv.aggregate.composite_score)}
+      <div style="margin-top:8px;color:var(--muted);font-family:var(--mono);font-size:10px">Train-fold aggregate only. No holdout data used here.</div>
+    </div>
+    <div class="card">
+      ${sourceLine(validation.source_label || 'Validation metrics', validation.source_type || 'selection_validation')}
+      <div class="card-title">${escapeHtml(validationReport.verdict || 'Validation report')}</div>
+      ${metricRow('Validation RMSE', validation.aggregate && validation.aggregate.rmse)}
+      ${metricRow('Validation MAE', validation.aggregate && validation.aggregate.mae)}
+      ${metricRow('Validation R²', validation.aggregate && validation.aggregate.r2)}
+      ${metricRow('Validation composite', validation.aggregate && validation.aggregate.composite_score)}
+      <div style="margin-top:8px">${verdictBadge(validationReport.verdict)}</div>
+      <div class="metric" style="margin-top:10px"><div class="metric-label">Pass rate</div><div class="metric-value sm">${formatPercent(validationReport.pass_rate)}</div></div>
+      <div class="metric"><div class="metric-label">Hard constraints</div><div class="metric-value sm" style="color:${countColor(validationReport.hard_constraint_count)}">${validationReport.hard_constraint_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Engineering cautions</div><div class="metric-value sm" style="color:${countColor(validationReport.engineering_caution_count)}">${validationReport.engineering_caution_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Data review flags</div><div class="metric-value sm" style="color:${countColor(validationReport.data_review_flag_count)}">${validationReport.data_review_flag_count ?? '—'}</div></div>
+    </div>
+    <div class="card">
+      ${sourceLine(holdout.source_label || 'Final holdout metrics', holdout.source_type || 'holdout_metrics')}
+      <div class="card-title">${escapeHtml((holdoutReport && holdoutReport.verdict) || 'Holdout report')}</div>
+      ${metricRow('Holdout RMSE', holdout.aggregate && holdout.aggregate.rmse)}
+      ${metricRow('Holdout MAE', holdout.aggregate && holdout.aggregate.mae)}
+      ${metricRow('Holdout R²', holdout.aggregate && holdout.aggregate.r2)}
+      ${metricRow('Holdout composite', holdout.aggregate && holdout.aggregate.composite_score)}
+      <div style="margin-top:8px">${verdictBadge(holdoutReport.verdict)}</div>
+      <div class="metric" style="margin-top:10px"><div class="metric-label">Pass rate</div><div class="metric-value sm">${formatPercent(holdoutReport.pass_rate)}</div></div>
+      <div class="metric"><div class="metric-label">Hard constraints</div><div class="metric-value sm" style="color:${countColor(holdoutReport.hard_constraint_count)}">${holdoutReport.hard_constraint_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Engineering cautions</div><div class="metric-value sm" style="color:${countColor(holdoutReport.engineering_caution_count)}">${holdoutReport.engineering_caution_count ?? '—'}</div></div>
+      <div class="metric"><div class="metric-label">Data review flags</div><div class="metric-value sm" style="color:${countColor(holdoutReport.data_review_flag_count)}">${holdoutReport.data_review_flag_count ?? '—'}</div></div>
+    </div>
+    <div class="card">
+      ${sourceLine(uncertainty.source_label || 'Uncertainty audit', uncertainty.source_type || 'uncertainty_audit')}
+      <div class="card-title">Coverage audit</div>
+      <div class="metric"><div class="metric-label">Coverage</div><div class="metric-value">${formatPercent(uncertainty.coverage)}</div></div>
+      <div class="metric"><div class="metric-label">Coverage target</div><div class="metric-value sm">${formatPercent(uncertainty.coverage_target)}</div></div>
+      <div class="metric"><div class="metric-label">Audit partition</div><div class="metric-value sm">${escapeHtml(uncertainty.audit_partition || '—')}</div></div>
+      <div class="metric"><div class="metric-label">Calibration partition</div><div class="metric-value sm">${escapeHtml(uncertainty.calibration_partition || '—')}</div></div>
+      <div class="metric"><div class="metric-label">Expected partition</div><div class="metric-value sm">${escapeHtml((uncertainty.coverage_audit && uncertainty.coverage_audit.expected_partition) || '—')}</div></div>
     </div>
   `;
 
-  document.getElementById('val-summary').innerHTML = `
-    <h3>Validation Summary</h3>
-    <div class="verdict-big ${v.toLowerCase()}">${v}</div>
-    <div class="metric"><div class="metric-label">Hard Constraints</div><div class="metric-value sm" style="color:${fail>0?'var(--red)':'var(--green)'}">${fail}</div></div>
-    <div class="metric"><div class="metric-label">Warning Samples</div><div class="metric-value sm" style="color:${warn>0?'var(--yellow)':'var(--green)'}">${warn}</div></div>
-    <div class="metric"><div class="metric-label">Engineering Cautions</div><div class="metric-value sm" style="color:${cautions>0?'var(--yellow)':'var(--green)'}">${cautions}</div></div>
-    <div class="metric"><div class="metric-label">Data Review Flags</div><div class="metric-value sm" style="color:${reviewFlags>0?'var(--yellow)':'var(--green)'}">${reviewFlags}</div></div>
-    <div class="metric"><div class="metric-label">Pass Rate</div><div class="metric-value sm">${passRate!=null?(passRate*100).toFixed(2)+'%':'—'}</div></div>
-    <div class="metric"><div class="metric-label">Assessment Confidence</div><div class="metric-value sm">${assessmentConfidence}</div></div>
-    <div class="metric"><div class="metric-label">Model</div><div class="metric-value sm">${d.model_name||'—'}</div></div>
-  `;
+  const compareRows = [
+    ['Cross-validation metrics', cv.aggregate || {}, cv.source_type || 'cross_validation', cv.source_label || 'Cross-validation metrics', null],
+    ['Validation metrics', validation.aggregate || {}, validation.source_type || 'selection_validation', validation.source_label || 'Validation metrics', verdictBadge(validationReport.verdict)],
+    ['Final holdout metrics', holdout.aggregate || {}, holdout.source_type || 'holdout_metrics', holdout.source_label || 'Final holdout metrics', verdictBadge(holdoutReport.verdict)],
+  ];
 
-  document.getElementById('val-warnings').innerHTML = `
-    <h3>Validation Breakdown</h3>
-    ${renderReasonGroup('Hard-Fail Reasons', hardFailReasons, 'No hard failures triggered', {bg:withAlpha(red,.08), border:red, text:red})}
-    ${renderReasonGroup('Warning Reasons', warns, 'No warnings triggered', {bg:withAlpha(yellow,.08), border:yellow, text:yellow})}
-    ${renderReasonGroup('Engineering Cautions', cautionReasons, 'No engineering cautions triggered', {bg:withAlpha(yellow,.08), border:yellow, text:yellow})}
-    ${renderReasonGroup('Data Review Flags', reviewFlagReasons, 'No data review flags triggered', {bg:withAlpha(accent,.08), border:accent, text:accent})}
-    <div style="margin-bottom:16px">
-      <div class="metric-label" style="margin-bottom:8px">Contextual Summary</div>
-      <div style="color:var(--muted);font-family:var(--mono);font-size:11px;line-height:1.6">${escapeHtml(contextualSummary)}</div>
-    </div>
-    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
-      <div class="metric-label" style="margin-bottom:8px">RULE REFERENCE</div>
-      ${[
-        ['Exposure class + w/c or w/b','Durability caution uses exposure metadata when available','WARN'],
-        ['High w/c + high strength','SCM, age, binder, and w/b context decide whether review is needed','WARN'],
-        ['High-volume SCM regime','Triggers age-aware data review instead of automatic anomaly labeling','WARN'],
-        ['Binder < 250 kg/m³','Low binder content','WARN'],
-        ['Binder > 550 kg/m³','Shrinkage risk','WARN'],
-        ['Fly ash > 40%','Exceeds ACI substitution limit','WARN'],
-        ['Slag > 70%','Exceeds BS 8500 GGBS limit','WARN'],
-        ['Predicted NaN / inf','Numerically invalid model output','FAIL'],
-        ['Predicted < 0 MPa','Physical impossibility','FAIL'],
-        ['Predicted outside configured bounds','Outside configured engineering range','FAIL'],
-      ].map(([rule,desc,sev])=>`
-        <div class="rule-item">
-          <span style="color:var(--txt)">${rule}</span>
-          <span style="color:var(--muted);flex:1;margin:0 12px;font-size:10px">${desc}</span>
-          <span class="badge ${sev.toLowerCase()}">${sev}</span>
-        </div>`).join('')}
+  const comparisonHtml = `
+    <div class="table-wrap">
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Source type</th>
+            <th>RMSE</th>
+            <th>MAE</th>
+            <th>R²</th>
+            <th>Composite</th>
+            <th>Verdict</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${compareRows.map(([label, aggregate, type, sourceLabel, verdict]) => `
+            <tr>
+              <td>${escapeHtml(sourceLabel)}</td>
+              <td><span class="comparison-pill neutral">${escapeHtml(type)}</span></td>
+              <td>${formatMetric(aggregate.rmse)}</td>
+              <td>${formatMetric(aggregate.mae)}</td>
+              <td>${formatMetric(aggregate.r2)}</td>
+              <td>${formatMetric(aggregate.composite_score)}</td>
+              <td>${verdict || '—'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
     </div>
   `;
+  const comparisonMount = document.getElementById('validation-comparison');
+  if(comparisonMount){
+    comparisonMount.innerHTML = comparisonHtml;
+  }
 }
 
 // ─── design tool ─────────────────────────────────────────────────────────────
@@ -1785,7 +3393,27 @@ async function loadDesign() {
     return;
   }
   let html = renderDesignGenerator();
-  if(d.batch.length){
+  const comparisonRows = Array.isArray(d.comparison_rows) ? d.comparison_rows : [];
+  if(comparisonRows.length){
+    html += `<div class="card-label" style="margin:0 0 10px 0">Source-separated batch comparison</div>
+      <div class="table-wrap" style="margin-bottom:24px">
+      <table class="comparison-table">
+        <thead><tr>
+          <th>Artifact source</th><th>Source type</th><th>Target MPa</th><th>Predicted MPa</th>
+          <th>Verdict</th><th>Interval width</th><th>Cement saving</th><th>Confidence</th>
+        </tr></thead>
+        <tbody>${comparisonRows.map(r=>`<tr>
+          <td>${escapeHtml(r.source_label || r._filename || '—')}</td>
+          <td><span class="comparison-pill neutral">${escapeHtml(r.source_type || '—')}</span></td>
+          <td>${r.target_strength != null ? formatMetric(r.target_strength, 2) : '—'}</td>
+          <td>${r.predicted_strength != null ? formatMetric(r.predicted_strength, 2) : '—'}</td>
+          <td><span class="badge ${(r.validation_verdict||'').toLowerCase()}">${escapeHtml(r.validation_verdict||'—')}</span></td>
+          <td>${r.interval_width != null ? formatMetric(r.interval_width, 2) : '—'}</td>
+          <td>${r.cement_saving_percent != null ? `${formatMetric(r.cement_saving_percent, 2)}%` : (r.cement_saving_kg_per_m3 != null ? `${formatMetric(r.cement_saving_kg_per_m3, 2)} kg` : '—')}</td>
+          <td>${escapeHtml(r.confidence_label || '—')}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>`;
+  }else if(d.batch.length){
     html += `<div class="table-wrap" style="margin-bottom:24px">
       <table>
         <thead><tr>
@@ -1806,13 +3434,22 @@ async function loadDesign() {
   if(d.singles.length){
     html += `<div class="card-grid">${d.singles.map(s=>`
       <div class="card" style="cursor:pointer" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
-        <div class="card-label">Design Result</div>
-        <div class="card-title">${s._filename||'—'}</div>
-        <div class="metric"><div class="metric-label">Target</div><div class="metric-value sm">${s.target_strength||'—'} MPa</div></div>
-        <div class="metric"><div class="metric-label">Predicted</div><div class="metric-value sm">${s.predicted_strength?parseFloat(s.predicted_strength).toFixed(2):'—'} MPa</div></div>
-        <span class="badge ${(s.validation_verdict||'').toLowerCase()}">${s.validation_verdict||'—'}</span>
+        <div class="card-label">Source: ${escapeHtml(s.source_mode || 'design_single')}</div>
+        <div class="card-title">${escapeHtml(s._filename || '—')}</div>
+        <div class="metric"><div class="metric-label">Target MPa</div><div class="metric-value sm">${s.target_strength!=null?formatMetric(s.target_strength,2):'—'}</div></div>
+        <div class="metric"><div class="metric-label">Predicted MPa</div><div class="metric-value sm">${s.predicted_strength!=null?formatMetric(s.predicted_strength,2):'—'}</div></div>
+        <div class="metric"><div class="metric-label">Verdict</div><div class="metric-value sm"><span class="badge ${(s.validation_verdict||'').toLowerCase()}">${escapeHtml(s.validation_verdict||'—')}</span></div></div>
+        <div class="metric"><div class="metric-label">Interval width</div><div class="metric-value sm">${s.uncertainty_interval && s.uncertainty_interval.interval_width != null ? formatMetric(s.uncertainty_interval.interval_width,2) : '—'}</div></div>
+        <div class="metric"><div class="metric-label">Confidence</div><div class="metric-value sm">${escapeHtml((s.uncertainty_interval && s.uncertainty_interval.confidence_label) || '—')}</div></div>
+        <div class="metric"><div class="metric-label">Cement saving</div><div class="metric-value sm">${s.estimated_cement_saving_vs_reference && s.estimated_cement_saving_vs_reference.cement_saving_percent != null ? `${formatMetric(s.estimated_cement_saving_vs_reference.cement_saving_percent,2)}%` : '—'}</div></div>
       </div>
       <div style="display:none;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:-8px;margin-bottom:8px;font-family:var(--mono);font-size:11px">
+        <div class="metric-label" style="margin-bottom:10px">Trade-off details</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px">
+          <div class="comparison-pill neutral">Source: ${escapeHtml(s.source_mode || 'design_single')}</div>
+          <div class="comparison-pill neutral">Overlap: ${s.uncertainty_interval && s.uncertainty_interval.target_window_overlap != null ? formatMetric(s.uncertainty_interval.target_window_overlap,2) : '—'}</div>
+          <div class="comparison-pill neutral">Saving: ${s.estimated_cement_saving_vs_reference && s.estimated_cement_saving_vs_reference.cement_saving_kg_per_m3 != null ? `${formatMetric(s.estimated_cement_saving_vs_reference.cement_saving_kg_per_m3,2)} kg` : '—'}</div>
+        </div>
         <pre style="white-space:pre-wrap;color:var(--muted)">${escapeHtml(JSON.stringify(s,null,2))}</pre>
       </div>
     `).join('')}</div>`;
@@ -1929,7 +3566,9 @@ function initScrollSpy(){
 
 @app.route("/")
 def index():
-    return render_template_string(HTML)
+    requested_mode = (request.args.get("mode") or "").strip().lower()
+    dashboard_mode = requested_mode if requested_mode in {"normal", "experimental"} else "normal"
+    return render_template_string(HTML, dashboard_mode=dashboard_mode)
 
 if __name__ == "__main__":
     import webbrowser, threading

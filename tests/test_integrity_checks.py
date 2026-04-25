@@ -33,9 +33,9 @@ class IntegrityCheckTests(unittest.TestCase):
             assert_no_cv_label_fraud(
                 {
                     "model_name": "StackingRegressor",
-                    "val_r2": 0.81,
-                    "val_rmse": 3.2,
-                    "val_mae": 2.1,
+                    "validation_r2": 0.81,
+                    "validation_rmse": 3.2,
+                    "validation_mae": 2.1,
                 }
             )
 
@@ -82,16 +82,18 @@ class IntegrityCheckTests(unittest.TestCase):
         )
 
         self.assertIn("cv_metrics", result)
-        self.assertIn("val_metrics", result)
+        self.assertIn("selection_validation", result)
         self.assertIn("cv_r2", result)
         self.assertIn("cv_rmse", result)
         self.assertIn("cv_mae", result)
-        self.assertIn("val_r2", result)
-        self.assertIn("val_rmse", result)
-        self.assertIn("val_mae", result)
+        self.assertIn("validation_r2", result)
+        self.assertIn("validation_rmse", result)
+        self.assertIn("validation_mae", result)
+        self.assertNotIn("val_metrics", result)
+        self.assertNotIn("test_metrics", result)
         assert_no_cv_label_fraud(result)
         self.assertEqual(result["cv_r2"], result["cv_metrics"]["r2"])
-        self.assertEqual(result["val_r2"], result["val_metrics"]["r2"])
+        self.assertEqual(result["validation_r2"], result["selection_validation"]["aggregate"]["r2"])
 
 
 if __name__ == "__main__":

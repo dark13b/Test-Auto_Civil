@@ -6,13 +6,16 @@ import ast
 import copy
 import json
 import math
-import pprint
 import re
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import yaml
+
+from artifact_contracts import artifact_metadata as resolve_artifact_metadata, evaluate_uncertainty_lineage
+from novelty_scorer import NoveltyScorer
+from state_store import JSONStateStore, build_default_lab_state, default_runtime_state_path
 
 
 RESEARCH_SURFACE_STATE_START = "# RESEARCH_SURFACE_STATE_START"
@@ -35,8 +38,20 @@ RESEARCH_RESULTS_COLUMNS = [
     "model_name",
     "display_name",
     "proposal_family",
+    "proposal_source",
+    "proposal_status",
+    "semantic_validation_result",
+    "semantic_validation_error",
+    "semantic_rejection_reason",
+    "proposal_backend",
+    "proposal_model",
+    "prompt_hash",
     "hypothesis",
     "hyperparameters",
+    "confidence",
+    "expected_delta_rmse",
+    "actual_delta_rmse",
+    "calibration_error",
     "selection_status",
     "validation_verdict",
     "error_message",
@@ -44,10 +59,10 @@ RESEARCH_RESULTS_COLUMNS = [
     "mae",
     "r2",
     "composite_score",
-    "test_rmse",
-    "test_mae",
-    "test_r2",
-    "test_composite_score",
+    "validation_rmse",
+    "validation_mae",
+    "validation_r2",
+    "validation_composite_score",
     "validation_pass_rate",
     "failed_count",
     "hard_failed_count",
@@ -66,6 +81,20 @@ class DuplicateExperimentError(ValueError):
     """Raised when LAB_STATE contains duplicate accepted experiment identities."""
 
 
+NOVELTY_ASSERTION_PHRASES = (
+    "not tried",
+    "not been tried",
+    "never tried",
+    "no accepted run",
+    "no prior run",
+    "new setting",
+    "new configuration",
+    "novel",
+    "unseen",
+    "first",
+)
+
+
 def _to_float(value: Any, fallback: float) -> float:
     try:
         return float(value)
@@ -80,6 +109,145 @@ def _to_int(value: Any, fallback: int) -> int:
         return int(fallback)
 
 
+def _normalize_text_for_match(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _text_mentions_any(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _has_numeric_magnitude(text: str) -> bool:
+    return bool(re.search(r"-?\d+(?:\.\d+)?", text))
+
+
+def _proposal_from_archive_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    outcome = _normalize_text_for_match(record.get("outcome"))
+    selection_status = _normalize_text_for_match(record.get("selection_status"))
+    if outcome not in {"accepted", "kept"} and selection_status not in {"accepted", "kept", "new_best"}:
+        if not bool(record.get("accepted", False)):
+            return None
+    proposal = record.get("proposal")
+    if isinstance(proposal, dict) and proposal:
+        return proposal
+    model_name = str(record.get("model_name", "")).strip()
+    params = _extract_trial_params(record)
+    if not model_name:
+        return None
+    return {"model_name": model_name, "params": params}
+
+
+def _candidate_references(
+    *,
+    current_best: dict[str, Any] | None,
+    trial_history: list[dict[str, Any]],
+    memory_payload: dict[str, Any],
+    archive_records: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    references: list[dict[str, Any]] = []
+    for trial in _iter_normalized_trials(trial_history, memory_payload):
+        references.append({"model_name": trial["model_name"], "params": trial["params"]})
+    for record in archive_records or []:
+        if not isinstance(record, dict):
+            continue
+        proposal = _proposal_from_archive_record(record)
+        if proposal is not None:
+            references.append(proposal)
+    if isinstance(current_best, dict):
+        current_best_name = str(current_best.get("model_name", "")).strip()
+        current_best_params = _extract_trial_params(current_best)
+        if current_best_name:
+            references.append({"model_name": current_best_name, "params": current_best_params})
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for proposal in references:
+        signature = build_config_signature(str(proposal.get("model_name", "")), dict(proposal.get("params", {})))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(proposal)
+    return unique
+
+
+def _config_mentions_semantic_details(proposal: dict[str, Any], candidate_config: dict[str, Any]) -> bool:
+    model_name = str(candidate_config.get("model_name", "")).strip().lower()
+    params = candidate_config.get("params", {})
+    if not model_name or not isinstance(params, dict):
+        return False
+    text_blob = " ".join(
+        str(proposal.get(field, ""))
+        for field in (
+            "hypothesis",
+            "rationale",
+            "proposed_change",
+            "target_component",
+            "novelty_claim",
+            "risk_notes",
+        )
+    ).lower()
+    if model_name and model_name.lower() in text_blob:
+        return True
+    for param_name in params:
+        if str(param_name).lower() in text_blob:
+            return True
+    return False
+
+
+def _proposal_text_conflicts_with_config(proposal: dict[str, Any], candidate_config: dict[str, Any]) -> bool:
+    text_blob = " ".join(
+        str(proposal.get(field, ""))
+        for field in (
+            "hypothesis",
+            "rationale",
+            "proposed_change",
+            "target_component",
+            "novelty_claim",
+            "risk_notes",
+        )
+    ).lower()
+    params = candidate_config.get("params", {})
+    if not isinstance(params, dict):
+        return False
+    for param_name, candidate_value in params.items():
+        param_text = re.escape(str(param_name).lower())
+        if isinstance(candidate_value, bool):
+            continue
+        if isinstance(candidate_value, (int, float)) and not isinstance(candidate_value, bool):
+            pattern = re.compile(rf"{param_text}\D{{0,24}}(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+            match = pattern.search(text_blob)
+            if match is None:
+                continue
+            try:
+                text_value = float(match.group(1))
+            except ValueError:
+                continue
+            if abs(text_value - float(candidate_value)) > max(1e-9, abs(float(candidate_value)) * 0.01):
+                return True
+        else:
+            pattern = re.compile(rf"{param_text}\D{{0,24}}([a-z0-9_.-]+)", re.IGNORECASE)
+            match = pattern.search(text_blob)
+            if match is None:
+                continue
+            if _normalize_text_for_match(match.group(1)) != _normalize_text_for_match(candidate_value):
+                return True
+    return False
+
+
+def _metric_direction_supports_improvement(expected_metric_effect: dict[str, Any], expected_direction: str) -> bool:
+    metric = _normalize_text_for_match(expected_metric_effect.get("metric"))
+    direction = _normalize_text_for_match(expected_metric_effect.get("direction"))
+    direction = direction or _normalize_text_for_match(expected_direction)
+    if any(token in metric for token in ("rmse", "mae", "mse", "loss", "error")):
+        return direction == "down"
+    if any(token in metric for token in ("accuracy", "score", "r2", "auc", "f1")):
+        return direction == "up"
+    return True
+
+
+def _novelty_claim_asserts_novelty(novelty_claim: str) -> bool:
+    return _text_mentions_any(_normalize_text_for_match(novelty_claim), NOVELTY_ASSERTION_PHRASES)
+
+
 def _to_serializable(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _to_serializable(inner) for key, inner in value.items()}
@@ -91,12 +259,7 @@ def _to_serializable(value: Any) -> Any:
 
 
 def _artifact_metadata(payload: dict[str, Any]) -> dict[str, Any]:
-    raw_metadata = payload.get("artifact_metadata", {})
-    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
-    for key in ("run_id", "artifact_id", "model_artifact_id", "source_mode", "timestamp"):
-        if key not in metadata and key in payload:
-            metadata[key] = payload[key]
-    return metadata
+    return resolve_artifact_metadata(payload)
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -190,7 +353,7 @@ def load_human_research_brief(path: Path) -> dict[str, Any]:
 
 def _empty_memory() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "accepted_experiments": [],
         "runs": [],
     }
@@ -212,8 +375,8 @@ def load_or_initialize_experiment_memory(memory_path: Path) -> dict[str, Any]:
         payload["runs"] = []
     if "accepted_experiments" not in payload or not isinstance(payload.get("accepted_experiments"), list):
         payload["accepted_experiments"] = []
-    if "schema_version" not in payload:
-        payload["schema_version"] = 2
+    if int(payload.get("schema_version", 0) or 0) < 3:
+        payload["schema_version"] = 3
     return payload
 
 
@@ -263,8 +426,20 @@ def record_experiment_memory(memory_path: Path, run_id: str, trial_record: dict[
             "selection_status": trial_record.get("selection_status"),
             "validation_verdict": trial_record.get("validation_verdict"),
             "composite_score": trial_record.get("composite_score"),
+            "rmse": trial_record.get("rmse"),
+            "validation_rmse": trial_record.get("validation_rmse", trial_record.get("val_rmse", trial_record.get("test_rmse"))),
             "scout_improvement_pct": trial_record.get("scout_improvement_pct"),
             "confirm_improvement_pct": trial_record.get("confirm_improvement_pct"),
+            "novelty_score": trial_record.get("novelty_score"),
+            "expected_delta_rmse": trial_record.get("expected_delta_rmse"),
+            "actual_delta_rmse": trial_record.get("actual_delta_rmse"),
+            "calibration_error": trial_record.get("calibration_error"),
+            "hard_fail_reasons": list(trial_record.get("hard_fail_reasons", [])),
+            "hard_constraint_reasons": list(trial_record.get("hard_constraint_reasons", [])),
+            "engineering_caution_reasons": list(trial_record.get("engineering_caution_reasons", [])),
+            "data_review_flag_reasons": list(trial_record.get("data_review_flag_reasons", [])),
+            "dataset_anomaly_reasons": list(trial_record.get("dataset_anomaly_reasons", [])),
+            "warn_reasons": list(trial_record.get("warn_reasons", [])),
             "signature": [signature[0], signature[1]],
         }
     )
@@ -513,6 +688,9 @@ def gate_proposal(
                 "code": "malformed_or_incomplete",
                 "message": "Proposal params are incomplete for the selected model family.",
             },
+            "novelty_score": 0.0,
+            "max_similarity": 1.0,
+            "closest_match": None,
         }
     if any(param_name not in search_space for param_name in params):
         return {
@@ -522,8 +700,17 @@ def gate_proposal(
                 "code": "malformed_or_incomplete",
                 "message": "Proposal contains parameters outside the allowed search space.",
             },
+            "novelty_score": 0.0,
+            "max_similarity": 1.0,
+            "closest_match": None,
         }
 
+    novelty_threshold = float(duplicate_settings.get("novelty_gate_threshold", 0.20))
+    novelty_result = NoveltyScorer(threshold=novelty_threshold).score_proposal(
+        proposal={"model_name": model_name, "params": params},
+        history=_iter_normalized_trials(trial_history, memory_payload),
+        available_models=available_models,
+    )
     signature = build_config_signature(model_name, params)
     if should_skip_duplicate_proposal(
         model_name=model_name,
@@ -539,6 +726,9 @@ def gate_proposal(
                 "message": "Proposal exactly matches a recent or historic configuration.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -571,6 +761,9 @@ def gate_proposal(
                 "message": "Proposal stays too close to recent runs from a saturated family.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -583,6 +776,9 @@ def gate_proposal(
                 "message": "Proposal is too similar to a recent configuration.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -595,6 +791,9 @@ def gate_proposal(
                 "message": "Weak recent evidence does not justify another similar run for this family.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -607,6 +806,9 @@ def gate_proposal(
                 "message": "This family is temporarily blocked unless the proposal is materially different.",
                 "model_name": model_name,
             },
+            "novelty_score": float(novelty_result["novelty_score"]),
+            "max_similarity": float(novelty_result["max_similarity"]),
+            "closest_match": novelty_result.get("closest_match"),
             "signature": signature,
         }
 
@@ -614,7 +816,212 @@ def gate_proposal(
         "accepted": True,
         "duplicate_rejected": False,
         "reason": None,
+        "novelty_score": float(novelty_result["novelty_score"]),
+        "max_similarity": float(novelty_result["max_similarity"]),
+        "closest_match": novelty_result.get("closest_match"),
         "signature": signature,
+    }
+
+
+def gate_research_proposal(
+    *,
+    proposal: dict[str, Any],
+    available_models: dict[str, dict[str, Any]],
+    current_run_signatures: set[tuple[str, str]],
+    memory_payload: dict[str, Any],
+    trial_history: list[dict[str, Any]],
+    family_state: dict[str, Any],
+    duplicate_settings: dict[str, Any],
+    current_best: dict[str, Any] | None = None,
+    archive_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    candidate_config = proposal.get("candidate_config")
+    if not isinstance(candidate_config, dict):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "non_executable_semantic_config",
+                "message": "candidate_config must be an executable object with model_name and params.",
+            },
+        }
+
+    model_name = str(candidate_config.get("model_name", "")).strip()
+    params = candidate_config.get("params")
+    if not model_name or model_name not in available_models or not isinstance(params, dict):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "non_executable_semantic_config",
+                "message": "candidate_config does not target an allowed executable model family.",
+                "model_name": model_name or None,
+            },
+        }
+    if not params:
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "semantically_invalid_candidate_config",
+                "message": "candidate_config is executable but does not propose any actual parameter change.",
+                "model_name": model_name,
+            },
+        }
+
+    novelty_claim = str(proposal.get("novelty_claim", ""))
+    references = _candidate_references(
+        current_best=current_best,
+        trial_history=trial_history,
+        memory_payload=memory_payload,
+        archive_records=archive_records,
+    )
+    candidate_signature = build_config_signature(model_name, params)
+    novelty_claim_asserts_novelty = _novelty_claim_asserts_novelty(novelty_claim)
+    for reference in references:
+        reference_model = str(reference.get("model_name", "")).strip()
+        reference_params = dict(reference.get("params", {}))
+        if not reference_model or reference_model != model_name:
+            continue
+        reference_signature = build_config_signature(reference_model, reference_params)
+        if candidate_signature == reference_signature:
+            code = "unsupported_novelty_claim" if novelty_claim_asserts_novelty else "duplicate_proposal"
+            message = (
+                "novelty_claim contradicts an already-tried configuration."
+                if code == "unsupported_novelty_claim"
+                else "Proposal exactly matches a recent or historic configuration."
+            )
+            return {
+                "accepted": False,
+                "duplicate_rejected": True,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": code,
+                    "message": message,
+                    "model_name": model_name,
+                },
+            }
+        if proposals_are_near_duplicates(
+            model_name=model_name,
+            candidate_params=params,
+            reference_params=reference_params,
+            available_models=available_models,
+            duplicate_settings=duplicate_settings,
+        ):
+            code = "unsupported_novelty_claim" if novelty_claim_asserts_novelty else "near_duplicate_proposal"
+            message = (
+                "novelty_claim contradicts an effectively identical archived configuration."
+                if code == "unsupported_novelty_claim"
+                else "Proposal is too similar to a recent configuration."
+            )
+            return {
+                "accepted": False,
+                "duplicate_rejected": True,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": code,
+                    "message": message,
+                    "model_name": model_name,
+                },
+            }
+
+    if _proposal_text_conflicts_with_config(proposal, candidate_config):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "inconsistent_expected_effect",
+                "message": "The written hypothesis conflicts with the executable candidate_config.",
+                "model_name": model_name,
+            },
+        }
+
+    expected_metric_effect = proposal.get("expected_metric_effect", {})
+    expected_direction = str(proposal.get("expected_direction", "")).strip().lower()
+    if isinstance(expected_metric_effect, dict) and expected_direction in {"improve", "worsen_risk"}:
+        if not _has_numeric_magnitude(str(expected_metric_effect.get("magnitude_estimate", ""))):
+            return {
+                "accepted": False,
+                "duplicate_rejected": False,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": "inconsistent_expected_effect",
+                    "message": "Expected improvement must include a bounded numeric magnitude estimate.",
+                    "model_name": model_name,
+                },
+            }
+        if not _metric_direction_supports_improvement(expected_metric_effect, expected_direction):
+            return {
+                "accepted": False,
+                "duplicate_rejected": False,
+                "semantic_validation_result": "failed",
+                "semantic_rejection_reason": {
+                    "code": "inconsistent_expected_effect",
+                    "message": "expected_metric_effect direction conflicts with the claimed outcome.",
+                    "model_name": model_name,
+                },
+            }
+
+    if not _config_mentions_semantic_details(proposal, candidate_config):
+        return {
+            "accepted": False,
+            "duplicate_rejected": False,
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": {
+                "code": "semantically_invalid_candidate_config",
+                "message": "The narrative does not mention the executable config or any changed parameters.",
+                "model_name": model_name,
+            },
+        }
+
+    gate_result = gate_proposal(
+        proposal={"model_name": model_name, "params": params},
+        available_models=available_models,
+        current_run_signatures=current_run_signatures,
+        memory_payload=memory_payload,
+        trial_history=trial_history,
+        family_state=family_state,
+        duplicate_settings=duplicate_settings,
+    )
+    if not gate_result.get("accepted", False):
+        reason = dict(gate_result.get("reason") or {})
+        code = str(reason.get("code", "semantic_rejection"))
+        if code == "exact_duplicate":
+            code = "duplicate_proposal"
+            reason["code"] = code
+            reason["message"] = "Proposal exactly matches a recent or historic configuration."
+        elif code == "near_duplicate":
+            code = "near_duplicate_proposal"
+            reason["code"] = code
+            reason["message"] = "Proposal is too similar to a recent configuration."
+        else:
+            reason["code"] = code
+        return {
+            "accepted": False,
+            "duplicate_rejected": bool(gate_result.get("duplicate_rejected", False)),
+            "semantic_validation_result": "failed",
+            "semantic_rejection_reason": reason,
+            "reason": reason,
+            "novelty_score": gate_result.get("novelty_score"),
+            "max_similarity": gate_result.get("max_similarity"),
+            "closest_match": gate_result.get("closest_match"),
+            "signature": gate_result.get("signature"),
+        }
+
+    return {
+        "accepted": True,
+        "duplicate_rejected": False,
+        "semantic_validation_result": "passed",
+        "semantic_rejection_reason": None,
+        "reason": None,
+        "novelty_score": gate_result.get("novelty_score"),
+        "max_similarity": gate_result.get("max_similarity"),
+        "closest_match": gate_result.get("closest_match"),
+        "signature": gate_result.get("signature"),
     }
 
 
@@ -665,7 +1072,22 @@ def trial_budget_status(*, elapsed_seconds: float, max_trial_seconds: float) -> 
 
 
 def read_research_surface_state(research_lab_path: Path) -> dict[str, Any]:
-    """Read the mutable LAB_STATE block from research_lab.py."""
+    """Read runtime research state from the persisted store, migrating legacy LAB_STATE when needed."""
+    state = _get_research_state_store(research_lab_path).load_or_migrate(
+        legacy_path=research_lab_path,
+        legacy_loader=_read_legacy_research_surface_state,
+        default_state=build_default_lab_state(),
+    )
+    validate_lab_state_integrity(state)
+    return state
+
+
+def _get_research_state_store(research_lab_path: Path) -> JSONStateStore:
+    return JSONStateStore(default_runtime_state_path(research_lab_path.parent))
+
+
+def _read_legacy_research_surface_state(research_lab_path: Path) -> dict[str, Any]:
+    """Read the legacy checked-in LAB_STATE block from research_lab.py."""
     raw_text = research_lab_path.read_text(encoding="utf-8")
     pattern = re.compile(
         rf"{re.escape(RESEARCH_SURFACE_STATE_START)}\n(?P<body>.*?)\n{re.escape(RESEARCH_SURFACE_STATE_END)}",
@@ -686,22 +1108,12 @@ def read_research_surface_state(research_lab_path: Path) -> dict[str, Any]:
 
 
 def write_research_surface_state(research_lab_path: Path, state: dict[str, Any]) -> None:
-    """Rewrite the mutable LAB_STATE block inside research_lab.py."""
-    raw_text = research_lab_path.read_text(encoding="utf-8")
-    state_literal = pprint.pformat(_to_serializable(state), sort_dicts=True, width=100)
-    replacement = (
-        f"{RESEARCH_SURFACE_STATE_START}\n"
-        f"LAB_STATE = {state_literal}\n"
-        f"{RESEARCH_SURFACE_STATE_END}"
+    """Persist runtime research state without rewriting source files."""
+    validate_lab_state_integrity(state)
+    _get_research_state_store(research_lab_path).save_state(
+        copy.deepcopy(state),
+        migrated_from=str(research_lab_path) if research_lab_path.exists() else None,
     )
-    pattern = re.compile(
-        rf"{re.escape(RESEARCH_SURFACE_STATE_START)}\n.*?\n{re.escape(RESEARCH_SURFACE_STATE_END)}",
-        flags=re.DOTALL,
-    )
-    updated_text, replacements = pattern.subn(replacement, raw_text, count=1)
-    if replacements != 1:
-        raise ValueError(f"Failed to rewrite LAB_STATE block in {research_lab_path}")
-    research_lab_path.write_text(updated_text, encoding="utf-8")
 
 
 def validate_lab_state_integrity(lab_state: dict[str, Any]) -> dict[str, Any]:
@@ -768,11 +1180,10 @@ def apply_keep_to_research_surface(research_lab_path: Path, accepted_entry: dict
 
 
 def build_acceptance_decision(final_metrics: dict[str, Any], brief: dict[str, Any]) -> dict[str, Any]:
-    """Build a final acceptance decision from final_metrics.json and brief thresholds."""
+    """Build a final acceptance decision from the canonical search-selection artifact."""
     minimum_improvement_pct = _to_float(brief.get("min_improvement_pct"), 0.0)
     improvement_pct = _to_float(final_metrics.get("composite_improvement_pct"), 0.0)
-    best_metrics = final_metrics.get("best_search_metrics", {})
-    best_model_name = str(best_metrics.get("model_name", "unknown")) if isinstance(best_metrics, dict) else "unknown"
+    best_model_name = str(final_metrics.get("model_name", "unknown"))
     final_metrics_metadata = _artifact_metadata(final_metrics)
     stale_inputs = bool(final_metrics_metadata.get("stale", False))
 
@@ -787,7 +1198,7 @@ def build_acceptance_decision(final_metrics: dict[str, Any], brief: dict[str, An
         )
     )
     return {
-        "source_of_truth": "final_metrics.json",
+        "source_of_truth": "best_search_result.json",
         "run_id": final_metrics_metadata.get("run_id", final_metrics.get("run_id")),
         "source_mode": "acceptance",
         "acceptance_metric": str(brief.get("acceptance_metric", "composite_score")),
@@ -800,95 +1211,13 @@ def build_acceptance_decision(final_metrics: dict[str, Any], brief: dict[str, An
 
 
 def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
-    """Validate that final artifacts agree with final_metrics.json as source of truth."""
-    final_metrics = load_json_file(outputs_dir / "final_metrics.json")
-    best_search_metrics = final_metrics.get("best_search_metrics", {})
-    if not isinstance(best_search_metrics, dict) or not best_search_metrics:
-        raise ValueError("final_metrics.json must contain best_search_metrics.")
+    """Validate that selection and terminal evaluation artifacts agree on the chosen model."""
+    best_result = load_json_file(outputs_dir / "best_search_result.json")
+    if not isinstance(best_result, dict) or not best_result:
+        raise ValueError("best_search_result.json must contain the canonical search-selection artifact.")
 
     mismatches: list[dict[str, Any]] = []
-    final_metrics_metadata = _artifact_metadata(final_metrics)
-    best_metrics_metadata = _artifact_metadata(best_search_metrics)
-    best_result_path = outputs_dir / "best_search_result.json"
-    if best_result_path.exists():
-        best_result = load_json_file(best_result_path)
-        best_result_metadata = _artifact_metadata(best_result)
-        for key in ("model_name", "hyperparameters", "composite_score", "validation_verdict"):
-            if _to_serializable(best_result.get(key)) != _to_serializable(best_search_metrics.get(key)):
-                mismatches.append(
-                    {
-                        "artifact": "best_search_result.json",
-                        "field": key,
-                        "expected": best_search_metrics.get(key),
-                        "actual": best_result.get(key),
-                    }
-                )
-        for key, expected_value, actual_value in (
-            ("run_id", best_metrics_metadata.get("run_id"), best_result_metadata.get("run_id")),
-            (
-                "model_artifact_id",
-                best_metrics_metadata.get("model_artifact_id"),
-                best_result_metadata.get("model_artifact_id"),
-            ),
-        ):
-            if expected_value != actual_value:
-                mismatches.append(
-                    {
-                        "artifact": "best_search_result.json",
-                        "field": key,
-                        "expected": expected_value,
-                        "actual": actual_value,
-                    }
-                )
-    else:
-        mismatches.append(
-            {
-                "artifact": "best_search_result.json",
-                "field": "exists",
-                "expected": True,
-                "actual": False,
-            }
-        )
-
-    if final_metrics.get("best_model_name") != best_search_metrics.get("model_name"):
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "best_model_name",
-                "expected": best_search_metrics.get("model_name"),
-                "actual": final_metrics.get("best_model_name"),
-            }
-        )
-    if _to_serializable(final_metrics.get("best_model_hyperparameters")) != _to_serializable(
-        best_search_metrics.get("hyperparameters")
-    ):
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "best_model_hyperparameters",
-                "expected": best_search_metrics.get("hyperparameters"),
-                "actual": final_metrics.get("best_model_hyperparameters"),
-            }
-        )
-    if final_metrics.get("validation_verdict") != best_search_metrics.get("validation_verdict"):
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "validation_verdict",
-                "expected": best_search_metrics.get("validation_verdict"),
-                "actual": final_metrics.get("validation_verdict"),
-            }
-        )
-    if final_metrics_metadata.get("run_id") not in {None, best_metrics_metadata.get("run_id")}:
-        mismatches.append(
-            {
-                "artifact": "final_metrics.json",
-                "field": "run_id",
-                "expected": best_metrics_metadata.get("run_id"),
-                "actual": final_metrics_metadata.get("run_id"),
-            }
-        )
-
+    best_result_metadata = _artifact_metadata(best_result)
     model_path = outputs_dir / "best_search_model.pkl"
     if not model_path.exists():
         mismatches.append(
@@ -900,8 +1229,74 @@ def validate_final_artifact_consistency(outputs_dir: Path) -> dict[str, Any]:
             }
         )
 
+    final_holdout_path = outputs_dir / "final_holdout_evaluation.json"
+    if final_holdout_path.exists():
+        final_holdout = load_json_file(final_holdout_path)
+        selected_model = final_holdout.get("selected_model", {})
+        final_holdout_metadata = _artifact_metadata(final_holdout)
+        for key in ("model_name", "hyperparameters", "composite_score", "validation_verdict"):
+            if _to_serializable(selected_model.get(key)) != _to_serializable(best_result.get(key)):
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": f"selected_model.{key}",
+                        "expected": best_result.get(key),
+                        "actual": selected_model.get(key),
+                    }
+                )
+        for key, expected_value, actual_value in (
+            ("run_id", best_result_metadata.get("run_id"), final_holdout_metadata.get("run_id")),
+            (
+                "model_artifact_id",
+                best_result_metadata.get("model_artifact_id"),
+                final_holdout_metadata.get("model_artifact_id"),
+            ),
+        ):
+            if expected_value != actual_value:
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": key,
+                        "expected": expected_value,
+                        "actual": actual_value,
+                    }
+                )
+        uncertainty_audit = final_holdout.get("uncertainty_audit")
+        if isinstance(uncertainty_audit, dict):
+            uncertainty_lineage = evaluate_uncertainty_lineage(
+                uncertainty_audit,
+                expected_lineage={
+                    "run_id": best_result_metadata.get("run_id"),
+                    "model_artifact_id": best_result_metadata.get("model_artifact_id"),
+                    "model_id": best_result_metadata.get("model_id") or best_result.get("model_name"),
+                    "model_fingerprint": best_result_metadata.get("model_fingerprint")
+                    or best_result_metadata.get("model_artifact_id")
+                    or best_result.get("model_name"),
+                    "config_hash": best_result_metadata.get("config_hash"),
+                },
+                fallback_model_id=str(best_result.get("model_name", "")).strip() or None,
+            )
+            for item in uncertainty_lineage["mismatches"]:
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": f"uncertainty_audit.{item['field']}",
+                        "expected": item["expected"],
+                        "actual": item["actual"],
+                    }
+                )
+            for field in uncertainty_lineage["missing_fields"]:
+                mismatches.append(
+                    {
+                        "artifact": "final_holdout_evaluation.json",
+                        "field": f"uncertainty_audit.{field}",
+                        "expected": best_result_metadata.get(field),
+                        "actual": None,
+                    }
+                )
+
     return {
-        "source_of_truth": "final_metrics.json",
+        "source_of_truth": "best_search_result.json",
         "consistent": not mismatches,
         "mismatches": mismatches,
     }
