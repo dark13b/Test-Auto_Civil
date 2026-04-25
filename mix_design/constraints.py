@@ -114,11 +114,11 @@ def apply_target_strength_bounds(constraints: DesignConstraints, target_strength
     if target_strength < 30.0:
         cement_bounds = (100.0, 260.0)
         water_bounds = (150.0, 210.0)
-        water_cement_max = 1.45
+        water_cement_max = 0.72
     elif target_strength <= 35.0:
         cement_bounds = (110.0, 280.0)
         water_bounds = (145.0, 210.0)
-        water_cement_max = 1.25
+        water_cement_max = 0.65
     elif target_strength <= 45.0:
         cement_bounds = (140.0, 300.0)
         water_bounds = (140.0, 210.0)
