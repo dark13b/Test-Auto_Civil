@@ -160,6 +160,7 @@ class ObjectiveScorecard:
     total_score: float
     components: tuple[ObjectiveComponentScore, ...]
     rank_explanation: tuple[str, ...]
+    guardrail_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
