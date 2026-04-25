@@ -376,6 +376,31 @@ class MixObjectiveEngine:
         )
         explanations.append(f"engineering_quality contributed {raw_value:.2f} as a mandatory safety ranking term.")
 
+        guardrail_penalty, guardrail_warnings = self._score_scientific_guardrails(
+            mix_design=mix_design,
+            prediction=prediction,
+            validator=validator,
+            design_constraints=design_constraints,
+        )
+        guardrail_explanation = (
+            f"scientific_guardrails: {len(guardrail_warnings)} warning(s), penalty={guardrail_penalty:.2f}. "
+            + (" | ".join(guardrail_warnings) if guardrail_warnings else "No guardrails fired.")
+        )
+        components.append(
+            ObjectiveComponentScore(
+                name="scientific_guardrails",
+                weight=1.0,
+                raw_value=float(guardrail_penalty),
+                weighted_score=float(guardrail_penalty),
+                explanation=guardrail_explanation,
+            )
+        )
+        if guardrail_warnings:
+            explanations.extend(f"[guardrail] {w}" for w in guardrail_warnings)
+        explanations.append(
+            f"scientific_guardrails contributed {guardrail_penalty:.2f} as a mandatory safety ranking term."
+        )
+
         total_score = float(sum(component.weighted_score for component in components))
         if explanations:
             explanations.append(f"Total weighted score is {total_score:.2f}. Lower scores rank better.")
@@ -384,6 +409,7 @@ class MixObjectiveEngine:
             total_score=total_score,
             components=tuple(components),
             rank_explanation=rank_explanation,
+            guardrail_warnings=guardrail_warnings,
         )
 
     @staticmethod

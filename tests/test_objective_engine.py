@@ -74,14 +74,15 @@ class ObjectiveEngineTests(unittest.TestCase):
 
         self.assertEqual(
             [component.name for component in scorecard.components],
-            ["target_fit", "cement_penalty", "co2_proxy", "validator_risk", "engineering_quality"],
+            ["target_fit", "cement_penalty", "co2_proxy", "validator_risk", "engineering_quality", "scientific_guardrails"],
         )
         self.assertTrue(all(component.explanation for component in scorecard.components))
         self.assertAlmostEqual(
             scorecard.total_score,
             sum(component.weighted_score for component in scorecard.components),
         )
-        self.assertIn("water/cement", scorecard.components[-1].explanation)
+        eq_component = next(c for c in scorecard.components if c.name == "engineering_quality")
+        self.assertIn("water/cement", eq_component.explanation)
 
     def test_validator_risk_scores_fail_higher_than_warn(self) -> None:
         engine = MixObjectiveEngine()
@@ -126,10 +127,11 @@ class ObjectiveEngineTests(unittest.TestCase):
 
         self.assertEqual(
             [component.name for component in scorecard.components],
-            ["strength_fit", "cost_proxy", "engineering_quality"],
+            ["strength_fit", "cost_proxy", "engineering_quality", "scientific_guardrails"],
         )
-        self.assertEqual(scorecard.components[1].raw_value, 150.0)
-        self.assertIn("water", scorecard.components[1].explanation.lower())
+        cost_component = next(c for c in scorecard.components if c.name == "cost_proxy")
+        self.assertEqual(cost_component.raw_value, 150.0)
+        self.assertIn("water", cost_component.explanation.lower())
 
     def test_engineering_quality_penalizes_constraint_uncertainty_and_validator_risk(self) -> None:
         engine = MixObjectiveEngine()

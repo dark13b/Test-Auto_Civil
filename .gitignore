@@ -47,3 +47,4 @@ build/
 
 # Keep intentional tracked data/docs only
 data/concrete_data.csv
+.gitnexus
