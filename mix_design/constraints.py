@@ -125,7 +125,7 @@ def apply_target_strength_bounds(constraints: DesignConstraints, target_strength
         water_cement_max = 0.55
     else:
         cement_bounds = (280.0, 500.0)
-        water_bounds = (150.0, 200.0)
+        water_bounds = (125.0, 185.0)
         water_cement_max = 0.45
 
     cement = RangeConstraint(
