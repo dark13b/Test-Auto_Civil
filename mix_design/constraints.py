@@ -139,10 +139,9 @@ def apply_target_strength_bounds(constraints: DesignConstraints, target_strength
         fixed=constraints.water.fixed,
     )
     existing_max = constraints.water_cement_ratio.max
-    bounded_max = (
-        max(existing_max if existing_max is not None else water_cement_max, water_cement_max)
-        if target_strength <= 35.0
-        else min(existing_max if existing_max is not None else water_cement_max, water_cement_max)
+    bounded_max = min(
+        existing_max if existing_max is not None else water_cement_max,
+        water_cement_max,
     )
     water_cement_ratio = replace(constraints.water_cement_ratio, max=bounded_max)
 
