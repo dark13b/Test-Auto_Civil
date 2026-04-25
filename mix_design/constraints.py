@@ -173,6 +173,22 @@ def ensure_default_age_constraint(constraints: DesignConstraints, default_age_da
     )
 
 
+def _assert_water_wcr_feasibility(constraints: DesignConstraints) -> None:
+    """Raise if water_min > cement_max * wcr_max — an optimizer-invisible infeasibility."""
+    wcr_max = constraints.water_cement_ratio.max
+    water_min = constraints.water.min
+    cement_max = constraints.cement.max
+    if wcr_max is None or water_min is None or cement_max is None:
+        return
+    max_achievable_water = float(cement_max) * float(wcr_max)
+    if float(water_min) > max_achievable_water + 1e-6:
+        raise ValueError(
+            f"Infeasible water/W/C constraint: water_min={water_min} kg/m\u00b3 exceeds "
+            f"cement_max({cement_max}) * wcr_max({wcr_max}) = {max_achievable_water:.1f} kg/m\u00b3. "
+            "Reduce water_min or relax the W/C ceiling."
+        )
+
+
 def prepare_design_constraints(
     config: Mapping[str, Any],
     *,
@@ -192,6 +208,7 @@ def prepare_design_constraints(
 
     merged = merge_design_constraints(default_constraints, typed_overrides)
     bounded = apply_target_strength_bounds(merged, target_strength_mpa=float(target_strength_mpa))
+    _assert_water_wcr_feasibility(bounded)
     return ensure_default_age_constraint(
         bounded,
         float(config["engineering"]["design_tool"]["default_age_days"]),
