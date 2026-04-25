@@ -241,10 +241,20 @@ class ConcreteMixDesignService:
             raw_report=dict(sample_report),
         )
 
+    @staticmethod
+    def _has_durability_warning(scenario: CandidateScenario) -> bool:
+        """True when any fired rule is a durability-class engineering caution."""
+        triggered = scenario.validator.raw_report.get("triggered_rules", [])
+        return any(
+            str(code).startswith("durability_") or str(code) == "low_binder_durability_caution"
+            for code in triggered
+        )
+
     def _scenario_success(self, scenario: CandidateScenario, request: MixDesignRequest) -> bool:
         return (
             scenario.constraints.passed
             and scenario.validator.overall_verdict != "FAIL"
+            and not self._has_durability_warning(scenario)
             and float(scenario.prediction.uncertainty_interval.target_window_overlap) > 0.0
         )
 
@@ -261,8 +271,20 @@ class ConcreteMixDesignService:
             penalty += 100000.0 * len(scenario.constraints.hard_failures)
         if scenario.validator.overall_verdict == "FAIL":
             penalty += 1000000.0
+        elif scenario.validator.overall_verdict == "WARN":
+            penalty += 2500.0
+        penalty += float(len(scenario.validator.engineering_cautions) * 750.0)
+        penalty += float(len(scenario.validator.data_review_flags) * 500.0)
+        water_cement_ratio = scenario.prediction.engineered_features.get("water_cement_ratio")
+        water_cement_max = request.constraints.water_cement_ratio.max
+        if water_cement_ratio is not None and water_cement_max is not None:
+            ratio = float(water_cement_ratio)
+            ceiling = max(float(water_cement_max), 1e-6)
+            if ratio > ceiling:
+                penalty += ((ratio - ceiling) / ceiling) * 100000.0
         if float(scenario.prediction.uncertainty_interval.target_window_overlap) <= 0.0:
             penalty += float(scenario.prediction.uncertainty_interval.interval_width) * 150.0
+        penalty += float(scenario.prediction.uncertainty_interval.interval_width) * 25.0
         return penalty
 
     def _evaluate_proposal(
