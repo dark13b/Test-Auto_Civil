@@ -16,6 +16,18 @@ from mix_design.contracts import (
     ValidatorOutcome,
 )
 
+# ---------------------------------------------------------------------------
+# Scientific guardrail MVP defaults
+# Centralised here so they can be adjusted without hunting through scoring logic.
+# These apply only when config-sourced constraints are unavailable.
+# ---------------------------------------------------------------------------
+_GUARDRAIL_WC_FALLBACK_MAX: float = 0.70  # absolute W/C ceiling if no config value
+_GUARDRAIL_WC_ABOVE_CEILING_FACTOR: float = 600.0  # penalty = excess_fraction * factor
+_GUARDRAIL_BOUNDS_PENALTY_PER_UNIT: float = 2.0  # penalty per kg/m³ outside cement/water bounds
+_GUARDRAIL_FAIL_VERDICT_PENALTY: float = 700.0  # extra penalty on FAIL (supplements engineering_quality)
+_GUARDRAIL_WIDE_INTERVAL_RATIO: float = 3.0  # width/tolerance > this → "very wide"
+_GUARDRAIL_WIDE_INTERVAL_PENALTY: float = 200.0
+
 
 @dataclass
 class MixObjectiveEngine:
@@ -196,6 +208,110 @@ class MixObjectiveEngine:
             f"constructability={constructability_penalty:.2f}."
         )
         return raw_value, explanation
+
+    def _score_scientific_guardrails(
+        self,
+        *,
+        mix_design: dict[str, float],
+        prediction: PredictionResult,
+        validator: ValidatorOutcome,
+        design_constraints: DesignConstraints,
+    ) -> tuple[float, tuple[str, ...]]:
+        """Evaluate 6 scientific guardrails; return (penalty, warning_strings).
+
+        Guardrails are additive ranking penalties with human-readable warnings.
+        They do not remove candidates — they push unsafe/unrealistic mixes down.
+        """
+        penalty = 0.0
+        warnings: list[str] = []
+
+        # --- Guardrail 1: W/C ratio above configured ceiling ---
+        wc_ratio = prediction.engineered_features.get("water_cement_ratio")
+        wc_ceiling = (
+            float(design_constraints.water_cement_ratio.max)
+            if design_constraints.water_cement_ratio.max is not None
+            else _GUARDRAIL_WC_FALLBACK_MAX
+        )
+        if wc_ratio is not None:
+            ratio = float(wc_ratio)
+            if ratio > wc_ceiling:
+                excess_fraction = (ratio - wc_ceiling) / max(wc_ceiling, 1e-6)
+                wc_penalty = excess_fraction * _GUARDRAIL_WC_ABOVE_CEILING_FACTOR
+                penalty += wc_penalty
+                warnings.append(
+                    f"W/C ratio {ratio:.3f} exceeds configured ceiling {wc_ceiling:.3f} "
+                    f"(excess {excess_fraction*100:.1f}%, penalty +{wc_penalty:.1f})."
+                )
+
+        # --- Guardrail 2: cement outside configured bounds ---
+        cement = float(mix_design.get("cement", 0.0))
+        cement_min = design_constraints.cement.min
+        cement_max = design_constraints.cement.max
+        if cement_min is not None and cement < cement_min:
+            shortfall = cement_min - cement
+            c_penalty = shortfall * _GUARDRAIL_BOUNDS_PENALTY_PER_UNIT
+            penalty += c_penalty
+            warnings.append(
+                f"Cement {cement:.1f} kg/m³ is below configured minimum {cement_min:.1f} kg/m³ "
+                f"(shortfall {shortfall:.1f} kg/m³, penalty +{c_penalty:.1f})."
+            )
+        elif cement_max is not None and cement > cement_max:
+            excess = cement - cement_max
+            c_penalty = excess * _GUARDRAIL_BOUNDS_PENALTY_PER_UNIT
+            penalty += c_penalty
+            warnings.append(
+                f"Cement {cement:.1f} kg/m³ exceeds configured maximum {cement_max:.1f} kg/m³ "
+                f"(excess {excess:.1f} kg/m³, penalty +{c_penalty:.1f})."
+            )
+
+        # --- Guardrail 3: water content outside configured bounds ---
+        water = float(mix_design.get("water", 0.0))
+        water_min = design_constraints.water.min
+        water_max = design_constraints.water.max
+        if water_min is not None and water < water_min:
+            shortfall = water_min - water
+            w_penalty = shortfall * _GUARDRAIL_BOUNDS_PENALTY_PER_UNIT
+            penalty += w_penalty
+            warnings.append(
+                f"Water {water:.1f} kg/m³ is below configured minimum {water_min:.1f} kg/m³ "
+                f"(shortfall {shortfall:.1f} kg/m³, penalty +{w_penalty:.1f})."
+            )
+        elif water_max is not None and water > water_max:
+            excess = water - water_max
+            w_penalty = excess * _GUARDRAIL_BOUNDS_PENALTY_PER_UNIT
+            penalty += w_penalty
+            warnings.append(
+                f"Water {water:.1f} kg/m³ exceeds configured maximum {water_max:.1f} kg/m³ "
+                f"(excess {excess:.1f} kg/m³, penalty +{w_penalty:.1f})."
+            )
+
+        # --- Guardrail 4: FAIL validator verdict ---
+        if str(validator.overall_verdict) == "FAIL":
+            penalty += _GUARDRAIL_FAIL_VERDICT_PENALTY
+            reason_summary = (
+                "; ".join(str(r) for r in validator.failure_reasons)
+                if validator.failure_reasons
+                else "see validator report"
+            )
+            warnings.append(
+                f"Validator verdict is FAIL — this mix does not meet engineering requirements "
+                f"({reason_summary}). Penalty +{_GUARDRAIL_FAIL_VERDICT_PENALTY:.0f}."
+            )
+
+        # --- Guardrail 5: very wide uncertainty interval ---
+        tolerance = max(float(design_constraints.tolerance_mpa or 0.0), 1e-6)
+        interval_width = max(float(prediction.uncertainty_interval.interval_width), 0.0)
+        width_ratio = interval_width / tolerance
+        if width_ratio > _GUARDRAIL_WIDE_INTERVAL_RATIO:
+            u_penalty = _GUARDRAIL_WIDE_INTERVAL_PENALTY
+            penalty += u_penalty
+            warnings.append(
+                f"Uncertainty interval width {interval_width:.2f} MPa is {width_ratio:.1f}× the "
+                f"tolerance ({tolerance:.2f} MPa) — prediction reliability is low "
+                f"(threshold {_GUARDRAIL_WIDE_INTERVAL_RATIO:.0f}×, penalty +{u_penalty:.0f})."
+            )
+
+        return penalty, tuple(warnings)
 
     def score_candidate(
         self,
